@@ -57,7 +57,6 @@ import sys
 import os
 import struct
 from math import *
-from this import d
 import numpy as np
 from datetime import datetime
 
