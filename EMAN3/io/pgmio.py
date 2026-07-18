@@ -48,8 +48,6 @@ References: https://netpbm.sourceforge.io/doc/pgm.html
 """
 
 import os
-from jax._src.interpreters.pxla import are_all_shardings_default_mem_kind
-from numba.core.ir_utils import arr_math
 import numpy as np
 import re
 import time
@@ -117,6 +115,11 @@ class PgmIO:
 	# 	return False
 
 	@staticmethod
+	def bit_depths():
+		"""Return list of supported bit depths. 8 = uint8, 16 = uint16."""
+		return [8, 16]
+
+	@staticmethod
 	def is_valid(filepath, chunk):
 		"""Check whether a file is potentially a valid PGM image.
 
@@ -148,10 +151,12 @@ class PgmIO:
 		self.nx = int(m.group(1))
 		self.ny = int(m.group(2))
 		self.maxval = int(m.group(3))
+		# Detect bit depth from maxval (PGM spec: <256 means 8-bit, else 16-bit)
+		self.bitdepth = 8 if self.maxval < 256 else 16
 		# The trailing whitespace (group 4) is the mandatory single char before binary data
 		self.data_offset = m.end()
 
-		return { "nx": self.nx, "ny": self.ny, "nz": 1, "PGM.max_gray": self.maxval }
+		return { "nx": self.nx, "ny": self.ny, "nz": 1, "bitdepth": self.bitdepth }
 
 	def read_data(self, index=0):
 		"""Read the uint8 image data.
@@ -199,10 +204,14 @@ class PgmIO:
 		self.nz = int(meta.get("nz", 1))
 
 		if self.nz != 1:
-			raise FileFormatError(f"Cannot write 3D image as PGM (nz={nz})")
+			raise FileFormatError(f"Cannot write 3D image as PGM (nz={self.nz})")
 
-		try: self.maxval = int(meta["PGM.max_gray"])
-		except: self.maxval=255
+		# Validate bitdepth and set maxval accordingly
+		bitdepth = int(meta.get("bitdepth", 8))
+		if bitdepth not in self.bit_depths():
+			raise FileFormatError(f"PGM supports only 8 or 16-bit; got {bitdepth}")
+		self.bitdepth = bitdepth
+		self.maxval = 255 if bitdepth == 8 else 65535
 
 		self._file=open(self.filename,"wb")
 		self._file.write(f"P5\n# Written by EMAN3 {time.ctime()}\n{self.nx} {self.ny}\n{self.maxval}\n".encode("ascii"))
@@ -235,7 +244,7 @@ class PgmIO:
 			self._file.write(flipped.ravel(order='C').tobytes())
 		elif data.dtype==np.uint16:
 			self._file.write(flipped.ravel(order='C').astype(">H").tobytes())	# > critical for big-endian
-		elif self.maxval<256:
+		if self.bitdepth == 8:
 			data=(255.0*(flipped-flipped.min())/(flipped.max()-flipped.min())).astype("B")
 			self._file.write(flipped.ravel(order='C').tobytes())
 		else:

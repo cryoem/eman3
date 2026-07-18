@@ -201,6 +201,11 @@ class SpiderIO:
 	# ---------------------------------------------------------------
 
 	@staticmethod
+	def bit_depths():
+		"""Return list of supported bit depths. 0 = float32."""
+		return [0]
+
+	@staticmethod
 	def is_valid(path,chunk):
 		"""Check whether a file is potentially a valid SPIDER image without opening.
 
@@ -272,6 +277,7 @@ class SpiderIO:
 		header["SPIDER_date"]=date_str
 		header["SPIDER_time"]=time_str
 		header["SPIDER_title"]=title_str
+		header["bitdepth"] = 0
 		
 		if index==-1:
 			self.nimg=int(header["SPIDER.maxim"]) # SPIDER numbers are EMAN numbers+1
@@ -331,6 +337,11 @@ class SpiderIO:
 		"""
 		
 		if self.mode=="r" : raise FileIOError("SPIDER file opened read-only, writes forbidden")
+
+		# Validate bitdepth (SPIDER is float32 only)
+		bitdepth = int(meta.get("bitdepth", 0))
+		if bitdepth not in self.bit_depths():
+			raise FileFormatError(f"SPIDER only supports float32 (bitdepth=0); got {bitdepth}")
 
 		# if this is our first write on a new file, we initialize ourselves from the first header
 		if self.nx is None: self.nx=int(meta["nx"])
