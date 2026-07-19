@@ -93,6 +93,12 @@ class PgmIO:
 		maxval    - maximum gray value from the header.
 	"""
 
+	# Class capability flags
+	SUPPORT_STACK = False
+	SUPPORT_3D = False
+	SUPPORT_3D_STACK = False
+	SUPPORT_COMPRESS = False
+
 	def __init__(self, filename, mode="r"):
 		self.filename = os.path.expanduser(filename)
 		self.mode = mode

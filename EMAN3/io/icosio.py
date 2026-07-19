@@ -90,7 +90,7 @@ class IcosIO:
 	"""Read and write ICOS format image files.
 
 	ICOS stores float32 image data (2D or 3D) with a simple binary header
-	and row-padded data. Single image per file — no stacks.
+	and row-padded data. Single image per file - no stacks.
 
 	Modes: "r" (read-only), "rw" (read-write, creates new file if it doesn't exist).
 
@@ -109,6 +109,12 @@ class IcosIO:
 		nx, ny, nz - dimensions from the header.
 		big_endian - endianness of the on-disk data.
 	"""
+
+	# Class capability flags
+	SUPPORT_STACK = False
+	SUPPORT_3D = True
+	SUPPORT_3D_STACK = False
+	SUPPORT_COMPRESS = False
 
 	def __init__(self, filename, mode="r"):
 		self.filename = os.path.expanduser(filename)
@@ -254,10 +260,10 @@ class IcosIO:
 				raise FileIOError(f"Incomplete ICOS data read at row {k}")
 
 			# Parse sentinel + data + sentinel as floats, strip sentinels
-			row_floats = np.frombuffer(row_raw, dtype=dt)
-			row_data = row_floats[1:-1].copy()
+				row_floats = np.frombuffer(row_raw, dtype=dt)
+				row_data = row_floats[1:-1].copy()
 
-			# Place into 3D array
+				# Place into 3D array
 				z = k // self.ny
 				y = k % self.ny
 				data[z, y, :] = row_data

@@ -84,6 +84,12 @@ class JpegIO:
 
 	MAGIC = b'\xff\xd8\xff'
 
+	# Class capability flags
+	SUPPORT_STACK = False
+	SUPPORT_3D = False
+	SUPPORT_3D_STACK = False
+	SUPPORT_COMPRESS = True
+
 	def __init__(self, filename, mode="r"):
 		self.filename = os.path.expanduser(filename)
 		self.mode = mode

@@ -105,7 +105,28 @@ class Transform:
     def get_matrix(self) -> np.ndarray:
         """Get the 3x4 matrix as numpy array"""
         return self.matrix.copy()
-    
+
+    def set_matrix(self, v: list) -> None:
+        """Set the transform matrix from a flat list of 12 floats (row-major order).
+
+        Order: [m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23]
+        """
+        if len(v) != 12:
+            raise TransformError(f"set_matrix requires exactly 12 values, got {len(v)}")
+        self.matrix = np.array(v, dtype=np.float32).reshape((3, 4))
+
+    def get_matrix_string(self, precision: int = 6) -> str:
+        """Return matrix as a comma-separated string in brackets.
+
+        Format: '[v0,v1,...,v12]' with given decimal precision.
+        Used for JSON serialization compatibility.
+        """
+        if precision < 2 or precision > 9:
+            precision = 6
+        fmt = f"%{precision}.{precision}g"
+        vals = [fmt % float(x) for x in self.matrix.flatten()]
+        return "[" + ",".join(vals) + "]"
+
     def get_matrix_4x4(self) -> np.ndarray:
         """Get the full 4x4 matrix as numpy array"""
         result = np.eye(4, dtype=np.float32)
@@ -174,6 +195,18 @@ class Transform:
             self._set_rotation_matrix(dict_params)
         elif euler_type == 'imagic':
             self._set_rotation_imagic(dict_params)
+        elif euler_type == '2d':
+            self.assert_valid_2d()
+            alpha = dict_params.get('alpha', 0) * np.pi / 180.0
+            self._set_rotation_from_euler(0, 0, alpha)
+        elif euler_type == 'xyz':
+            self._set_rotation_xyz(dict_params)
+        elif euler_type == 'spin':
+            self._set_rotation_spin(dict_params)
+        elif euler_type == 'spinvec':
+            self._set_rotation_spinvec(dict_params)
+        elif euler_type == 'sgirot':
+            self._set_rotation_sgirot(dict_params)
         else:
             raise TransformError(f"Unknown Euler type: {euler_type}")
     
@@ -235,7 +268,7 @@ class Transform:
         saz = np.sin(az)
         callt = np.cos(alt)
         salt = np.sin(alt)
-        
+
         self.matrix[0, 0] = cphi * caz - callt * saz * sphi
         self.matrix[0, 1] = cphi * saz + callt * caz * sphi
         self.matrix[0, 2] = salt * sphi
@@ -245,7 +278,99 @@ class Transform:
         self.matrix[2, 0] = salt * saz
         self.matrix[2, 1] = -salt * caz
         self.matrix[2, 2] = callt
-    
+
+    def _set_rotation_xyz(self, dict_params: Dict) -> None:
+        """Set rotation from x/y/z tilt angles (degrees)."""
+        xt = np.deg2rad(dict_params.get('xtilt', 0))
+        yt = np.deg2rad(dict_params.get('ytilt', 0))
+        zt = np.deg2rad(dict_params.get('ztilt', 0))
+        cx, sx = np.cos(xt), np.sin(xt)
+        cy, sy = np.cos(yt), np.sin(yt)
+        cz, sz = np.cos(zt), np.sin(zt)
+
+        self.matrix[0, 0] = cy * cz
+        self.matrix[0, 1] = cx * sz + sx * sy * cz
+        self.matrix[0, 2] = sx * sz - cx * sy * cz
+        self.matrix[1, 0] = -cy * sz
+        self.matrix[1, 1] = cx * cz - sx * sy * sz
+        self.matrix[1, 2] = sx * cz + cx * sy * sz
+        self.matrix[2, 0] = sy
+        self.matrix[2, 1] = -sx * cy
+        self.matrix[2, 2] = cx * cy
+
+    def _set_rotation_spin(self, dict_params: Dict) -> None:
+        """Set rotation from axis-angle (omega in degrees, unit vector n1/n2/n3)."""
+        omega = np.deg2rad(dict_params.get('omega', 0)) / 2.0
+        norm = np.hypot(
+            np.hypot(dict_params.get('n1', 0), dict_params.get('n2', 0)),
+            dict_params.get('n3', 0)
+        )
+        if norm == 0.0:
+            e0, e1, e2, e3 = 1.0, 0.0, 0.0, 0.0
+        else:
+            e0 = np.cos(omega)
+            half_sin = np.sin(omega) / norm
+            e1 = half_sin * dict_params.get('n1', 0)
+            e2 = half_sin * dict_params.get('n2', 0)
+            e3 = half_sin * dict_params.get('n3', 0)
+
+        self.matrix[0, 0] = e0*e0 + e1*e1 - e2*e2 - e3*e3
+        self.matrix[0, 1] = 2.0 * (e1*e2 + e0*e3)
+        self.matrix[0, 2] = 2.0 * (e1*e3 - e0*e2)
+        self.matrix[1, 0] = 2.0 * (e2*e1 - e0*e3)
+        self.matrix[1, 1] = e0*e0 - e1*e1 + e2*e2 - e3*e3
+        self.matrix[1, 2] = 2.0 * (e2*e3 + e0*e1)
+        self.matrix[2, 0] = 2.0 * (e3*e1 + e0*e2)
+        self.matrix[2, 1] = 2.0 * (e3*e2 - e0*e1)
+        self.matrix[2, 2] = e0*e0 - e1*e1 - e2*e2 + e3*e3
+
+    def _set_rotation_spinvec(self, dict_params: Dict) -> None:
+        """Set rotation from spin-vector (v1/v2/v3). Angle derived from vector norm.
+
+        omega = 2*pi*||v||, axis = v/||v||"""
+        norm = np.hypot(
+            np.hypot(dict_params.get('v1', 0), dict_params.get('v2', 0)),
+            dict_params.get('v3', 0)
+        )
+        if norm == 0.0:
+            e0, e1, e2, e3 = 1.0, 0.0, 0.0, 0.0
+        else:
+            omega = np.pi * norm
+            half_sin = np.sin(omega) / norm
+            e0 = np.cos(omega)
+            e1 = half_sin * dict_params.get('v1', 0)
+            e2 = half_sin * dict_params.get('v2', 0)
+            e3 = half_sin * dict_params.get('v3', 0)
+
+        self.matrix[0, 0] = e0*e0 + e1*e1 - e2*e2 - e3*e3
+        self.matrix[0, 1] = 2.0 * (e1*e2 + e0*e3)
+        self.matrix[0, 2] = 2.0 * (e1*e3 - e0*e2)
+        self.matrix[1, 0] = 2.0 * (e2*e1 - e0*e3)
+        self.matrix[1, 1] = e0*e0 - e1*e1 + e2*e2 - e3*e3
+        self.matrix[1, 2] = 2.0 * (e2*e3 + e0*e1)
+        self.matrix[2, 0] = 2.0 * (e3*e1 + e0*e2)
+        self.matrix[2, 1] = 2.0 * (e3*e2 - e0*e1)
+        self.matrix[2, 2] = e0*e0 - e1*e1 - e2*e2 + e3*e3
+
+    def _set_rotation_sgirot(self, dict_params: Dict) -> None:
+        """Set rotation from SGI-style quaternion (q in degrees, axis n1/n2/n3)."""
+        half = np.deg2rad(dict_params.get('q', 0)) / 2.0
+        e0 = np.cos(half)
+        hs = np.sin(half)
+        e1 = hs * dict_params.get('n1', 0)
+        e2 = hs * dict_params.get('n2', 0)
+        e3 = hs * dict_params.get('n3', 0)
+
+        self.matrix[0, 0] = e0*e0 + e1*e1 - e2*e2 - e3*e3
+        self.matrix[0, 1] = 2.0 * (e1*e2 + e0*e3)
+        self.matrix[0, 2] = 2.0 * (e1*e3 - e0*e2)
+        self.matrix[1, 0] = 2.0 * (e2*e1 - e0*e3)
+        self.matrix[1, 1] = e0*e0 - e1*e1 + e2*e2 - e3*e3
+        self.matrix[1, 2] = 2.0 * (e2*e3 + e0*e1)
+        self.matrix[2, 0] = 2.0 * (e3*e1 + e0*e2)
+        self.matrix[2, 1] = 2.0 * (e3*e2 - e0*e1)
+        self.matrix[2, 2] = e0*e0 - e1*e1 - e2*e2 + e3*e3
+
     # === Parameter methods ===
     
     def set_params(self, dict_params: Dict) -> None:
@@ -324,6 +449,42 @@ class Transform:
         t = Transform()
         t.set_rotation({'type': 'eman', 'phi': 45.0, 'az': 0.0, 'alt': 54.73561})
         return t
+
+    def assert_valid_2d(self) -> None:
+        """Assert that this transform is valid for 2D processing.
+
+        Raises TransformError if the transform contains 3D rotations
+        or translations not suitable for 2D image processing.
+        """
+        rotation_error = 0
+        translation_error = 0
+
+        m = self.matrix
+        if abs(m[2, 0]) > self.ERR_LIMIT:
+            rotation_error += 1
+        if abs(m[2, 1]) > self.ERR_LIMIT:
+            rotation_error += 1
+        if abs(m[0, 2]) > self.ERR_LIMIT:
+            rotation_error += 1
+        if abs(m[1, 2]) > self.ERR_LIMIT:
+            rotation_error += 1
+        if m[2, 3] != 0:
+            translation_error += 1
+        if m[2, 2] <= 0:
+            rotation_error += 1
+
+        if translation_error and rotation_error:
+            raise TransformError(
+                "Transform contains both 3D rotations and 3D translations. Cannot be used for 2D."
+            )
+        elif translation_error:
+            raise TransformError(
+                "Transform has non-zero z-translation. Cannot be used for 2D."
+            )
+        elif rotation_error:
+            raise TransformError(
+                "Transform contains 3D rotations. Cannot be used for 2D."
+            )
 
 
 # === Symmetry3D Classes (numpy arrays) ===

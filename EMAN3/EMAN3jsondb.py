@@ -49,13 +49,15 @@ import threading
 import traceback
 import re
 import numpy as np
+from EMAN3.ctf import EMAN2Ctf
+from EMAN3.transform import Transform
 
 # If set, fairly verbose debugging information will be written to the console
 # larger numbers will increase the amount of output
 DBDEBUG=0
 
 def js_one_key(url,key):
-	"""Opens a JSON file and returns a single key before closing the file. Not really faster, but conserves memory by not leaving the file open"""
+	"""Opens a JSON file and returns a single key before closing the file. Not faster, but conserves memory by not leaving the file open"""
 
 	return JSDict.one_key(url,key)
 
@@ -122,43 +124,11 @@ def js_list_dicts(url):
 
 	return ld
 
-class tmpimg(object):
-	def __init__(self,fsp,n):
-		self.fsp=fsp
-		self.n=n
-	
-	def image(self):
-		return EMData(self.fsp,self.n)
-
 
 ############
 ### JSON support for specific objects
 ############
 import base64,zlib
-
-def emdata_to_jsondict(obj):
-	"""This is tacked on to EMData objects to give them non-pickle JSON support"""
-	ret=obj.get_attr_dict()
-	ret["__class__"]="EMData"
-	ret["~bindata~"]=base64.encodestring(zlib.compress(obj.get_data_string(),1))		# we use ~ here as a delimiter because it's alphabetically after letters
-	return ret
-
-EMData.to_jsondict=emdata_to_jsondict		# we hack this into the EMData object
-
-def emdata_from_jsondict(dct):
-	"""This returns a new EMData object reconstituted from a JSON file"""
-	fixedkeys=frozenset(("nx","ny","nz","minimum","maximum","mean","sigma","square_sum","mean_nonzero","sigma_nonzero","__class__","~bindata~"))
-	ret=EMData(dct["nx"],dct["ny"],dct["nz"])
-	ret.set_data_string(zlib.decompress(base64.decodestring(dct["~bindata~"])))
-	for k in fixedkeys:
-		try: del dct[k]
-		except: pass
-
-	for k in list(dct.keys()):
-		ret[k]=dct[k]
-
-	ret.update()
-	return ret
 
 def eman2ctf_to_jsondict(obj):
 	ret=obj.to_dict()
@@ -839,34 +809,17 @@ performance than many individual changes."""
 		if noupdate:
 			if self.lasttime==0 : self.sync()		# if DB is closed, sync anyway
 			if key in self.delkeys and key not in self.changes and key not in self.data : raise KeyError(key)
-			if key in self.changes : 
+			if key in self.changes :
 				ret=self.changes[key]
-				if isinstance(ret,EMData) :
-					ret.del_attr("json_path")
-					ret.del_attr("json_n")
 				return ret
 			ret=self.data[key]
-			# we don't actually read the image file until/unless it's needed
-			if isinstance(ret,tmpimg) :
-				ret=ret.image()
-				self.data[key]=ret
-			if isinstance(ret,EMData) :
-				ret.del_attr("json_path")
-				ret.del_attr("json_n")
 			return ret
 
 
-		self.sync()
-		if key in self.data : 
-			ret=self.data[key]
-			# we don't actually read the image file until/unless it's needed
-			if isinstance(ret,tmpimg) :
-				ret=ret.image()
-				self.data[key]=ret
-			if isinstance(ret,EMData) :
-				ret.del_attr("json_path")
-				ret.del_attr("json_n")
-			return ret
+			self.sync()
+			if key in self.data : 
+				ret=self.data[key]
+				return ret
 			
 		raise KeyError(key)
 
@@ -882,28 +835,6 @@ performance than many individual changes."""
 			val=val.item()
 		elif isinstance(val, np.ndarray):
 			val=val.tolist()
-			
-		
-		# for EMData objects we need to figure out what file they will get stored in
-		if isinstance(val,EMData) :
-			# Changing an image triggers an actual read of the old image
-			try:
-				if isinstance(self.data[key],tmpimg):
-					self.data[key]=self.data[key].image()
-			except: pass
-			try: 
-				val["json_path"]=self.changes[key]["json_path"]
-				val["json_n"]=self.changes[key]["json_n"]
-			except: 
-				try: 
-					val["json_path"]=self.data[key]["json_path"]
-					val["json_n"]=self.data[key]["json_n"]
-				except: 
-					val["json_path"] = self.path.replace(".json","_jsonimg.hdf")
-					try: 
-						val["json_n"] = EMUtil.get_image_count(val["json_path"])
-					except: val["json_n"] = 0
-#			print key,val["json_path"],val["json_n"]
 
 		self.changes[key]=val
 		if not deferupdate : self.sync()
@@ -923,7 +854,6 @@ JSDict.__delitem__=JSDict.delete
 jsonclasses = {
 	"JSTask":JSTask.from_jsondict,
 	"JSTaskQueue":JSTaskQueue.from_jsondict,
-	"EMData":emdata_from_jsondict,
 	"EMAN2Ctf":eman2ctf_from_jsondict,
 	"Transform":transform_from_jsondict,
 	"EMAN3Ctf":eman3ctf_from_jsondict
@@ -939,40 +869,11 @@ def json_to_obj(jsdata):
 			traceback.print_exc()
 			print("error decoding ",jsdata["__pickle__"])
 			return str(jsdata["__pickle__"])				# This shouldn't happen. Means a module hasn't been loaded. This is an emergency stopgap to avoid crashing
-	elif "__image__" in jsdata :							# images now stored in a separate HDF file
-		try: 
-			# We defer actual reading of the image until it's needed
-			ret= tmpimg(str(jsdata["__image__"][0]),int(jsdata["__image__"][1]))
-#			ret= EMData(str(jsdata["__image__"][0]),int(jsdata["__image__"][1]))
-		except:
-			print("Error reading image from JSON: ",jsdata["__image__"])
-			ret= None
+	elif "__image__" in jsdata :
+		ret = None
 		return ret
 	elif "__class__" in jsdata : return jsonclasses[jsdata["__class__"]](jsdata)
 	else: return jsdata
-
-def obj_to_json(obj):
-	"""converts a python object to a supportable json type"""
-	if isinstance(obj,tmpimg) :
-		return {"__image__":(obj.fsp,obj.n)}
-	if isinstance(obj,EMData) :
-		try: fnm = (obj["json_path"],obj["json_n"])
-		except: 
-			traceback.print_stack()
-			print("ERROR: Cannot store image in JSON list. This should never happen and indicates a coding error.")
-			fnm=["BAD_JSON.hdf",0]
-		obj.write_image(fnm[0],fnm[1])
-		return {"__image__":fnm}
-	if isinstance(obj,np.ndarray): obj=obj.tolist()
-	if np.isscalar(obj) : return obj.item()
-#	if isinstance(obj,dict) or isinstance(obj,list) or isinstance(obj,tuple): return obj.item()   # shouldn't be necessary
-	if hasattr(obj, "to_jsondict"):
-		return obj.to_jsondict()
-	else:
-		try: return {"__pickle__":pickle.dumps(obj,0).decode("utf-8") }
-		except:
-			print(f"error pickling {type(obj)} {obj}")
-			return {"__pickle__":pickle.dumps(None,0).decode("utf-8") }
 
 __doc__ = \
 """This module provides a dict-like wrapper for JSON files on disk, with full support for file locking and other
@@ -981,6 +882,19 @@ consistency. Performance will be substantially worse than BDB, particularly with
 are human-readable, and it will not suffer from the issues with caching and database corruption which frustrated so
 many users with BDB."""
 
-
-
-
+def obj_to_json(obj):
+	"""converts a python object to a supportable json type"""
+	if isinstance(obj,np.ndarray): obj=obj.tolist()
+	if np.isscalar(obj):
+		try: return obj.item()
+		except AttributeError:
+			return obj
+	if isinstance(obj, (dict, list, tuple)):
+		return obj
+	if hasattr(obj, "to_jsondict"):
+		return obj.to_jsondict()
+	else:
+		try: return {"__pickle__":pickle.dumps(obj,0).decode("utf-8") }
+		except:
+			print(f"error pickling {type(obj)} {obj}")
+			return {"__pickle__":pickle.dumps(None,0).decode("utf-8") }

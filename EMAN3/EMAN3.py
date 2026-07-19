@@ -44,6 +44,7 @@ import socket
 import subprocess
 import EMAN3.EMAN3jsondb
 from EMAN3.EMAN3jsondb import JSDict,js_open_dict,js_close_dict,js_remove_dict,js_list_dicts,js_check_dict,js_one_key
+from EMAN3.transform import Transform
 import argparse, copy
 import glob
 import random
@@ -119,8 +120,6 @@ try:
 	os.putenv("LC_CTYPE","en_US.UTF-8")
 	os.putenv("LC_ALL","en_US.UTF-8")
 except: pass
-
-XYData.__len__=XYData.get_size
 
 try:
 	if __session__ is not None :
@@ -1292,7 +1291,7 @@ def test_image(type=0,size=(128,128)):
 	type=2  square
 	type=3  hollow square
 """
-	ret=np.zeros(size)
+	ret=np.zeros(size,dtype="f")
 	nx,ny=size
 
 	if type==0 :
@@ -1305,7 +1304,7 @@ def test_image(type=0,size=(128,128)):
 		dist = np.sqrt(dx**2 + dy**2) * 30.0 / nx
 		gaussian = np.exp(-dist**2)
 		sinusoid = np.sin(dx * dy) + 0.5
-		ret += gaussian * sinusoid
+		ret += (gaussian * sinusoid).sum(axis=0)
 	elif type==1 :
 		ret=np.arange(size[0]*size[1]).reshape(size)
 	elif type==2:
@@ -1324,7 +1323,8 @@ def test_image_3d(type=0,size=(64,64,64)):
 	type=0  axes, asymmetric (x longest, y shorter, z even shorter) center ->positive
 	type=1  linear increase, x then y then z
 """
-	ret=np.zeros(size)
+	nx,ny,nz=size
+	ret=np.zeros(size,dtype="f")
 	if type==0 :
 		ret[nx//2:nx*9//12,ny//2,nz//2]=1.0
 		ret[nx//2,ny//2:ny*8//12,nz//2]=1.0
@@ -1565,82 +1565,82 @@ and translate them into a dictionary."""
 		self.lock.release()
 		return ln
 
-	def read_image(self,N,hdronly=False,region=None):
-		"""This reads the image referenced by the nth record in the #LSX file. The same task can be accomplished with EMData.read_image,
-but this method prevents multiple open/close operations on the #LSX file."""
+# 	def read_image(self,N,hdronly=False,region=None):
+# 		"""This reads the image referenced by the nth record in the #LSX file. The same task can be accomplished with EMData.read_image,
+# but this method prevents multiple open/close operations on the #LSX file."""
 
-		raise Exception("Not yet implemented")
-		n,fsp,jsondict=self.read(N)
-#		print(self.path,n,fsp,jsondict,hdronly,region)
-		# ret=EMData()
-		# ret.read_image_c(fsp,n,hdronly,region)
-		ret["source_path"]=self.path
-		ret["source_n"]=N
-		if len(jsondict)>0 :
-			for k in jsondict: ret[k]=jsondict[k]
+# 		raise Exception("Not yet implemented")
+# 		n,fsp,jsondict=self.read(N)
+# #		print(self.path,n,fsp,jsondict,hdronly,region)
+# 		# ret=EMData()
+# 		# ret.read_image_c(fsp,n,hdronly,region)
+# 		ret["source_path"]=self.path
+# 		ret["source_n"]=N
+# 		if len(jsondict)>0 :
+# 			for k in jsondict: ret[k]=jsondict[k]
 
-		return ret
+# 		return ret
 
-	def read_into_image(self,ret=None,N=0,hdronly=False,region=None,is_3d=False,imgtype=IMAGE_UNKNOWN):
-		"""This reads the image referenced by the nth record in the #LSX file. The same task can be accomplished with EMData.read_image,
-but this method prevents multiple open/close operations on the #LSX file."""
+# 	def read_into_image(self,ret=None,N=0,hdronly=False,region=None,is_3d=False,imgtype=IMAGE_UNKNOWN):
+# 		"""This reads the image referenced by the nth record in the #LSX file. The same task can be accomplished with EMData.read_image,
+# but this method prevents multiple open/close operations on the #LSX file."""
 
-		raise Exception("Not yet implemented")
-		n,fsp,jsondict=self.read(N)
-#		print(self.path,n,fsp,jsondict,hdronly,region)
-		# ret.read_image_c(fsp,n,hdronly,region,is_3d,imgtype)
-		ret["data_n"]=ret["source_n"]
-		ret["data_source"]=ret["source_path"]
-		ret["source_path"]=self.path
-		ret["source_n"]=N
-		if len(jsondict)>0 :
-			for k in jsondict: ret[k]=jsondict[k]
+# 		raise Exception("Not yet implemented")
+# 		n,fsp,jsondict=self.read(N)
+# #		print(self.path,n,fsp,jsondict,hdronly,region)
+# 		# ret.read_image_c(fsp,n,hdronly,region,is_3d,imgtype)
+# 		ret["data_n"]=ret["source_n"]
+# 		ret["data_source"]=ret["source_path"]
+# 		ret["source_path"]=self.path
+# 		ret["source_n"]=N
+# 		if len(jsondict)>0 :
+# 			for k in jsondict: ret[k]=jsondict[k]
 
-	def read_images(self,nlst=None,hdronly=False):
-		"""This reads a set of images referenced by the nth record in the #LSX file. This is used by read_images in Python when the file is a LST file
-		if nlst is None, the entire file is read."""
+# 	def read_images(self,nlst=None,hdronly=False):
+# 		"""This reads a set of images referenced by the nth record in the #LSX file. This is used by read_images in Python when the file is a LST file
+# 		if nlst is None, the entire file is read."""
 
-		raise Exception("Not yet implemented")
-		# organize the images to read by path to take advantage of read_images performance
-		# d2r contains tuples (image number in returned array,image number in file (key),extra data dictionary)
-		d2r={}
-		if nlst is None or len(nlst)==0:
-			for i in range(self.n):
-				j,p,d=self.read(i)
-				try: d2r[p].append((i,j,d,i))
-				except: d2r[p]=[(i,j,d,i)]
-			ii=self.n
-		else:
-			# ii is the index of the image in the array we will eventually return, i is the index of the image
-			# in the lst file. j is the index in the referenced image file, p. d is the dictionary of 
-			# override values from the lst comment field
-			for ii,i in enumerate(nlst):
-				j,p,d=self.read(int(i))
-				try: d2r[p].append((ii,j,d,i))
-				except: d2r[p]=[(ii,j,d,i)]
-			ii+=1
+# 		raise Exception("Not yet implemented")
+# 		# organize the images to read by path to take advantage of read_images performance
+# 		# d2r contains tuples (image number in returned array,image number in file (key),extra data dictionary)
+# 		d2r={}
+# 		if nlst is None or len(nlst)==0:
+# 			for i in range(self.n):
+# 				j,p,d=self.read(i)
+# 				try: d2r[p].append((i,j,d,i))
+# 				except: d2r[p]=[(i,j,d,i)]
+# 			ii=self.n
+# 		else:
+# 			# ii is the index of the image in the array we will eventually return, i is the index of the image
+# 			# in the lst file. j is the index in the referenced image file, p. d is the dictionary of 
+# 			# override values from the lst comment field
+# 			for ii,i in enumerate(nlst):
+# 				j,p,d=self.read(int(i))
+# 				try: d2r[p].append((ii,j,d,i))
+# 				except: d2r[p]=[(ii,j,d,i)]
+# 			ii+=1
 
-#		out=open("dbug.txt","w")
-		# we read the actual images with calls to read_images for speed
-		# then overlay the metadata overrides from the LST file, and put them in the requested read order
-		ret=[None]*ii	# ii is left with the total number of images to be returned
-		for fsp in d2r:
-			tpls=d2r[fsp]
-			# imgs=EMData.read_images_c(fsp,[i[1] for i in tpls],IMAGE_UNKNOWN,hdronly)
-			for i,tpl in enumerate(tpls):
-				imgs[i]["source_path"]=self.path
-				try: imgs[i]["source_n"]=int(tpl[3])
-				except:
-					traceback.print_exc()
-					raise Exception(f"Error in read_images: {i},{tpl}")
-				for k in tpl[2]: 
-					imgs[i][k]=tpl[2][k]
-				ret[tpl[0]]=imgs[i]
-#				out.write(f"{tpl[0]}\t{i}\t{fsp}\n")
+# #		out=open("dbug.txt","w")
+# 		# we read the actual images with calls to read_images for speed
+# 		# then overlay the metadata overrides from the LST file, and put them in the requested read order
+# 		ret=[None]*ii	# ii is left with the total number of images to be returned
+# 		for fsp in d2r:
+# 			tpls=d2r[fsp]
+# 			# imgs=EMData.read_images_c(fsp,[i[1] for i in tpls],IMAGE_UNKNOWN,hdronly)
+# 			for i,tpl in enumerate(tpls):
+# 				imgs[i]["source_path"]=self.path
+# 				try: imgs[i]["source_n"]=int(tpl[3])
+# 				except:
+# 					traceback.print_exc()
+# 					raise Exception(f"Error in read_images: {i},{tpl}")
+# 				for k in tpl[2]: 
+# 					imgs[i][k]=tpl[2][k]
+# 				ret[tpl[0]]=imgs[i]
+# #				out.write(f"{tpl[0]}\t{i}\t{fsp}\n")
 
-		if None in ret: raise(Exception(f"Error reading {nlst} from {self.path}, {ret.index(None)} is None"))
+# 		if None in ret: raise(Exception(f"Error reading {nlst} from {self.path}, {ret.index(None)} is None"))
 
-		return ret
+# 		return ret
 
 	def normalize(self):
 		"""This will read the entire file and insure that the line-length parameter is valid. If it is not,
@@ -1785,7 +1785,6 @@ def load_lst_params(fsp , imgns=None):
 	return ret
 	
 
-__doc__ = \
-"EMAN classes and routines for image/volume processing in \n\
+__doc__ = """EMAN classes and routines for image/volume processing in \n\
 single particle reconstructions.
-"
+"""

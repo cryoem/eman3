@@ -614,6 +614,12 @@ class MrcIO:
 		big_endian - endianness of the on-disk data.
 	"""
 
+	# Class capability flags
+	SUPPORT_STACK = True
+	SUPPORT_3D = True
+	SUPPORT_3D_STACK = False
+	SUPPORT_COMPRESS = False
+
 	def __init__(self, filename, mode="r"):
 		self.filename = os.path.expanduser(filename)
 		self.mode = mode

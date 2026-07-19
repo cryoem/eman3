@@ -73,7 +73,7 @@ class TiffIO:
 
 	TIFF stores grayscale images at 8-bit, 16-bit or float32 depth with
 	optional compression. Multiple images per file supported by writing one
-	page at a time — pages are not buffered in RAM.
+	page at a time - pages are not buffered in RAM.
 
 	Modes: "r" (read-only), "rw" (read-write, creates new file if it doesn't exist).
 
@@ -95,6 +95,12 @@ class TiffIO:
 		nx, ny     - dimensions from the first directory entry.
 		big_endian - endianness of the on-disk data.
 	"""
+
+	# Class capability flags
+	SUPPORT_STACK = True
+	SUPPORT_3D = False
+	SUPPORT_3D_STACK = False
+	SUPPORT_COMPRESS = True
 
 	def __init__(self, filename, mode="r"):
 		self.filename = os.path.expanduser(filename)
