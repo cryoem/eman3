@@ -128,6 +128,10 @@ class JpegIO:
 			self._file.close()
 		return False
 
+	def __len__(self):
+		"""Return 1 — this format stores a single image."""
+		return 1
+
 	def _parse_header(self):
 		"Read JPEG header info using Pillow. Sets nx, ny, JPEG.quality."
 		with Image.open(self.filename) as img:

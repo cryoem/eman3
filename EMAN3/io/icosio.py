@@ -162,7 +162,10 @@ class IcosIO:
 		"""Return list of supported bit depths. ICOS is float32 only (bitdepth=0)."""
 		return [0]
 
-	@staticmethod
+	def __len__(self):
+		"""Return 1 — this format stores a single image."""
+		return 1
+
 	def is_valid(filepath, chunk):
 		"""Check whether a file is potentially a valid ICOS image.
 
@@ -249,7 +252,8 @@ class IcosIO:
 
 		self._file.seek(ICOS_HEADER_SIZE)
 
-		dt = ">f4" if self.big_endian else "<f4"
+		dt = '<f4'  # ICOS always little-endian
+		self.big_endian = False
 
 		nrows = self.ny * self.nz
 		data = np.zeros((self.nz, self.ny, self.nx), dtype=np.float32)
@@ -260,15 +264,15 @@ class IcosIO:
 				raise FileIOError(f"Incomplete ICOS data read at row {k}")
 
 			# Parse sentinel + data + sentinel as floats, strip sentinels
-				row_floats = np.frombuffer(row_raw, dtype=dt)
-				row_data = row_floats[1:-1].copy()
+			row_floats = np.frombuffer(row_raw, dtype=dt)
+			row_data = row_floats[1:-1].copy()
 
-				# Place into 3D array
-				z = k // self.ny
-				y = k % self.ny
-				data[z, y, :] = row_data
+			# Place into 3D array
+			z = k // self.ny
+			y = k % self.ny
+			data[z, y, :] = row_data
 
-			return data
+		return data
 
 	def write_header(self, meta, index=-1):
 		"""Write an ICOS header.
@@ -343,15 +347,16 @@ class IcosIO:
 			raise InvalidDimensions(
 				f"Data shape ({nz}, {ny}, {nx}) != header ({self.nz}, {self.ny}, {self.nx})")
 
-		flipped = data
-
+		flipped = data.astype(np.float32)
+		self.big_endian = False  # ICOS always little-endian
 		sentinel_val = self.nx * 4  # bytes per row of float data
 		self._file.seek(ICOS_HEADER_SIZE)
 
 		for z in range(nz):
 			for y in range(ny):
 				row = flipped[z, y, :]
-				sent_bytes = struct.pack("<f", float(sentinel_val))
-				self._file.write(sent_bytes)
-				self._file.write(row.tobytes())
-				self._file.write(sent_bytes)
+				row_bytes = np.empty(2 + nx, dtype='<f4')
+				row_bytes[0] = sentinel_val
+				row_bytes[1:-1] = row
+				row_bytes[-1] = sentinel_val
+				self._file.write(row_bytes.tobytes())

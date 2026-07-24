@@ -129,6 +129,10 @@ class PngIO:
 			self._file.close()
 		return False
 
+	def __len__(self):
+		"""Return 1 — this format stores a single image."""
+		return 1
+
 	def _parse_header(self):
 		"""Read PNG header and cache full image. Sets nx, ny, PNG_bitdepth."""
 		with Image.open(self.filename) as img:
@@ -304,7 +308,7 @@ class PngIO:
 		else:
 			out_data = np.zeros((self.ny, self.nx), dtype=out_dtype)
 
-		img = Image.fromarray(out_data, mode='I' if self.PNG_bitdepth == 16 else 'L')
+		img = Image.fromarray(out_data, mode='I;16' if self.PNG_bitdepth == 16 else 'L')
 		self._file.seek(0)
 		img.save(self._file, format='PNG', bits=self.PNG_bitdepth)
 		img.close()

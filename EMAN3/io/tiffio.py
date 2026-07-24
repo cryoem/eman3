@@ -141,6 +141,10 @@ class TiffIO:
 						self.big_endian = (header == b'MM')
 				self._initialized = True
 
+	def __len__(self):
+		"""Return number of images (TIFF pages)."""
+		return self.nimg if self.nimg else 1
+
 	def _count_pages(self):
 		"""Count pages by reading directory entries."""
 		if self._tif is None:

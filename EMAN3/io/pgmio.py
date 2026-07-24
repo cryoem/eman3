@@ -137,6 +137,10 @@ class PgmIO:
 		
 		return False
 
+	def __len__(self):
+		"""Return 1 — this format stores a single image."""
+		return 1
+
 	def read_header(self, index=0):
 		"""Read the PGM header and return it as a dict.
 
@@ -187,9 +191,23 @@ class PgmIO:
 			if len(raw) < self.nx * self.ny * 2:
 				raise FileIOError(f"Incomplete data read: got {len(raw)} of {self.nx * self.ny * 2} bytes")
 
-		self._file=None
+		# Process data first, then close file
+		if self.bitdepth == 8:
+			data = np.frombuffer(raw, dtype=np.uint8).reshape((self.ny, self.nx), order='C')[::-1, :]
+		else:
+			# 16-bit PGM uses big-endian per spec
+			data = np.frombuffer(raw, dtype='>H').reshape((self.ny, self.nx), order='C')[::-1, :]
 
-		return np.frombuffer(raw, dtype=np.uint8).reshape((self.ny, self.nx), order='C')
+		self._file.close()
+		self._file = None
+
+		return data
+
+	def __del__(self):
+		"""Close file handle on destruction."""
+		if self._file is not None:
+			try: self._file.close()
+			except Exception: pass
 
 	def write_header(self, meta, index=0):
 		"""Write a PGM header.
@@ -242,19 +260,19 @@ class PgmIO:
 		if data.shape[1] != self.nx or data.shape[0] != self.ny:
 			raise InvalidDimensions(f"Data shape ({ny}, {nx}) != header ({self.ny}, {self.nx})")
 
-		# y=0 is at the top in the file, bottom in numpy
-		#flipped = data[::-1, :] #this is incorrect, not sure why based on specs
-		flipped=data
+		# EMAN convention: row 0 at bottom. PGM stores top-to-bottom.
+		flipped = data[::-1, :]
 		
 		if data.dtype==np.uint8:
 			self._file.write(flipped.ravel(order='C').tobytes())
 		elif data.dtype==np.uint16:
-			self._file.write(flipped.ravel(order='C').astype(">H").tobytes())	# > critical for big-endian
-		if self.bitdepth == 8:
-			data=(255.0*(flipped-flipped.min())/(flipped.max()-flipped.min())).astype("B")
-			self._file.write(flipped.ravel(order='C').tobytes())
+			self._file.write(flipped.ravel(order='C').astype(">H").tobytes())
+		elif self.bitdepth == 8:
+			out = np.clip(255.0*(flipped-flipped.min())/(flipped.max()-flipped.min()), 0, 255).astype(np.uint8)
+			self._file.write(out.ravel(order='C').tobytes())
 		else:
-			data=(65535.0*(flipped-flipped.min())/(flipped.max()-flipped.min()))
-			self._file.write(flipped.ravel(order='C').astype(">H").tobytes())	# > critical for big-endian
+			out = np.clip(65535.0*(flipped-flipped.min())/(flipped.max()-flipped.min()), 0, 65535).astype(np.uint16)
+			self._file.write(out.ravel(order='C').astype(">H").tobytes())	# > critical for big-endian
 
-		self._file=None
+		self._file.close()
+		self._file = None

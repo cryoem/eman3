@@ -195,6 +195,10 @@ class SpiderIO:
 		if self._file is not None: self._file.close()
 		return False
 
+	def __len__(self):
+		"""Return number of images in the file."""
+		return self.nimg if self.nimg else 0
+
 	# def __del__(self):
 	# 	try:
 	# 		self._file.flush()
@@ -353,10 +357,17 @@ class SpiderIO:
 		if self.nx is None: self.nx=int(meta["nx"])
 		if self.ny is None: self.ny=int(meta["ny"])
 		if self.nz is None: self.nz=int(meta["nz"])
-		if self.nimg is None: self.nimg=max(index+1,1)
-		if self.reclen is None: 
+		if self.reclen is None:
 			self.reclen=self.nx*4
 			self.headlen=ceil(1024/self.reclen)*self.reclen
+
+		# Resolve index: -1 means append. First image goes at 0.
+		if index < 0:
+			if self.nimg is None or self.nimg == 0:
+				index = 0
+			else:
+				index = self.nimg
+		self.nimg = max(self.nimg or 0, index + 1)
 
 		# we force a few specific values, modification of meta is an intentional side-effect
 		meta["SPIDER.istack"]=2
@@ -365,6 +376,7 @@ class SpiderIO:
 		meta["nz"]=self.nz
 		meta["SPIDER.type"]=1 if self.nz==1 else 3
 		meta["SPIDER.reclen"]=self.reclen
+		meta["SPIDER.headrec"]=int(self.headlen/self.reclen)
 		meta["SPIDER.headlen"]=self.headlen
 		meta["SPIDER.istack"]=0		# this will be 2 in the global header (we only write stacks)
 		meta["SPIDER.imgnum"]=index+1	# should be 0 in the global header
@@ -381,11 +393,17 @@ class SpiderIO:
 
 		# raw is the header represented as bytes
 		raw=bytearray(floats.tobytes())
-		print(len(raw))
 		raw[1023]=0
-		raw[844:855]=meta["SPIDER_date"][:11].encode('ascii', errors='ignore')
-		raw[855:863]=meta["SPIDER_time"][:8].encode('ascii', errors='ignore')
-		raw[863:]=meta["SPIDER_title"][:160].encode('ascii', errors='ignore')
+
+		from datetime import datetime
+		now = datetime.now()
+		sp_date = meta.get("SPIDER_date", now.strftime("%d-%b-%Y"))[:11]
+		sp_time = meta.get("SPIDER_time", now.strftime("%H:%M:%S"))[:8]
+		sp_title = meta.get("SPIDER_title", "EMAN3")[0:160]
+
+		raw[844:855]=sp_date.encode('ascii', errors='ignore')
+		raw[855:863]=sp_time.encode('ascii', errors='ignore')
+		raw[863:1023]=sp_title.encode('ascii', errors='ignore').ljust(160, b'\x00')[:160]
 
 		# write the same header we're writing for the image, then fix it at the end
 		if not self._initialized :
@@ -393,8 +411,7 @@ class SpiderIO:
 			self._file.write(raw)
 
 			self._file.seek(_HEADER_FLOATS["SPIDER.istack"]*4)
-			if self.big_endian: self._file.write(b"\x04\x00\x00\x00")	# This is 2.0
-			else: self._file.write(b"\x00\x00\x00\x04")
+			self._file.write(struct.pack(">f", 2.0) if self.big_endian else struct.pack("<f", 2.0))
 
 			self._file.seek(_HEADER_FLOATS["SPIDER.imgnum"]*4)
 			self._file.write(b"\x00\x00\x00\x00")		# 0.0
@@ -433,7 +450,7 @@ class SpiderIO:
 			if self.big_endian: write_data = data.astype(">f").ravel().tobytes()
 			else: write_data = data.astype("<f").ravel().tobytes()
 
-		if len(write_data)!=self.reclen*self.ny*self.nz: raise InvalidDimensions(f"Data size {index.shape} expected {self.nz},{self.ny},{self.nx}")
+		if len(write_data)!=self.reclen*self.ny*self.nz: raise InvalidDimensions(f"Data size {data.shape} != expected ({self.nz},{self.ny},{self.nx})")
 
 		self._file.seek(self.headlen*2+(self.headlen+self.reclen*self.ny*self.nz)*index)
 		self._file.write(write_data)

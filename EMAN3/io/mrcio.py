@@ -676,6 +676,10 @@ class MrcIO:
 			self._file = None
 		return False
 
+	def __len__(self):
+		"""Return number of images (1 for single MRC, stack_size for MRCS)."""
+		return self.nimg if self.nimg else 1
+
 	@staticmethod
 	def bit_depths():
 		"""Return list of supported bit depths. MRC supports 8, 16, and float32 (0)."""
