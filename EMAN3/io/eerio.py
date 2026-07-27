@@ -258,9 +258,20 @@ class EerIO:
             pass
 
     @staticmethod
-    def is_valid(filepath):
-        """Check whether a file is a valid EER file by trying to open it as TIFF."""
+    def is_valid(filepath, chunk=None):
+        """Check whether a file is a valid EER file by trying to open it as TIFF.
+        If chunk is provided, checks for TIFF magic bytes in the chunk.
+        """
         try:
+            if chunk is not None:
+                # TIFF magic: II (LE) or MM (BE), offset 2 = 42 or 43
+                import struct
+                if len(chunk) < 4:
+                    return False
+                if chunk[:2] in (b'II', b'MM'):
+                    offset = struct.unpack('<H' if chunk[:2] == b'II' else '>H', chunk[2:4])[0]
+                    return offset in (42, 43)
+                return False
             import tifffile
             with tifffile.TiffFile(os.path.expanduser(filepath)) as tif:
                 return len(tif.pages) > 0

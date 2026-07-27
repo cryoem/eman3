@@ -387,7 +387,22 @@ class Transform:
             self.set_scale(float(dict_params['scale']))
         if 'mirror' in dict_params:
             self.set_mirror(bool(dict_params['mirror']))
-    
+
+    def __repr__(self) -> str:
+        """Return string representation as Transform(dict_params)."""
+        params = self.get_rotation('eman')
+        scale = self.get_scale()
+        if abs(scale - 1.0) > self.ERR_LIMIT:
+            params['scale'] = scale
+        mirror = self.get_mirror()
+        if mirror:
+            params['mirror'] = mirror
+        trans = self.get_trans_2d()
+        if not np.allclose(trans, [0.0, 0.0], atol=self.ERR_LIMIT):
+            params['tx'] = float(trans[0])
+            params['ty'] = float(trans[1])
+        return f"Transform({repr(params)})"
+
     def get_rotation(self, euler_type: str = 'eman') -> Dict:
         """Extract rotation parameters in specified Euler convention"""
         euler_type = euler_type.lower()

@@ -173,11 +173,16 @@ class PifIO:
 		return [8, 16, 32]
 
 	@staticmethod
-	def is_valid(filepath):
-		"""Check whether a file has a valid PIF header (magic numbers)."""
+	def is_valid(filepath, chunk=None):
+		"""Check whether a file has a valid PIF header (magic numbers).
+		If chunk is provided, checks the chunk instead of reopening the file.
+		"""
 		try:
-			with open(os.path.expanduser(filepath), "rb") as f:
-				raw = f.read(8)
+			if chunk is not None:
+				raw = chunk[:8]
+			else:
+				with open(os.path.expanduser(filepath), "rb") as f:
+					raw = f.read(8)
 			if len(raw) < 8:
 				return False
 			vals = np.frombuffer(raw, dtype='<i4')

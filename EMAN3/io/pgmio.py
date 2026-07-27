@@ -132,9 +132,15 @@ class PgmIO:
 		Takes a filepath and the first ~1K of the file as bytes.
 		If chunk is not provided, reads the file header itself.
 		"""
-
-		if chunk[:2]=="P5" and str.isspace(chunk[2]) : return True
-		
+		if isinstance(chunk, str):
+			chunk = chunk.encode('ascii')
+		try:
+			text = chunk[:4].decode('ascii', errors='ignore').strip()
+		except Exception:
+			return False
+		# PGM variants: P2 (ASCII), P5 (binary grayscale)
+		if text.startswith(('P2', 'P5')):
+			return True
 		return False
 
 	def __len__(self):

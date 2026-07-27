@@ -247,12 +247,17 @@ class AmiraIO:
 		"""Return 1 — this format stores a single image."""
 		return 1
 
-	def is_valid(filepath):
+	@staticmethod
+	def is_valid(filepath, chunk=None):
 		"""Check whether a file has a valid Amira Mesh header.
 
 		Reads the first line and checks for the magic string `# AmiraMesh`.
+		If chunk is provided, checks the chunk instead of reopening the file.
 		"""
 		try:
+			if chunk is not None:
+				text = chunk.decode('utf-8', errors='replace') if isinstance(chunk, bytes) else chunk
+				return MAGIC in text
 			with open(os.path.expanduser(filepath), 'rb') as f:
 				first_line = f.readline()
 				if isinstance(first_line, bytes):

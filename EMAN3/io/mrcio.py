@@ -1106,8 +1106,8 @@ class MrcIO:
 		else:
 			raise FileFormatError(f"Unsupported MRC write mode: {mode}")
 
-		# Build header on first write
-		if self._is_new_file:
+		# Build header on first write; rewrite for stacks to keep nz in sync
+		if self._is_new_file or self.is_stack:
 			stats_meta = {
 				"minimum": float(out_data.min()),
 				"maximum": float(out_data.max()),
@@ -1115,7 +1115,8 @@ class MrcIO:
 				"sigma": float(np.std(out_data)) if len(out_data) > 1 else 0.0,
 			}
 			self._build_and_write_header_with_data(stats_meta)
-			self._is_new_file = False
+			if self._is_new_file:
+				self._is_new_file = False
 
 		nsymbt = self._h.get("nsymbt", 0)
 		data_offset = MRC_HEADER_SIZE + nsymbt

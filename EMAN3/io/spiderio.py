@@ -232,11 +232,11 @@ class SpiderIO:
 		else: floats = np.frombuffer(chunk[:SPIDER_FLOATS_IN_HEADER*4], dtype='<f')
 		
 		# not exhaustive, but should be a pretty strong check
-		if (floats[HEADER_FLOATS["SPIDER.maxim"]] != int(floats[HEADER_FLOATS["SPIDER.maxim"]]) or
-			floats[HEADER_FLOATS["nx"]] != int(floats[HEADER_FLOATS["nx"]]) or
-			floats[HEADER_FLOATS["ny"]] != int(floats[HEADER_FLOATS["ny"]]) or
-			floats[HEADER_FLOATS["nz"]] != int(floats[HEADER_FLOATS["nz"]]) or
-			floats[HEADER_FLOATS["nx"]] < 1) : return False
+		if (floats[_HEADER_FLOATS["SPIDER.maxim"]] != int(floats[_HEADER_FLOATS["SPIDER.maxim"]]) or
+			floats[_HEADER_FLOATS["nx"]] != int(floats[_HEADER_FLOATS["nx"]]) or
+			floats[_HEADER_FLOATS["ny"]] != int(floats[_HEADER_FLOATS["ny"]]) or
+			floats[_HEADER_FLOATS["nz"]] != int(floats[_HEADER_FLOATS["nz"]]) or
+			floats[_HEADER_FLOATS["nx"]] < 1) : return False
 
 		return True
 

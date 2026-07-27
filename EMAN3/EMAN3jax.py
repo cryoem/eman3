@@ -35,7 +35,7 @@ This module is exclusive with EMAN3tensor. Do not try and import both in a singl
 ONLY import this file if you will be working with JAX in your program, otherwise the JAX initialization may add unreasonable startup delays
 
 There are several key classes for data representation in this module:
-EMStack3D, 2D, 1D - A set of 3 classes to represent stacks of images of different dimensionality with seamless interconversion among EMData, NumPy and Tensorflow.
+EMStack3D, 2D, 1D - A set of 3 classes to represent stacks of images of different dimensionality with seamless interconversion among NumPy and JAX arrays.
 	Implemented as 3 separate classes to avoid validation overhead and provide dimensionality-specific routines. All share a common generic interface.
 
 Orientations - an array {N,X,Y,Z} of orientations, interconvertable to EMAN Transform objects. The main representation is an XYZ vector where the length of the vector represents
@@ -43,7 +43,7 @@ Orientations - an array {N,X,Y,Z} of orientations, interconvertable to EMAN Tran
 
 Points - an array of Point objects {N,X,Y,Z,A} with amplitude, but no width
 
-VERY important to note that when indexing EMData objects it is emd[x,y,z], whereas indexing numpy/tensorflow objects, the last index is the fastest varying ary[z,y,x] !
+VERY important to note that when indexing EMData objects it is emd[x,y,z], whereas indexing numpy/jax objects, the last index is the fastest varying ary[z,y,x] !
 
 ====
 tf.signal.rfft2d    - returns a new constant tensor which is the FFT of the last 2 indices of the tensor.
@@ -59,7 +59,11 @@ np.fromfunction(lambda x,y: np.hypot(x,y),(nx,ny)) - for example
 #import os
 #os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-from EMAN3 import *
+from EMAN3.transform import Transform
+from EMAN3.ctf import EMAN2Ctf
+from EMAN3.io.imageio import ImageIO
+from EMAN3.EMAN3 import LSXFile
+import os
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -85,9 +89,11 @@ class StackCache():
 	def __init__(self,filename):
 		"""Specify the path to the .lst file to be cached"""
 		print("cache: ",filename)
-		hdr=EMData(filename,0,True).get_attr_dict()		# header of the first image so we can compute downsampling
+		io = ImageIO(filename)
+		hdr = io.read_header(0)  # header of the first image so we can compute downsampling
 		if hdr["nx"]<32 : raise Exception("StackCache: Cannot cache files smaller than 32x32 pixels")
 		if hdr["nx"]!=hdr["ny"] or (hdr["nx"]!=hdr["nz"] and hdr["nz"]!=1) : raise Exception("StackCache: Cannot cache non-square/cube images")
+		io.close()
 		if not filename.endswith(".lst"): raise Exception("StackCache: Can only cache .lst files")
 
 		# overall metadata, not stored per-particle
@@ -146,8 +152,15 @@ class StackCache():
 			for i in range(0,len(lsx),chunk):
 				tlast=print_progress(tlast,"caching: ",i,len(lsx))
 				end=min(i+chunk,len(lsx))
-				if hdr["nz"]==1: stk=EMStack2D(EMData.read_images(filename,range(i,end)))
-				else: stk=EMStack3D(EMData.read_images(filename,range(i,end)))
+				indices = list(range(i,end))
+				img_io = ImageIO(filename)
+				if hdr["nz"]==1:
+					data_stack, headers = img_io.read_images(indices)
+					stk=EMStack2D(data_stack,headers=headers)
+				else:
+					data_stack, headers = img_io.read_images(indices)
+					stk=EMStack3D(data_stack,headers=headers)
+				img_io.close()
 
 				self._meta[i:end]=stk.metadata
 
@@ -211,13 +224,11 @@ class StackCache():
 		return data
 
 class EMStack():
-	"""This class represents a stack of images in either an EMData, NumPy or Tensorflow representation, with easy interconversion
-	- Shape of the array is {N,Z,Y,X}, as EMData, it is a list of N x EMData(X,Y,Z)
+	"""This class represents a stack of images in either NumPy or JAX representation.
+	- Shape of the array is {N,Z,Y,X} for 3D or {N,Y,X} for 2D
 	- All images in the stack must have the same dimensions.
-	- Only one representation exists at a time. Coercing to a new type is relatively expensive in terms of time.
-	- Coerce routines will insure that the required representation exists, but others will be lost to insure self-consistency.
-	- The convenience method numpy_list() will return a python list of N {Z,X,Y} NumPy arrays sharing memory with the EMData objects in the EMDataStack,
-	  but beware, as coercing the EMDataStack to a differnt type will invalidate these NumPy arrays, and could create a crash!
+	- Only one representation exists at a time. Coercing to a new type is relatively expensive.
+	- The convenience method numpy() will return a NumPy array sharing memory with the internal data.
 
 	Individual images in the stack may be accessed using [n]
 	"""
@@ -225,24 +236,21 @@ class EMStack():
 	def __init__(self,imgs=None,parent=None):
 		"""	imgs - one of:
 		None
-		filename, with optional ":" range specifier (see https://eman2.org/ImageFormats)
-		single EMData object
-		list or tuple of EMData objects
-		numpy array, with first axis being image number {N,Z,Y,X} | {N,Y,X} | {N,X}
+		filename (reads all images via ImageIO)
+		numpy array, with first axis being image number {N,Z,Y,X} | {N,Y,X}
 		Tensor, with first axis being image number {N,Z,Y,X} ...
 		"""
-		self._data=None	# representation in whatever the current format is
+		self._data=None
 		self._meta=None # (N,11) NumPy array of metadata. Specific meaning different for 2-D and 3-D
-		self._npy_list=None # list of NumPy arrays sharing memory with EMData objects. RISKY - never copy this list, only use in place!
 		self.apix=None
 		self.voltage=None
 		self.cs=None
 		self.is_phase_flipped=None
 
-		self.set_data(imgs,parent)
+		self.set_data(imgs, parent=parent)
 
-	def set_data(self,imgs):
-		raise Exception("EMStack should not be used directly, please use EMStack3D, EMStack2D or EMStack1d")
+	def set_data(self, imgs, parent=None):
+		raise Exception("EMStack should not be used directly, please use EMStack3D or EMStack2D")
 
 	def set_cache(self,meta,apix,voltage,cs):
 		"""Used by the cache class to set internals directly. Not recommended for other use."""
@@ -281,35 +289,17 @@ class EMStack():
 		self.set_data(value)
 
 	@property
-	def emdata(self):
-		self.coerce_emdata()
-		return self._data
-
-	@emdata.setter
-	def emdata(self,value):
-		self.set_data(value)
-
-	@property
-	def numpy_list(self):
-		self.coerce_emdata()
-		if self._npy_list is not None: return
-		self._npy_list=[i.numpy() for i in self._data]
-
-	@property
 	def metadata(self):
 		"""returns the "live" metadata numpy array. That is, this array can be modified in-place and the EMStack2D will see the modifications"""
 		return self._meta
 
 	def coerce_numpy(self):
 		if isinstance(self._data,np.ndarray): return
-		elif self._npy_list is not None: self._data=np.stack(self._npy_list)
-		elif isinstance(self._data,list): self._data=np.stack([i.numpy() for i in self._data])
 		elif isinstance(self._data,jax.Array): self._data=np.array(self._data)
 		else: raise Exception(f"Invalid data in EMStack3D: {type(self._data)}")
 
 	def coerce_jax(self):
 		if isinstance(self._data,jax.Array): return
-		elif isinstance(self._data,list): self._data=to_jax(self._data)
 		elif isinstance(self._data,np.ndarray): self._data=jnp.array(self._data)
 		else: raise Exception(f"Invalid data in EMStack3D: {type(self._data)}")
 
@@ -341,8 +331,17 @@ class EMStack():
 		pass
 
 	def write_images(self,fsp=None,bits=12,n0=0):
-		self.coerce_emdata()
-		im_write_compressed(self._data,fsp,n0,bits)
+		"""Write images to an HDF5 file. fsp is the output filename, bits controls
+		compression/bit-depth (0=float32, 8=uint8, 16=uint16), n0 is start index."""
+		self.coerce_numpy()
+		if fsp is None:
+			fsp = "output.hdf"
+		io = ImageIO(fsp, mode="rw")
+		for i in range(len(self._data)):
+			header = {"nx": self._data[i].shape[-1], "ny": self._data[i].shape[-2], "nz": 1,
+					"render_bits": bits, "render_compress_level": 1}
+			io.write_image(n0+i, self._data[i], header)
+		io.close()
 
 	def downsample(self,newsize):
 		"""Downsamples each image/volume in Fourier space such that its real-space dimensions after downsampling
@@ -352,99 +351,104 @@ class EMStack():
 		pass
 
 class EMStack3D(EMStack):
-	"""This class represents a stack of 3-D Volumes in either an EMData, NumPy or Tensorflow representation, with easy interconversion
-	- Shape of the array is {N,Z,Y,X}, as EMData, it is a list of N x EMData(X,Y,Z)
+	"""This class represents a stack of 3-D Volumes in NumPy or JAX representation.
+	- Shape of the array is {N,Z,Y,X}
 	- All images in the stack must have the same dimensions.
-	- Only one representation exists at a time. Coercing to a new type is relatively expensive in terms of time.
-	- Coerce routines will insure that the required representation exists, but others will be lost to insure self-consistency.
-	- The convenience method numpy_list() will return a python list of N {Z,X,Y} NumPy arrays sharing memory with the EMData objects in the EMDataStack,
-	  but beware, as coercing the EMDataStack to a differnt type will invalidate these NumPy arrays, and could create a crash!
+	- Only one representation exists at a time. Coercing to a new type is relatively expensive.
 	- essential metadata is stored internally upon read: 0:tz/ny,1:ty/ny,2:tx/ny,3:ortx,4:orty,5:ortz,6:score,7:class,8-10 future expansion
 
-	Individual images in the stack may be accessed using emdata[n], tensor[n], numpy[n]
+	Individual images in the stack may be accessed using numpy[n], jax[n]
 	"""
 
-	def set_data(self,imgs,parent=None):
-		""" """
+	def set_data(self, imgs, parent=None, headers=None):
+		"""imgs can be:
+		None
+		numpy array {N,Z,Y,X} or {Z,Y,X} (single volume)
+		JAX array {N,Z,Y,X}
+		filename string (reads all images via ImageIO)
+		
+		parent: EMStack parent to inherit metadata from
+		headers: list of metadata dicts (e.g. from read_header) to populate _meta
+		"""
 		if imgs is None:
 			self._data=None
-			self._npy_list=None
-		elif isinstance(imgs,EMData):
-			if imgs.get_ndim()!=3: raise Exception("EMStack3D only supports 3-D data")
-			self._data=[imgs]
-			self._npy_list=None
-			self._meta=np.zeros((1,11),dtype=np.float32)	# single image
-			try:
-				r=imgs["xform.align3d"].get_params("spinvec")
-				self._meta[0,0:6]=(r["tz"]/imgs["ny"],r["ty"]/imgs["ny"],r["tx"]/imgs["ny"],r["v1"],r["v2"],r["v3"])
-			except: pass
-
-			try: self._meta[0,6]=imgs["score"]
-			except: pass
-
-			try: self._meta[0,7]=imgs["class"]
-			except: pass
-
-			self._npy_list=None
-			self.apix=imgs["apix_x"]
-			try: self.is_phase_flipped=imgs["is_ctf_phase_flipped"]
-			except: self.is_phase_flipped=False
-
-			self.apix=imgs["apix_x"]
-		elif isinstance(imgs,jax.Array) or isinstance(imgs,np.ndarray):
+		## imgs is a numpy or jax array
+		elif isinstance(imgs,(jax.Array,np.ndarray)):
+			imgs=np.asarray(imgs)
 			if len(imgs.shape)==3:
-				imgs=jnp.expand_dims(imgs,0)
-			elif len(imgs.shape)!=4: raise Exception(f"EMStack3D only supports stacks of 3-D data, the provided images were {len(imgs.shape)}-D")
+				imgs=imgs[np.newaxis,:,:,:]  # add batch dim
+			elif len(imgs.shape)!=4: raise Exception(f"EMStack3D only supports stacks of 3-D data, got {len(imgs.shape)}-D")
+			self._data=imgs
+			self._meta=np.zeros((imgs.shape[0],11),dtype=np.float32)
 			if parent is not None:
 				if parent.metadata.shape==(imgs.shape[0],11): self._meta=parent._meta.copy()
-				else: raise Exception(f"EMStack2D(imgs,meta) has {imgs.shape[0]} images but metadata shape is {meta.shape}")
+				else: raise Exception(f"EMStack3D(imgs,meta) has {imgs.shape[0]} images but metadata shape is {meta.shape}")
 				self.apix,self.is_phase_flipped,self.voltage,self.cs=parent.apix,parent.is_phase_flipped,parent.voltage,parent.cs
-			self._data=imgs
-			self._npy_list=None
+			## Extract metadata from headers if provided
+			elif headers is not None:
+				for i,h in enumerate(headers):
+					try:
+						r=h["xform.align3d"].get_params("spinvec")
+						self._meta[i,0:6]=(r["tz"]/h["ny"],r["ty"]/h["ny"],r["tx"]/h["ny"],r["v1"],r["v2"],r["v3"])
+					except: pass
+					try: self._meta[i,6]=h["score"]
+					except: pass
+					try: self._meta[i,7]=h["class"]
+					except: pass
+				self.apix=headers[0].get("apix_x",1.0)
+				try: self.is_phase_flipped=headers[0]["is_ctf_phase_flipped"]
+				except: self.is_phase_flipped=False
+		## imgs is a filename string
 		elif isinstance(imgs,str):
-			self._data=EMData.read_images(imgs)
-			self.apix=self._data[0]["apix_x"]
-			if imgs[0].get_ndim()!=3: raise Exception(f"EMStack3D only supports stacks of 3-D data. {imgs} is {imgs[0].get_ndim()}-D")
-			self._npy_list=None
+			io = ImageIO(imgs)
+			data_stack, headers = io.read_images()
+			self._data=np.asarray(data_stack)
+			io.close()
+			if len(self._data.shape)==3:  # single volume
+				self._data=self._data[np.newaxis,:,:,:]
+			self._meta=np.zeros((self._data.shape[0],11),dtype=np.float32)
+			for i,h in enumerate(headers):
+				try:
+					r=h["xform.align3d"].get_params("spinvec")
+					self._meta[i,0:6]=(r["tz"]/h["ny"],r["ty"]/h["ny"],r["tx"]/h["ny"],r["v1"],r["v2"],r["v3"])
+				except: pass
+				try: self._meta[i,6]=h["score"]
+				except: pass
+				try: self._meta[i,7]=h["class"]
+				except: pass
+			self.apix=headers[0].get("apix_x",1.0)
+			try: self.is_phase_flipped=headers[0]["is_ctf_phase_flipped"]
+			except: self.is_phase_flipped=False
 		else:
-			try:
-				if not isinstance(imgs[0],EMData): raise Exception(f"EMDataStack cannot be initialized with a list of {type(imgs[0])}")
-				self._data=list(imgs)		# copy the list, not the elements of the list
-				self._npy_list=None
-			except: raise Exception("EMDataStack may be initialized with None, a filename, an EMData object, a list/tuple of EMData objects, a NumPy array or a Tensor {N,Z,Y,X}")
+			raise Exception(f"EMStack3D may be initialized with None, filename or numpy/jax array")
 
 	def __len__(self): return len(self._data)
 
 	@property
 	def shape(self):
-		# note that the returned shape is N,Z,Y,X regardless of representation
-		if isinstance(self._data,list): return(np.array((len(self._data),self._data[0]["nz"],self._data[0]["ny"],self._data[0]["nx"])))
-		return(np.array(self._data.shape))
+		return np.array(self._data.shape)
 
 	def center_clip(self,size):
 		size=int(size)
 		if size<1: raise Exception("center_clip(size) must be called with a positive integer")
-		shp=(self.shape-size)//2
-		if isinstance(self._data,list):
-			newlst=[im.get_clip(Region(int(shp[1]),int(shp[2]),int(shp[2]),size,size,size)) for im in self._data]
-			return EMStack3D(newlst)
-		elif isinstance(self._data,np.ndarray) or isinstance(self._data,jax.Array):
-			newary=self._data[:,shp[1]:shp[1]+size,shp[2]:shp[2]+size,shp[3]:shp[3]+size]
-			return EMStack3D(newary)
+		self.coerce_numpy()
+		shp=(np.array(self.shape[1:])-size)//2
+		newary=self._data[:,shp[0]:shp[0]+size,shp[1]:shp[1]+size,shp[2]:shp[2]+size]
+		return EMStack3D(newary)
 
 	def do_fft(self,keep_type=False):
-		"""Computes the FFT of each image and returns a new EMStack3D. If keep_type is not set, will convert to Tensor before computing FFT."""
+		"""Computes the FFT of each image and returns a new EMStack3D."""
 		if keep_type: raise Exception("do_fft: keep_type not functional yet")
 		self.coerce_jax()
 
 		return EMStack3D(jax_fft3d(self._data))
 
 	def do_ift(self,keep_type=False):
-		"""Computes the IFT of each image and returns a new EMStack3D. If keep_type is not set, will convert to Tensor before computing."""
+		"""Computes the IFT of each image and returns a new EMStack3D."""
 		if keep_type: raise Exception("do_ift: keep_type not functional yet")
 		self.coerce_jax()
 
-		return jax_ift3d(self._data)
+		return EMStack3D(jax_ift3d(self._data))
 
 	def calc_ccf(self,target):
 		"""Compute the cross correlation between each image in the stack and target, which may be a single image or another EMStack of the same size"""
@@ -485,134 +489,90 @@ class EMStack3D(EMStack):
 
 
 class EMStack2D(EMStack):
-	"""This class represents a stack of 2-D Images in either an EMData, NumPy or Tensorflow representation, with easy interconversion
-	- Shape of the array is {N,Y,X}, as EMData, it is a list of N x EMData(X,Y)
+	"""This class represents a stack of 2-D Images in NumPy or JAX representation.
+	- Shape of the array is {N,Y,X}
 	- All images in the stack must have the same dimensions.
-	- Only one representation exists at a time. Coercing to a new type is relatively expensive in terms of time.
-	- Coerce routines will insure that the required representation exists, but others will be lost to insure self-consistency.
-	- The convenience method numpy_list() will return a python list of N {Z,X,Y} NumPy arrays sharing memory with the EMData objects in the EMDataStack,
-	  but beware, as coercing the EMDataStack to a differnt type will invalidate these NumPy arrays, and could create a crash!
+	- Only one representation exists at a time. Coercing to a new type is relatively expensive.
 	- essential metadata is stored internally upon read: 0:ty/ny,1:tx/ny,2:ortx,3:orty,4:ortz,5:defocus,6:phase,7:dfdiff,8:astigangle,9:score,10:class
 
-	Note that EMData headers are lost if converted to jax or numpy!
-
-	Individual images in the stack may be accessed using emdata[n], jax[n], numpy[n]
+	Individual images in the stack may be accessed using numpy[n], jax[n]
 	"""
 
-	def set_data(self,imgs,parent=None):
-		"""imgs can be a single EMData instance, a list of EMData instances, an image filename or a np or jnp array.
-If initialized with an array, the optional parent argument is only used when imgs is a numpy/jax array to set the corresponding
-metadata in the new object."""
+	def set_data(self, imgs, parent=None, headers=None):
+		"""imgs can be:
+		None
+		numpy array {N,Y,X}
+		JAX array {N,Y,X}
+		filename string (reads all images via ImageIO)
+		
+		parent: EMStack parent to inherit metadata from
+		headers: list of metadata dicts (e.g. from read_header) to populate _meta
+		"""
 		self._meta=None
 
 		if imgs is None:
 			self._data=None
-			self._npy_list=None
-		## imgs is a filename
-		elif isinstance(imgs,EMData):
-			if imgs.get_ndim()!=2: raise Exception("EMStack2D only supports 2-D data")
-			self._data=[imgs]
-
-			self._meta=np.zeros((1,11),dtype=np.float32)	# single image
-			try:
-				r=imgs["xform.projection"].get_params("spinvec")
-				self._meta[0,0:5]=(r["ty"]/imgs["ny"],r["tx"]/imgs["ny"],r["v1"],r["v2"],r["v3"])
-			except: pass
-
-			try:
-				ctf = imgs["ctf"]
-				self._meta[0,5:9]=(ctf.defocus,ctf.get_phase(),ctf.dfdiff,ctf.dfang)
-			except:
-				try:
-					js=js_open_dict(info_name(imgs["ptcl_source_image"]))
-					ctf = js["ctf"][0]
-					self._meta[0,5:9]=(ctf.defocus,ctf.get_phase(),ctf.dfdiff,ctf.dfang)
-					js.close()
-				except: pass
-
-			try: self._meta[0,9]=imgs["score"]
-			except: pass
-
-			try: self._meta[0,10]=imgs["class"]
-			except: pass
-
-			self._npy_list=None
-			self.apix=imgs["apix_x"]
-			try: self.is_phase_flipped=imgs["is_ctf_phase_flipped"]
-			except: self.is_phase_flipped=False
 		## imgs is a numpy or jax array
-		elif isinstance(imgs,jax.Array) or isinstance(imgs,np.ndarray):
-			if len(imgs.shape)!=3: raise Exception(f"EMStack2D only supports stacks of 2-D data, the provided images were {len(imgs.shape)}-D")
+		elif isinstance(imgs,(jax.Array,np.ndarray)):
+			imgs=np.asarray(imgs)
+			if len(imgs.shape)==2:  # single image, add batch dim
+				imgs=imgs[np.newaxis,:,:]
+			elif len(imgs.shape)!=3: raise Exception(f"EMStack2D only supports stacks of 2-D data, got {len(imgs.shape)}-D")
 			self._data=imgs
+			self._meta=np.zeros((imgs.shape[0],11),dtype=np.float32)
 			if parent is not None:
 				if parent.metadata.shape==(imgs.shape[0],11): self._meta=parent._meta.copy()
 				else: raise Exception(f"EMStack2D(imgs,meta) has {imgs.shape[0]} images but metadata shape is {meta.shape}")
 				self.apix,self.is_phase_flipped,self.voltage,self.cs=parent.apix,parent.is_phase_flipped,parent.voltage,parent.cs
-
-			self._npy_list=None
-		## imgs is a filename
-		elif isinstance(imgs,str):
-			self._data=EMData.read_images(imgs)
-			if self._data[0].get_ndim()!=2:
-				if len(self._data)!=1 : raise Exception(f"EMStack2D only supports stacks of 2-D data or a single volume. {imgs} is a stack of {self._data[0].get_ndim()}-D")
-			self.apix=self._data[0]["apix_x"]
-			try: self.is_phase_flipped=self._data[0]["is_ctf_phase_flipped"]
-			except: self.is_phase_flipped=False
-			self._meta=np.zeros((len(self._data),11),dtype=np.float32)	# single image
-			for i,im in enumerate(self._data):
-				try:
-					r=im["xform.projection"].get_params("spinvec")
-					self._meta[i,0:5]=(r["ty"]/im["ny"],r["tx"]/im["ny"],r["v1"],r["v2"],r["v3"])
-				except: pass
-
-				try:
-					ctf = im["ctf"]
-					self._meta[i,5:9]=(ctf.defocus,ctf.get_phase(),ctf.dfdiff,ctf.dfang)
-				except: pass
-
-				try: self._meta[i,9]=im["score"]
-				except: pass
-
-				try: self._meta[i,10]=im["class"]
-				except: pass
-
-			self._npy_list=None
-		## imgs is a list of EMData objects
-		else:
-			# try:
-				if not isinstance(imgs[0],EMData): raise Exception(f"EMDataStack cannot be initialized with a list of {type(imgs[0])}")
-				self._data=list(imgs)		# copy the list, not the elements of the list
-
-				self.apix=self._data[0]["apix_x"]
-				try: self.is_phase_flipped=self._data[0]["is_ctf_phase_flipped"]
-				except: self.is_phase_flipped=False
-				self._meta=np.zeros((len(self._data),11),dtype=np.float32)	# single image
-				for i,im in enumerate(self._data):
+			## Extract metadata from headers if provided
+			elif headers is not None:
+				for i,h in enumerate(headers):
 					try:
-						r=im["xform.projection"].get_params("spinvec")
-						self._meta[i,0:5]=(r["ty"]/im["ny"],r["tx"]/im["ny"],r["v1"],r["v2"],r["v3"])
+						r=h["xform.projection"].get_params("spinvec")
+						self._meta[i,0:5]=(r["ty"]/h["ny"],r["tx"]/h["ny"],r["v1"],r["v2"],r["v3"])
 					except: pass
-
 					try:
-						ctf = im["ctf"]
+						ctf = h["ctf"]
 						self._meta[i,5:9]=(ctf.defocus,ctf.get_phase(),ctf.dfdiff,ctf.dfang)
 					except: pass
-
-					try: self._meta[i,9]=im["score"]
+					try: self._meta[i,9]=h["score"]
 					except: pass
-
-					try: self._meta[i,10]=im["class"]
+					try: self._meta[i,10]=h["class"]
 					except: pass
-				self._npy_list=None
-			# except:
-			# 	traceback.print_exc()
-			# 	raise Exception("EMStack2D may be initialized with None, a filename, an EMData object, a list/tuple of EMData objects, a NumPy array or a Tensor {N,Y,X}")
+				self.apix=headers[0].get("apix_x",1.0)
+				try: self.is_phase_flipped=headers[0]["is_ctf_phase_flipped"]
+				except: self.is_phase_flipped=False
+		## imgs is a filename string
+		elif isinstance(imgs,str):
+			io = ImageIO(imgs)
+			data_stack, headers = io.read_images()
+			self._data=np.asarray(data_stack)
+			io.close()
+			self._meta=np.zeros((len(headers),11),dtype=np.float32)
+			for i,h in enumerate(headers):
+				try:
+					r=h["xform.projection"].get_params("spinvec")
+					self._meta[i,0:5]=(r["ty"]/h["ny"],r["tx"]/h["ny"],r["v1"],r["v2"],r["v3"])
+				except: pass
+				try:
+					ctf = h["ctf"]
+					self._meta[i,5:9]=(ctf.defocus,ctf.get_phase(),ctf.dfdiff,ctf.dfang)
+				except: pass
+				try: self._meta[i,9]=h["score"]
+				except: pass
+				try: self._meta[i,10]=h["class"]
+				except: pass
+			self.apix=headers[0].get("apix_x",1.0)
+			try: self.is_phase_flipped=headers[0]["is_ctf_phase_flipped"]
+			except: self.is_phase_flipped=False
+		else:
+			raise Exception(f"EMStack2D may be initialized with None, filename or numpy/jax array")
 
 		# if we got at least one CTF object somewhere it should still exist
 		try:
 			self.voltage=ctf.voltage
 			self.cs=ctf.cs
-			self.apix=ctf.apix			# if it exists, it should agree with the ctf fitting
+			self.apix=ctf.apix
 		except:
 			self.voltage=None
 			self.cs=None
@@ -621,9 +581,7 @@ metadata in the new object."""
 
 	@property
 	def shape(self):
-		# note that the returned shape is N,Y,X regardless of representation
-		if isinstance(self._data,list): return(np.array((len(self._data),self._data[0]["ny"],self._data[0]["nx"])))
-		return(np.array(self._data.shape))
+		return np.array(self._data.shape)
 
 	@property
 	def orientations(self):
@@ -741,11 +699,8 @@ metadata in the new object."""
 		return EMStack2D((self.jax-edgemean[:,jnp.newaxis,jnp.newaxis])/jnp.std(self.jax,axis=(1,2))[:,jnp.newaxis,jnp.newaxis],self)
 
 	def center_align_seq(self,region_size=-1):
-		"""Aligns a stack of (real space) images using the middle 1/2 (in x/y) of each image, and the middle image as a starting point.
-		designed to do a rough alignment of tilt series. region_size is the size in pixels of the region around the center of each
-		image to use for alignment. Default is ~1/2 the box size. All sizes adjusted to a good size"""
-
-		#TODO - While functional, this whole method seems inefficient, particularly in terms of JAX
+		"""Aligns a stack of (real space) images using the middle 1/2 (in x/y) of each image,
+		and the middle image as a starting point. Designed for rough alignment of tilt series."""
 		if region_size<=32 : region_size=self.shape[1]//2
 		region_size=good_size(region_size)
 
@@ -759,20 +714,20 @@ metadata in the new object."""
 		abot1=EMStack2D(cens.jax[jnp.arange(nc-1,-1,-1)])
 		alibot=abot0.align_translate(abot1)
 
-#		print(alibot,alitop)
-
-		self.coerce_emdata()
+		# Apply shifts to numpy data directly using scipy.ndimage.shift or similar
+		from scipy import ndimage
+		self.coerce_numpy()
 		dx,dy=0,0
 		for i,sh in enumerate(alibot):
 			dx+=sh[1]
 			dy+=sh[0]
-			self.emdata[nc-i-1].translate(-int(dx),-int(dy),0)
+			self._data[nc-i-1]=ndimage.shift(self._data[nc-i-1],(-dy,-dx),order=1)
 
 		dx,dy=0,0
 		for i,sh in enumerate(alitop):
 			dx+=sh[1]
 			dy+=sh[0]
-			self.emdata[nc+i+1].translate(-int(dx),-int(dy),0)
+			self._data[nc+i+1]=ndimage.shift(self._data[nc+i+1],(-dy,-dx),order=1)
 
 
 	def align_translate(self,ref,maxshift=-1):
@@ -1175,15 +1130,14 @@ x,y,z are ~-0.5 to ~0.5 (typ) and amp is 0 to ~1. A scaling factor (value -> pix
 		"""Replace the current set of Points with a set of Points generated from a 3-D map by progressive Gaussian decomposition.
 		The map is filtered to res, then the highest amplitude peak is assigned to the first Gaussian. After subtracting that Gaussian from the
 		map the process is repeated until the ratio of the next amplitude to the first amplitude falls below the minratio limit.
-		vol - a single EMData, numpy or tensorflow volume
+		vol - a single EMData, numpy or jax volume
 		res - lowpass filter resolution and the FWHM of the Points to be subtracted, specified in A, use apix for non-EMData volumes
 		minratio - minimum peak ratio, >0
 		apix - A/pix override"""
 
-		if isinstance(vol,jax.Array): emd=from_jax(vol)
-		elif isinstance(vol,np.ndarray): emd=from_numpy(vol)
-		elif isinstance(vol,EMData): emd=vol
-		else: raise Exception("init_from_map: vol must be EMData, Tensor or NumPy Array")
+		if isinstance(vol,jax.Array): emd=np.array(from_jax(vol))
+		elif isinstance(vol,np.ndarray): emd=vol
+		else: raise Exception("init_from_map: vol must be a numpy array or JAX tensor")
 
 		if apix is not None: emd["apix_x"],emd["apix_y"],emd["apix_z"]=apix,apix,apix
 
@@ -1230,7 +1184,6 @@ significantly altering the spatial distribution. npoint specifies the total numb
 		"""
 		"""
 		if isinstance(mask,EMStack2D) : mask=mask.jax
-		elif isinstance(mask,EMData) : mask=to_jax(mask)
 		elif isinstance(mask,np.ndarray) : mask=jnp.array(mask)
 		elif not isinstance(mask,jax.Array) : raise Exception("invalid data type for Points.mask")
 
@@ -1306,7 +1259,7 @@ significantly altering the spatial distribution. npoint specifies the total numb
 		"""A numpy implementation of volume since the jax at method makes a copy instead of updating in place when not in jit compiled and was causing OOM errors"""
 		zsize=good_size(boxsize*zaspect*2.0)
 		vol=np.zeros((zsize,boxsize,boxsize))
-		xfpoint=np.flip((self[:,:3]+jnp.array((0.5,0.5,zaspect)))*boxsize,-1)		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->Tensorflow issue
+		xfpoint=np.flip((self[:,:3]+jnp.array((0.5,0.5,zaspect)))*boxsize,-1)		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->jax issue
 
 		xfpointf=np.floor(xfpoint)
 		xfpointi=np.ndarray.astype(xfpointf,np.int32)   # integer index
@@ -1364,7 +1317,7 @@ significantly altering the spatial distribution. npoint specifies the total numb
 		bposall=bposall[mask]
 		vol[bposall[:,0], bposall[:,1],bposall[:,2]]+=bampall
 
-		return from_numpy(vol) # I think this makes a copy which isn't ideal but I don't know how to get it to an EMData object another way
+		return vol # I think this makes a copy which isn't ideal but I don't know how to get it to an EMData object another way
 
 def point_project_single_fn(pointary,mx,boxsize,tytx):
 	"""This exists as a function separate from the Point class to better support JAX optimization. It is called by the corresponding Point method.
@@ -1391,7 +1344,7 @@ def point_project_single_fn(pointary,mx,boxsize,tytx):
 	# jax.debug.print("Shape of mx: {x}", x=mx.shape)
 	# jax.debug.print("Shape of pointary sliced: {y}", y=pointary[:, :3].shape)
 	# print(f"{mx.shape},{pointary[:, :3].shape}")
-	xfpoint=jnp.einsum("ij,kj->ki",mx,pointary[:,:3])	# changed to ik instead of ki due to y,x ordering in tensorflow
+	xfpoint=jnp.einsum("ij,kj->ki",mx,pointary[:,:3])	# changed to ik instead of ki due to y,x ordering in jax
 	xfpoint+=tytx[:2]	# translation, ignore z or any other variables which might be used for per particle defocus, etc
 	xfpoint=(xfpoint+0.5)*os_bs			# shift and scale both x and y the same
 
@@ -1512,7 +1465,7 @@ def point_project_ctf_single_fn(pointary,mx,ctf_info,apix,boxsize,tytx,astig):
 	shift01=jnp.array((0,1))
 	shift11=jnp.array((1,1))
 
-	xfpoint=jnp.einsum("ij,kj->ki",mx,pointary[:,:3])	# changed to ik instead of ki due to y,x ordering in tensorflow
+	xfpoint=jnp.einsum("ij,kj->ki",mx,pointary[:,:3])	# changed to ik instead of ki due to y,x ordering in jax
 	xfpoint+=tytx[:2]	# translation, ignore z or any other variables which might be used for per particle defocus, etc
 	xfpoint=(xfpoint+0.5)*os_bs			# shift and scale both x and y the same
 
@@ -1604,7 +1557,7 @@ def point_project_layered_ctf_single_fn(pointary,mx,ctf_info,dfstep,apix,boxsize
 	boxstep=dfstep*10000.0/apix
 	offset = ceil((boxsize*1.733-boxstep)/(2*boxstep))
 
-	xfpoint=jnp.fliplr(jnp.einsum("ij,kj->ki",mx,pointary[:,:3]))	# changed to ik instead of ki due to y,x ordering in tensorflow
+	xfpoint=jnp.fliplr(jnp.einsum("ij,kj->ki",mx,pointary[:,:3]))	# changed to ik instead of ki due to y,x ordering in jax
 	xfpointz = xfpoint[:,0]
 	xfpoint = xfpoint[:,1:]+tytx	# translation
 	xfpoint=(xfpoint+0.5)*boxsize			# shift and scale both x and y the same
@@ -1676,9 +1629,9 @@ def point_project_layered_ctf_sym_fn(pointary, ortary, ctf_info, dfstep, apix, n
 def point_volume_fn(pointary,boxsize,zsize):
 	"""This exists as a function separate from the Point class to better support JAX optimization. It is called by the corresponding Point method."""
 
-#		xfpoint=tf.reverse((pointary[:,:3]+(0.5,0.5,zaspect))*boxsize,[-1])		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->Tensorflow issue
+#		xfpoint=tf.reverse((pointary[:,:3]+(0.5,0.5,zaspect))*boxsize,[-1])		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->jax issue
 	zaspect=zsize/(2.0*boxsize)
-	xfpoint=jnp.flip((pointary[:,:3]+jnp.array((0.5,0.5,zaspect)))*boxsize,-1)		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->Tensorflow issue
+	xfpoint=jnp.flip((pointary[:,:3]+jnp.array((0.5,0.5,zaspect)))*boxsize,-1)		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->jax issue
 	pos_mask = jnp.all(jnp.logical_and(xfpoint>0.0, xfpoint<boxsize-1.0001),axis=1).astype(float)
 	xfpoint=jnp.clip(xfpoint,0.0,boxsize-1.0001)
 
@@ -1795,13 +1748,13 @@ def jax_to_mx3d(ortary):
 
 JAXDEV=jax.devices()[0]
 def jax_set_device(dev=0,maxmem=4096):
-	"""Sets maximum memory for a specific Tensorflow device and returns a device to use with "with:"
+	"""Sets maximum memory for a specific jax device and returns a device to use with "with:"
 	dev - GPU number or -1 for CPU (CPU doesn't actually permit memory size allocation)
 	maxmem - maximum memory to allocate in megabytes
 
 	dev=tf_set_device(gpuid,6144)
 	with dev:
-		# tensorflow operations, "with" block optional
+		# jax operations, "with" block optional
 	"""
 	global JAXDEV
 	if dev<0 :
@@ -1815,29 +1768,26 @@ def jax_set_device(dev=0,maxmem=4096):
 		# tf.config.set_logical_device_configuration(pdevice,[tf.config.LogicalDeviceConfiguration(memory_limit=maxmem)])
 		# return tf.device(f'/GPU:{dev}')
 
-def from_jax(jaxtensor,stack=False):
-	"""Convert a specified tensor to an EMData object
-	If stack is set, then the first axis of the tensor will be unpacked to form a list. ie a 3D tensor would become a list of 2D EMData objects"""
-
+def from_jax(jaxtensor, stack=False):
+	"""Convert a JAX tensor to NumPy array(s).
+	If stack is set, the first axis will be unpacked into a list of arrays."""
+	arr = np.array(jaxtensor)
 	if stack:
-		return [EMNumPy.numpy2em(np.array(jaxtensor[i])) for i in range(jaxtensor.shape[0])]
-	return EMNumPy.numpy2em(np.array(jaxtensor))
+		return [arr[i] for i in range(arr.shape[0])]
+	return arr
 
-def to_jax(emdata):
-	"""Convert a specified EMData object or list of EMData objects into a JAX tensor. The tensor is immutable."""
-
-	if isinstance(emdata,EMData):
-		return jnp.array(EMNumPy.em2numpy(emdata))
-
-	if isinstance(emdata,list) or isinstance(emdata,tuple):
-		npstack=np.stack([to_numpy(im) for im in emdata],axis=0)
+def to_jax(data):
+	"""Convert a NumPy array or stack into a JAX tensor."""
+	if isinstance(data, np.ndarray):
+		return jnp.array(data)
+	if isinstance(data, (list, tuple)):
+		npstack = np.stack([np.asarray(im) for im in data], axis=0)
 		return jnp.array(npstack)
+	raise Exception(f"to_jax: unsupported type {type(data)}")
 
 def jax_fft2d(imgs):
-	if isinstance(imgs,EMData) or ((isinstance(imgs,list) or isinstance(imgs,tuple)) and isinstance(imgs[0],EMData)): imgs=to_jax(imgs)
-
+	if not isinstance(imgs, jax.Array): imgs = to_jax(imgs)
 	if imgs.dtype==jnp.complex64: raise Exception("Data type must be real")
-
 	return jnp.fft.rfft2(imgs)
 
 @jax.jit
@@ -1845,24 +1795,18 @@ def jax_fft2d_jit(imgs):
 	return jnp.fft.rfft2(imgs)
 
 def jax_fft3d(imgs):
-	if isinstance(imgs,EMData) or ((isinstance(imgs,list) or isinstance(imgs,tuple)) and isinstance(imgs[0],EMData)): imgs=to_jax(imgs)
-
+	if not isinstance(imgs, jax.Array): imgs = to_jax(imgs)
 	if imgs.dtype==jnp.complex64: raise Exception("Data type must be real")
-
 	return jnp.fft.rfftn(imgs,axes=(-3,-2,-1))
 
 def jax_ift2d(imgs):
-	if isinstance(imgs,EMData) or ((isinstance(imgs,list) or isinstance(imgs,tuple)) and isinstance(imgs[0],EMData)): imgs=to_jax(imgs)
-
+	if not isinstance(imgs, jax.Array): imgs = to_jax(imgs)
 	if imgs.dtype!=jnp.complex64: raise Exception("Data type must be complex")
-
 	return jnp.fft.irfft2(imgs)
 
 def jax_ift3d(imgs):
-	if isinstance(imgs,EMData) or ((isinstance(imgs,list) or isinstance(imgs,tuple)) and isinstance(imgs[0],EMData)): imgs=to_jax(imgs)
-
+	if not isinstance(imgs, jax.Array): imgs = to_jax(imgs)
 	if imgs.dtype!=jnp.complex64: raise Exception("Data type must be complex")
-
 	return jnp.fft.irfftn(imgs,axes=[-3,-2,-1])
 
 POF2D=None
@@ -1899,7 +1843,7 @@ def jax_pointfilt_2d(boxsize,halfwidth):
 
 
 def jax_downsample_2d(imgs,newx,stack=False):
-	"""Fourier downsamples a tensorflow 2D image or stack of 2D images (similar to math.fft.resample processor conceptually)
+	"""Fourier downsamples a jax 2D image or stack of 2D images (similar to math.fft.resample processor conceptually)
 	return will always be a stack (3d tensor) even if the first dimension is 1
 	passed image/stack may be real or complex (FFT), return is always complex!
 	final image will be a square/cube with the (real space) size nx on all axes. Should not be used to downsample rectangular images.
@@ -1909,7 +1853,7 @@ def jax_downsample_2d(imgs,newx,stack=False):
 
 	if newx%2!=0 : raise Exception("newx must be an even number")
 
-	if isinstance(imgs,EMData) or ((isinstance(imgs,list) or isinstance(imgs,tuple)) and isinstance(imgs[0],EMData)): imgs=to_jax(imgs)
+	if not isinstance(imgs, jax.Array): imgs = to_jax(imgs)
 
 	if imgs.dtype!=jnp.complex64: imgs=jnp.fft.rfft2(imgs)
 
@@ -1921,7 +1865,7 @@ def jax_downsample_2d(imgs,newx,stack=False):
 	return imgs[:,:,:newx//2+1]
 
 def jax_downsample_3d(imgs,newx,stack=False):
-	"""Fourier downsamples a tensorflow 3D image or stack of 3D images (similar to math.fft.resample processor conceptually)
+	"""Fourier downsamples a jax 3D image or stack of 3D images (similar to math.fft.resample processor conceptually)
 	return will always be a stack (3d tensor) even if the first dimension is 1
 	passed image/stack may be real or complex (FFT), return is always complex!
 	final image will be a square/cube with the size nx on all axes. Should not be used to downsample rectangular images.
@@ -1931,7 +1875,7 @@ def jax_downsample_3d(imgs,newx,stack=False):
 
 	if newx%2!=0 : raise Exception("newx must be an even number")
 
-	if isinstance(imgs,EMData) or ((isinstance(imgs,list) or isinstance(imgs,tuple)) and isinstance(imgs[0],EMData)): imgs=to_jax(imgs)
+	if not isinstance(imgs, jax.Array): imgs = to_jax(imgs)
 
 	if imgs.dtype!=jnp.complex64: imgs=jnp.fft.rfftn(imgs,axes=(-3,-2,-1))
 

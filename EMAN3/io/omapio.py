@@ -244,40 +244,52 @@ class OmapIO:
 		"""Return 1 — this format stores a single image."""
 		return 1
 
-	def is_valid(filepath):
+	@staticmethod
+	def is_valid(filepath, chunk=None):
 		"""Check whether a file has a valid OMAP/DNS6/BRIX header.
 
 		Reads the first 512-byte record(s) and validates: scale2==100,
 		dimensions in range (0, 10000], etc. Matches C++ OmapIO::is_valid.
+		If chunk is provided, checks the chunk instead of reopening the file.
 		"""
 		try:
-			with open(os.path.expanduser(filepath), "rb") as f:
-				record = f.read(512)
+			if chunk is not None:
+				# Use chunk data directly
+				record = chunk[:512]
 				if len(record) < 512:
 					return False
-
 				# Check for ASCII preamble (skip if present)
 				if _is_ascii_record(record):
+					record = chunk[512:1024]
+					if len(record) < 512:
+						return False
+			else:
+				with open(os.path.expanduser(filepath), "rb") as f:
 					record = f.read(512)
 					if len(record) < 512:
 						return False
+					# Check for ASCII preamble (skip if present)
+					if _is_ascii_record(record):
+						record = f.read(512)
+						if len(record) < 512:
+							return False
 
-				hed = np.frombuffer(record, dtype=OMAP_HEADER_DTYPE)[0]
+			hed = np.frombuffer(record, dtype=OMAP_HEADER_DTYPE)[0]
 
-				# C++ is_valid checks scale2==100 and dimensions in (0, 10000]
-				scale2_val = int(hed["scale2"])
-				if scale2_val != 100:
-					return False
+			# C++ is_valid checks scale2==100 and dimensions in (0, 10000]
+			scale2_val = int(hed["scale2"])
+			if scale2_val != 100:
+				return False
 
-				nx = int(hed["nx"])
-				ny = int(hed["ny"])
-				nz = int(hed["nz"])
-				if nx <= 0 or ny <= 0 or nz <= 0:
-					return False
-				if nx > 10000 or ny > 10000 or nz > 10000:
-					return False
+			nx = int(hed["nx"])
+			ny = int(hed["ny"])
+			nz = int(hed["nz"])
+			if nx <= 0 or ny <= 0 or nz <= 0:
+				return False
+			if nx > 10000 or ny > 10000 or nz > 10000:
+				return False
 
-				return True
+			return True
 
 		except Exception:
 			return False

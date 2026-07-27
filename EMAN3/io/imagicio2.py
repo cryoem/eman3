@@ -322,17 +322,21 @@ class ImagicIO:
 		return [0]
 
 	@staticmethod
-	def is_valid(filepath):
+	def is_valid(filepath, chunk=None):
 		"""Check whether a .hed file is a valid IMAGIC-4D header.
 
 		Reads the first Imagic4D record and validates required fields:
 		realtype must be one of the known machine stamps, headrec==1,
 		dimensions in reasonable ranges, etc. Matches C++ SpiderIO::is_valid.
+		If chunk is provided, checks the chunk instead of reopening the file.
 		"""
-		hed_path = filepath if filepath.endswith(".hed") else filepath + ".hed"
 		try:
-			with open(hed_path, "rb") as f:
-				raw = f.read(IMAGIC_HEADER_DTYPE.itemsize)
+			if chunk is not None:
+				raw = chunk
+			else:
+				hed_path = filepath if filepath.endswith(".hed") else filepath + ".hed"
+				with open(hed_path, "rb") as f:
+					raw = f.read(IMAGIC_HEADER_DTYPE.itemsize)
 			if len(raw) < IMAGIC_HEADER_DTYPE.itemsize:
 				return False
 
