@@ -2,7 +2,8 @@
 # Ported from EMAN2 qtgui/emimage2d.py
 
 import weakref
-from EMAN3.gui.valslider import ValSlider, ValBox, StringBox
+from math import sqrt
+from EMAN3.gui.valslider import ValSlider, ValBox
 
 import pygfx as gfx
 from rendercanvas.qt import QRenderWidget
@@ -10,9 +11,8 @@ from rendercanvas.qt import QRenderWidget
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
 from EMAN3.gui.emshape import (
-	ShapeLine, ShapeCircle, ShapeLabel,
-	ShapeScrRect, ShapeScrLabel, ShapeRCircle,
-	ShapeScrCircle, ShapeRectPoint,
+	ShapeLine, ShapeRectPoint,
+	PyGfxRenderer,
 )
 import numpy as np
 
@@ -123,11 +123,10 @@ def _resize_nearest(src, dst_h, dst_w):
 		return src.copy()
 
 	sy, sx = src.shape
-	# Map each output pixel to the nearest source pixel center
-	y_idx = np.floor(np.linspace(0.5, sy - 0.5, dst_h)).astype(int)
-	x_idx = np.floor(np.linspace(0.5, sx - 0.5, dst_w)).astype(int)
-	y_idx = np.clip(y_idx, 0, sy - 1)
-	x_idx = np.clip(x_idx, 0, sx - 1)
+	# Each output pixel maps to the nearest source pixel.
+	# Integer arithmetic gives exact distribution: dst_h/src rows per row.
+	y_idx = (np.arange(dst_h) * sy // dst_h).astype(int)
+	x_idx = (np.arange(dst_w) * sx // dst_w).astype(int)
 	return src[np.ix_(y_idx, x_idx)]
 
 
@@ -389,6 +388,13 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			self._camera = gfx.OrthographicCamera()
 			self._camera.world.position = (0, 0, 1)
 
+			# Ensure line materials are initialized early by adding an invisible placeholder
+			_dummy_verts = np.array([[0, 0, 2], [0, 0, 2]], dtype=np.float32)
+			self._line_init_placeholder = gfx.Line(
+				gfx.Geometry(positions=_dummy_verts),
+				gfx.LineThinMaterial(thickness=1, color=(0, 0, 0, 0)))
+			self._scene.add(self._line_init_placeholder)
+
 			self.setAcceptDrops(True)
 			self.setContextMenuPolicy(Qt.PreventContextMenu)
 
@@ -421,7 +427,9 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		try:
 			self._renderer.render(self._scene, self._camera)
 		except Exception as e:
+			import traceback
 			print(f"Render error: {e}")
+			traceback.print_exc()
 
 		self._canvas.request_draw(self._render_callback)
 
@@ -505,6 +513,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 				self.inspector.enable_image_range(0, len(self._list_data), self._list_idx)
 			else:
 				self.inspector.disable_image_range()
+			self.inspector.update_app_tab()
 
 		self.force_display_update()
 
@@ -591,6 +600,13 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			# Clear probe/measure overlays when switching modes
 			self.shapes.pop("PROBE", None)
 			self.shapes.pop("MEAS", None)
+			self._request_render()
+			# Clear probe labels if switching away from probe mode
+			if self.inspector and mode_num != 3:
+				self.inspector.set_probe_values(None, None, None, None, None, None, None, None, None, 0, 0)
+			# Clear measure labels if switching away from measure mode
+			if self.inspector and mode_num != 4:
+				self.inspector.set_measure_info(0, 0, 0, 0, 0.0, 0.0, 0.0, 1.0)
 
 	def auto_contrast(self, inspector_update=True, display_update=True):
 		"""Auto-adjust contrast to mean +/- 3 sigma."""
@@ -778,8 +794,8 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		# Update PyGfx texture (float32 in [0..1], no post-processing contrast/brightness)
 		self._update_texture(rgb)
 
-		# Render shape overlays on top
-		if self.display_shapes and self.shapes:
+		# Render shape overlays on top (always render when there's a stack for the counter)
+		if self.display_shapes and (self.shapes or self._list_data):
 			self._render_shapes(w, h)
 
 		# Apply frozen/excluded overlays (rgb is now float32 in [0..1])
@@ -812,7 +828,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		"""Create the PyGfx texture and image node for display."""
 		try:
 			empty_data = np.zeros((h, w, 4), dtype=np.float32)
-			self._gfx_texture = gfx.Texture(empty_data, dim=2, colorspace='physical')
+			self._gfx_texture = gfx.Texture(empty_data, dim=2)
 
 			geometry = gfx.Geometry(grid=self._gfx_texture)
 			material = gfx.ImageBasicMaterial()
@@ -830,7 +846,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 	# ── Shape rendering ──
 
 	def _render_shapes(self, w, h):
-		"""Render shape overlays on top of the image."""
+		"""Render shape overlays on top of the image via their own render() methods."""
 		if self._shape_group is None:
 			self._shape_group = gfx.Group()
 			self._shape_group.render_order = 10
@@ -840,99 +856,32 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		while len(self._shape_group.children) > 0:
 			self._shape_group.remove(self._shape_group.children[0])
 
+		# Data-to-screen transform: (data_x, data_y) -> pygfx world coords
+		def d2s(dx, dy):
+			sx = self.origin[0] + dx * self.scale
+			sy = self.origin[1] + dy * self.scale
+			return sx, sy
+
+		renderer = PyGfxRenderer(self._shape_group)
+
+		# Add image counter label (screen coords, lower-right corner)
+		if self._list_data is not None and len(self._list_data) > 1:
+			label_text = f"{self._list_idx} ({len(self._list_data)})"
+			x_pos = w - 80
+			y_pos = 25  # screen_space Y: 0=bottom, small value = lower margin
+			try:
+				node = gfx.Text(label_text, font_size=14, screen_space=True)
+				node.local.position = (float(x_pos), float(y_pos), 0)
+				node.material.color = (0.9, 0.9, 0.7, 1.0)
+				renderer._group.add(node)
+			except Exception:
+				pass
+
 		for name, shape in self.shapes.items():
-			node = self._render_single_shape(shape, w, h)
-			if node:
-				self._shape_group.add(node)
-
-	def _render_single_shape(self, shape, w, h):
-		"""Render a single shape as a PyGfx node."""
-		try:
-			if isinstance(shape, ShapeLine):
-				x0s, y0s = self._img_to_scr(shape.x0, shape.y0, w, h)
-				x1s, y1s = self._img_to_scr(shape.x1, shape.y1, w, h)
-				return self._make_line_node(
-					x0s, y0s, x1s, y1s, shape.r, shape.g, shape.b, True)
-
-			elif isinstance(shape, ShapeRCircle):
-				# Data-space inscribed circle from bounding rectangle
-				sx0, sy0 = self._img_to_scr(shape.x0, shape.y0, w, h)
-				sx1, sy1 = self._img_to_scr(shape.x1, shape.y1, w, h)
-				sx_c = (sx0 + sx1) / 2.0
-				sy_c = (sy0 + sy1) / 2.0
-				sr = min(abs(sx1 - sx0), abs(sy1 - sy0)) / 2.0
-				return self._make_circle_node(sx_c, sy_c, sr, shape.r, shape.g, shape.b, False)
-
-			elif isinstance(shape, ShapeCircle):
-				# Data-space circle
-				sx, sy = self._img_to_scr(shape.cx, shape.cy, w, h)
-				sr = shape.radius * self.scale
-				return self._make_circle_node(sx, sy, sr, shape.r, shape.g, shape.b, True)
-
-			elif isinstance(shape, ShapeScrLabel):
-				# Screen-space label
-				return self._make_text_node(
-					shape.text, shape.x, shape.y,
-					shape.r, shape.g, shape.b, True)
-
-			elif isinstance(shape, ShapeLabel):
-				# Data-space label
-				return self._make_text_node(
-					shape.text, shape.x, shape.y,
-					shape.r, shape.g, shape.b, False)
-
-			elif isinstance(shape, ShapeRectPoint):
-				# Data-space rectangle with point marker (used for probe overlay)
-				x0s, y0s = self._img_to_scr(shape.x0, shape.y0, w, h)
-				x1s, y1s = self._img_to_scr(shape.x1, shape.y1, w, h)
-				return self._make_rect_node(x0s, y0s, x1s, y1s, shape.r, shape.g, shape.b, True)
-
-		except Exception:
-			pass
-		return None
-
-	def _make_line_node(self, x0, y0, x1, y1, r, g, b, flip_y):
-		if flip_y:
-			y0 = self.height() - y0
-			y1 = self.height() - y1
-		pts = np.array([[x0, y0, 0], [x1, y1, 0]], dtype=np.float32)
-		return gfx.Line(
-			gfx.Geometry(positions=pts),
-			gfx.LineBasicMaterial(color=(r, g, b), linewidth=2))
-
-	def _make_rect_node(self, x0, y0, x1, y1, r, g, b, flip_y):
-		"""Create a PyGfx rectangle (line strip around corners)."""
-		if flip_y:
-			y0 = self.height() - y0
-			y1 = self.height() - y1
-		pts = np.array([
-			[x0, y0, 0], [x1, y0, 0], [x1, y1, 0],
-			[x0, y1, 0], [x0, y0, 0],
-		], dtype=np.float32)
-		return gfx.Line(
-			gfx.Geometry(positions=pts),
-			gfx.LineBasicMaterial(color=(r, g, b), linewidth=2))
-
-	def _make_circle_node(self, cx, cy, radius, r, g, b, flip_y):
-		if flip_y:
-			cy = self.height() - cy
-		n_points = 64
-		thetas = np.linspace(0, 2 * np.pi, n_points)
-		pts = np.column_stack([
-			cx + radius * np.cos(thetas),
-			cy + radius * np.sin(thetas),
-			np.zeros(n_points)
-		]).astype(np.float32)
-		return gfx.Line(
-			gfx.Geometry(positions=pts),
-			gfx.LineBasicMaterial(color=(r, g, b), linewidth=2))
-
-	def _make_text_node(self, text, x, y, r, g, b, is_screen_space):
-		if not is_screen_space:
-			x, y = self._img_to_scr(x, y, self.width(), self.height())
-		return gfx.Text(
-			text, position=(x, y, 0), color=(r, g, b, 1.0),
-			render_order=20)
+			try:
+				shape.render(renderer, d2s=d2s)
+			except Exception:
+				pass
 
 	def _img_to_screen_pts(self, pts_img, w, h):
 		result = []
@@ -948,8 +897,12 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		return sx, sy
 
 	def _scr_to_img(self, sx, sy):
+		# pygfx ortho camera: world origin is bottom-left,
+		# so screen-Y from Qt (top-down) must be flipped
+		w = self.width()
+		h = self.height()
 		ix = int((sx - self.origin[0]) / self.scale)
-		iy = int((sy - self.origin[1]) / self.scale)
+		iy = int(((h - sy) - self.origin[1]) / self.scale)
 		return ix, iy
 
 	def set_file_name(self, name):
@@ -1123,6 +1076,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			if self._list_data is not None:
 				self.inspector.enable_image_range(0, len(self._list_data), self._list_idx)
 			self.inspector._update_brightness_contrast()
+			self.inspector.update_app_tab()
 		return self.inspector
 
 	def show_inspector(self, show):
@@ -1155,15 +1109,34 @@ class EMImage2DWidget(QtWidgets.QWidget):
 
 			if self.inspector:
 				self.inspector.set_image_idx(self._list_idx, 1)
+				self.inspector.update_app_tab()
 
 			self.force_display_update()
 			self.signal_increment_list_data.emit(delta)
+
+	def _update_measure_info(self, x0, y0, x1, y1):
+		"""Update measure labels based on current line endpoints."""
+		dx = abs(x1 - x0)
+		dy = abs(y1 - y0)
+		apix = 1.0
+		try:
+			if self.inspector:
+				apix = self.inspector.mtapix.getValue()
+		except Exception:
+			pass
+		len_a = apix * sqrt(dx*dx + dy*dy)
+		dx_a = dx * apix
+		dy_a = dy * apix
+
+		if self.inspector:
+			self.inspector.set_measure_info(x0, y0, x1, y1, dx_a, dy_a, len_a, apix)
 
 	def _update_measure_shape(self, lc):
 		if "MEAS" in self.shapes:
 			shape = self.shapes["MEAS"]
 			shape.x1 = lc[0]
 			shape.y1 = lc[1]
+			self._update_measure_info(shape.x0, shape.y0, shape.x1, shape.y1)
 			self._request_render()
 
 	def _do_probe(self, x, y):
@@ -1182,19 +1155,18 @@ class EMImage2DWidget(QtWidgets.QWidget):
 
 		x, y = int(round(x)), int(round(y))
 
-		# Clamp to image bounds
+		# Compute actual probe box coords (unclamped - allow drawing outside image)
 		half_sz = sz // 2
-		area_x0 = max(0, min(x - half_sz, nx))
-		area_y0 = max(0, min(y - half_sz, ny))
-		area_x1 = max(0, min(x + half_sz + (sz % 2), nx))
-		area_y1 = max(0, min(y + half_sz + (sz % 2), ny))
+		actual_x0 = x - half_sz
+		actual_y0 = y - half_sz
+		actual_x1 = x + half_sz + (sz % 2)
+		actual_y1 = y + half_sz + (sz % 2)
 
-		# If probe area has no overlap with image, abort gracefully
-		if area_x1 <= area_x0 or area_y1 <= area_y0:
-			self.shapes.pop("PROBE", None)
-			if self.inspector:
-				self.inspector.set_probe_values(None, None, None, None, None, None, None, x, y, nx, ny)
-			return
+		# Clamp only for data access
+		data_x0 = max(0, min(actual_x0, nx))
+		data_y0 = max(0, min(actual_y0, ny))
+		data_x1 = max(0, min(actual_x1, nx))
+		data_y1 = max(0, min(actual_y1, ny))
 
 		# Center point value
 		if 0 <= x < nx and 0 <= y < ny:
@@ -1202,8 +1174,18 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		else:
 			center_val = None
 
+		# If no overlap with image, clear stats but still draw box
+		if data_x1 <= data_x0 or data_y1 <= data_y0:
+			if self.inspector:
+				self.inspector.set_probe_values(None, None, None, None, None, None, None, x, y, nx, ny)
+			# Draw probe box even when outside image bounds
+			self.shapes.pop("PROBE", None)
+			self.add_shape("PROBE", ShapeRectPoint(0.5, 0.1, 0.5, float(actual_x0), float(actual_y0), float(actual_x1), float(actual_y1), 2))
+			self._request_render()
+			return
+
 		# Area statistics from the clipped region
-		area_data = data[area_y0:area_y1, area_x0:area_x1]
+		area_data = data[data_y0:data_y1, data_x0:data_x1]
 		area_avg = float(np.mean(area_data))
 		area_sig = float(np.std(area_data))
 
@@ -1241,9 +1223,9 @@ class EMImage2DWidget(QtWidgets.QWidget):
 				area_sig, nz_sig, skew, kurt,
 				x, y, nx, ny)
 
-		# Draw probe rectangle overlay (in data coordinates)
+		# Draw probe rectangle overlay (in data coordinates) - uses actual unclamped coords
 		self.shapes.pop("PROBE", None)
-		self.add_shape("PROBE", ShapeRectPoint(0.5, 0.5, 0.1, float(area_x0), float(area_y0), float(area_x1), float(area_y1), 2))
+		self.add_shape("PROBE", ShapeRectPoint(0.5, 0.1, 0.5, float(actual_x0), float(actual_y0), float(actual_x1), float(actual_y1), 2))
 		self._request_render()
 
 	def closeEvent(self, event):
@@ -1383,10 +1365,11 @@ class EMImageInspector2D(QtWidgets.QWidget):
 				tgt._fft_cache.clear()
 				if tgt.curfft > 0:
 					tgt._compute_fft_display(tgt.curfft)
-				tgt.auto_contrast(inspector_update=False, display_update=False)
+				tgt.auto_contrast_for_current_mode(inspector_update=False, display_update=False)
 				if tgt.inspector:
-					tgt.inspector_update(use_fourier=False)
+					tgt.inspector_update(use_fourier=(tgt.curfft > 0))
 					tgt.inspector.set_image_idx(new_idx)
+					self.update_app_tab()
 				tgt.force_display_update()
 		self._busy_slider = 0
 
@@ -1439,24 +1422,102 @@ class EMImageInspector2D(QtWidgets.QWidget):
 	def _build_tabs(self):
 		"""Build the inspector tab widget with mouse mode switching.
 
-		Tab indices: 0=App, 1=Save, 2=Filt, 3=Probe, 4=Meas, 5=Draw, 6=PSpec
-		Mouse modes: emit, emit, emit, probe, measure, draw, emit
+		Tab indices: 0=App, 1=Save, 2=Probe, 3=Meas, 4=PSpec
+		Mouse modes: emit, emit, probe, measure, emit
 		"""
 		tab_widget = QtWidgets.QTabWidget()
 
-		tab_widget.addTab(QtWidgets.QTextEdit("Application mouse functions"), "App")
+		tab_widget.addTab(self._build_app_tab(), "App")
 		tab_widget.addTab(self._build_save_tab(), "Save")
-		tab_widget.addTab(self._build_filter_tab(), "Filt")
 		tab_widget.addTab(self._build_probe_tab(), "Probe")
 		tab_widget.addTab(self._build_measure_tab(), "Meas")
-		tab_widget.addTab(self._build_draw_tab(), "Draw")
 		tab_widget.addTab(self._build_pspec_tab(), "PSpec")
 
 		# Wire tab changes to switch mouse modes
-		tab_map = {0: 0, 1: 0, 2: 0, 3: 3, 4: 4, 5: 5, 6: 0}
+		tab_map = {0: 0, 1: 0, 2: 3, 3: 4, 4: 0}
 		tab_widget.currentChanged.connect(lambda idx: self._set_mouse_mode(tab_map.get(idx, 0)))
 
 		self.vbl.addWidget(tab_widget)
+
+	def _build_app_tab(self):
+		"""Build the App tab with a 2-column key/value table showing image info."""
+		tab = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(tab)
+		layout.setContentsMargins(4, 4, 4, 4)
+		layout.setSpacing(0)
+
+		self.app_table = QtWidgets.QTableWidget(0, 2)
+		self.app_table.setHorizontalHeaderLabels(["Key", "Value"])
+		self.app_table.horizontalHeader().setStretchLastSection(True)
+		self.app_table.verticalHeader().setVisible(False)
+		self.app_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+		layout.addWidget(self.app_table)
+
+		info_label = QtWidgets.QLabel("Middle-click or Alt+click on the display to show/hide control panel.")
+		info_label.setStyleSheet("QLabel { font-style: italic; color: gray; padding: 4px; }")
+		layout.addWidget(info_label)
+
+		info_label2 = QtWidgets.QLabel("Right-drag to pan, scroll wheel to zoom.")
+		info_label2.setStyleSheet("QLabel { font-style: italic; color: gray; padding: 4px; }")
+		layout.addWidget(info_label2)
+
+		return tab
+
+	def update_app_tab(self):
+		"""Populate the App tab with current image statistics and metadata."""
+		tgt = self.target()
+		if not tgt:
+			return
+
+		data = tgt._get_current_data()
+		self.app_table.setRowCount(0)
+
+		def _add_row(key, val):
+			row = self.app_table.rowCount()
+			self.app_table.insertRow(row)
+			key_item = QtWidgets.QTableWidgetItem(str(key))
+			val_item = QtWidgets.QTableWidgetItem(str(val))
+			key_item.setFlags(key_item.flags() & ~Qt.ItemIsEditable)
+			val_item.setFlags(val_item.flags() & ~Qt.ItemIsEditable)
+			self.app_table.setItem(row, 0, key_item)
+			self.app_table.setItem(row, 1, val_item)
+
+		# Data statistics
+		if data is not None:
+			ny, nx = data.shape
+			_add_row("Images", len(tgt._list_data) if tgt._list_data else 1)
+			if tgt._list_data:
+				_add_row("Current Index", tgt._list_idx)
+			_add_row("Shape", f"{ny} x {nx}")
+			_add_row("Mean", f"{float(np.mean(data)):.4f}")
+			_add_row("Std", f"{float(np.std(data)):.4f}")
+			_add_row("Min", f"{float(np.min(data)):.6g}")
+			_add_row("Max", f"{float(np.max(data)):.6g}")
+			_add_row("Dtype", data.dtype.name)
+		else:
+			_add_row("Data", "None")
+
+		# Stack properties (apix, voltage, cs)
+		stack = tgt._stack
+		if stack is not None:
+			for attr in ["apix", "voltage", "cs"]:
+				val = getattr(stack, attr, None)
+				if val is not None:
+					_add_row(attr, val)
+
+		# Metadata from file headers (per-image dict stored as list)
+		meta_list = tgt._metadata if isinstance(tgt._metadata, list) else [tgt._metadata]
+		if meta_list and len(meta_list) > 0:
+			hdr_idx = tgt._list_idx if tgt._list_data else 0
+			if hdr_idx < len(meta_list):
+				hdr = meta_list[hdr_idx]
+				for key, val in hdr.items():
+					# Skip keys already displayed above
+					if key in ("nx", "ny", "nz", "Mean", "Std", "Min", "Max"):
+						continue
+					_add_row(key, val)
+
+		self.app_table.resizeColumnsToContents()
 
 	def _build_save_tab(self):
 		tab = QtWidgets.QWidget()
@@ -1472,23 +1533,6 @@ class EMImageInspector2D(QtWidgets.QWidget):
 		layout.addWidget(snap_btn, 0, 0)
 		layout.addWidget(save_btn, 1, 0)
 		layout.addWidget(stack_btn, 1, 1)
-
-		return tab
-
-	def _build_filter_tab(self):
-		tab = QtWidgets.QWidget()
-		layout = QtWidgets.QGridLayout(tab)
-
-		self.procbox1 = StringBox(label="Process1:", value="filter.lowpass.gauss:cutoff_abs=0.125")
-		self.procbox2 = StringBox(label="Process2:", value="filter.highpass.gauss:cutoff_pixels=3")
-		self.procbox3 = StringBox(label="Process3:", value="math.linear:scale=5:shift=0")
-
-		layout.addWidget(self.procbox1, 0, 0)
-		layout.addWidget(self.procbox2, 1, 0)
-		layout.addWidget(self.procbox3, 2, 0)
-
-		label = QtWidgets.QLabel("Display only - image unchanged!")
-		layout.addWidget(label, 3, 0)
 
 		return tab
 
@@ -1548,28 +1592,6 @@ class EMImageInspector2D(QtWidgets.QWidget):
 		layout.addWidget(self.mtshowval, 3, 0, 1, 2, Qt.AlignLeft)
 		self.mtshowval2 = QtWidgets.QLabel("")
 		layout.addWidget(self.mtshowval2, 4, 0, 1, 2, Qt.AlignLeft)
-
-		return tab
-
-	def _build_draw_tab(self):
-		tab = QtWidgets.QWidget()
-		layout = QtWidgets.QGridLayout(tab)
-
-		layout.addWidget(QtWidgets.QLabel("Pen Size:"), 0, 0)
-		self.dtpen = QtWidgets.QLineEdit("5")
-		layout.addWidget(self.dtpen, 0, 1)
-
-		layout.addWidget(QtWidgets.QLabel("Pen Val:"), 1, 0)
-		self.dtpenv = QtWidgets.QLineEdit("1.0")
-		layout.addWidget(self.dtpenv, 1, 1)
-
-		layout.addWidget(QtWidgets.QLabel("Pen Size2:"), 0, 2)
-		self.dtpen2 = QtWidgets.QLineEdit("5")
-		layout.addWidget(self.dtpen2, 0, 3)
-
-		layout.addWidget(QtWidgets.QLabel("Pen Val2:"), 1, 2)
-		self.dtpenv2 = QtWidgets.QLineEdit("0")
-		layout.addWidget(self.dtpenv2, 1, 3)
 
 		return tab
 
@@ -1773,20 +1795,28 @@ class EMImageInspector2D(QtWidgets.QWidget):
 		"""Switch the widget's mouse mode."""
 		tgt = self.target()
 		if tgt:
-			tgt.mouse_mode = mode_num
+			tgt.set_mouse_mode(mode_num)
+
+	def _fmt(self, val):
+		"""Format a float for display, or return empty string if None."""
+		if val is None:
+			return ""
+		return f"{val:.3f}"
 
 	def set_probe_values(self, point_val, area_avg, area_avg_nz,
 				area_sig, area_sig_nz, skew, kurt, x, y, nx, ny):
 		try:
-			self.ptpointval.setText(f"Point Value: {point_val:.3f}")
-			self.ptareaavg.setText(f"Area Avg: {area_avg:.3f}")
-			self.ptareaavgnz.setText(f"Area Avg (!=0): {area_avg_nz:.3f}")
-			self.ptareasig.setText(f"Area Sig: {area_sig:.3f}")
-			self.ptareasignz.setText(f"Area Sig (!=0): {area_sig_nz:.3f}")
-			self.ptareaskew.setText(f"Skewness: {skew:.3f}")
-			self.ptareakurt.setText(f"Kurtosis: {kurt:.3f}")
-			self.ptcoord.setText(f"Center Coord: {x}, {y}")
-			self.ptcoord2.setText(f"dcen ({x-nx//2}, {y-ny//2})")
+			self.ptpointval.setText(f"Point Value: {self._fmt(point_val)}")
+			self.ptareaavg.setText(f"Area Avg: {self._fmt(area_avg)}")
+			self.ptareaavgnz.setText(f"Area Avg (!=0): {self._fmt(area_avg_nz)}")
+			self.ptareasig.setText(f"Area Sig: {self._fmt(area_sig)}")
+			self.ptareasignz.setText(f"Area Sig (!=0): {self._fmt(area_sig_nz)}")
+			self.ptareaskew.setText(f"Skewness: {self._fmt(skew)}")
+			self.ptareakurt.setText(f"Kurtosis: {self._fmt(kurt)}")
+			if x is not None:
+				self.ptcoord.setText(f"Center Coord: {x}, {y}")
+				if nx and ny:
+					self.ptcoord2.setText(f"dcen ({x-nx//2}, {y-ny//2})")
 		except Exception:
 			pass
 

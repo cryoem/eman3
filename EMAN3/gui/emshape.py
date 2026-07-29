@@ -48,6 +48,55 @@ Usage:
 
 import numpy as np
 from math import sqrt
+import pygfx as gfx
+
+
+class PyGfxRenderer:
+	"""Bridge between EMShape render() calls and a pygfx scene group.
+
+	Shapes call renderer.line_strip(), renderer.points(), renderer.text(),
+	and the helper creates pygfx nodes and adds them to the scene group.
+	"""
+	def __init__(self, scene_group):
+		self._group = scene_group
+		if self._group is None:
+			self._group = gfx.Group()
+		self._group.render_order = 10
+
+	def line_strip(self, vertices_2d, color=(1, 1, 1), width=1.0):
+		"""Draw a line strip from 2D vertices."""
+		h, w = vertices_2d.shape if len(vertices_2d.shape) == 2 else (vertices_2d.size, 2)
+		if h < 2:
+			return
+		# Convert 2D to 3D for pygfx - place in front of image at slightly positive Z
+		pos = np.zeros((h, 3), dtype=np.float32)
+		pos[:, :2] = vertices_2d.astype(np.float32)
+		pos[:, 2] = 1.0  # In front (positive Z is closer to camera looking down +Z axis in pygfx ortho camera)
+		node = gfx.Line(
+			gfx.Geometry(positions=pos),
+			gfx.LineThinMaterial(thickness=max(1.0, float(width)), color=(*color, 1.0)))
+		self._group.add(node)
+
+	def points(self, positions_2d, color=(1, 1, 1), size=5.0):
+		"""Draw point markers from 2D positions."""
+		pos = np.zeros((len(positions_2d), 3), dtype=np.float32)
+		pos[:, :2] = np.asarray(positions_2d, dtype=np.float32)
+		pos[:, 2] = 1.0
+		colors = np.full((len(positions_2d), 4), [*color, 1.0], dtype=np.float32)
+		node = gfx.Points(
+			gfx.Geometry(positions=pos, colors=colors),
+			gfx.PointsMaterial(size=float(size)))
+		self._group.add(node)
+
+	def text(self, x, y, txt, color=(1, 1, 1), size=12, bg=False):
+		"""Draw text at screen position."""
+		try:
+			node = gfx.Text(str(txt), font_size=size, screen_space=True)
+			node.local.position = (float(x), float(y), 0)
+			node.material.color = (*color, 1.0)
+			self._group.add(node)
+		except Exception:
+			pass
 
 
 # Circle vertex cache (60 segments)
