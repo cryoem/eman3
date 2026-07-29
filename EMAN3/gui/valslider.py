@@ -103,19 +103,18 @@ class ValSlider(QtWidgets.QWidget):
 			layout.addWidget(self.label)
 
 		self.text = QtWidgets.QLineEdit(self)
-		self.text.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
-								QtWidgets.QSizePolicy.Preferred)
-		self.text.setMinimumSize(80, 0)
-		layout.addWidget(self.text)
+		# Fixed width for text entry (enough for ~5-6 digits), slider gets the rest
+		self.text.setFixedWidth(70)
+		layout.addWidget(self.text, stretch=0)
 
 		self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
 		self.slider.setMaximum(4095)
 		self.slider.setSingleStep(16)
 		self.slider.setPageStep(256)
 		self.slider.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
-								 QtWidgets.QSizePolicy.Preferred)
+						QtWidgets.QSizePolicy.Preferred)
 		self.slider.setMinimumSize(100, 0)
-		layout.addWidget(self.slider)
+		layout.addWidget(self.slider, stretch=1)
 
 		self.text.editingFinished.connect(self._on_text_change)
 		self.slider.valueChanged.connect(self._on_slider_change)
@@ -174,7 +173,7 @@ class ValSlider(QtWidgets.QWidget):
 	def setIntonly(self, flag):
 		self.intonly = bool(flag)
 		self.rounding = 0 if flag else 3
-		self.text.setMinimumWidth(50 if flag else 80)
+		self.text.setFixedWidth(50 if flag else 70)
 		self._updateboth()
 
 	def setLabel(self, label):

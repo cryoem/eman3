@@ -14,6 +14,7 @@ from EMAN3.gui.emshape import (
 	ShapeLine, ShapeRectPoint,
 	PyGfxRenderer,
 )
+from EMAN3.gui.histogramwidget import HistogramWidget
 import numpy as np
 
 # ─── NumPy rendering helpers (replacing GLUtil C++) ──────────────────────
@@ -60,6 +61,10 @@ def _render_image_8bit(data, scale, origin_x, origin_y,
 	else:
 		scaled_region = _resize_bilinear(region, rendered_h, rendered_w)
 
+		# Apply LUT-based histogram equalization on signal pixels only
+		if histogram_mode > 0 and max_val > min_val:
+			lut = _hist_equalize_lut(scaled_region, min_val, max_val, histogram_mode)
+
 	# Place at correct screen position (NOT centered)
 	padded = np.full((display_h, display_w), min_val, dtype=np.float32)
 	place_x0 = max(0, int(round(origin_x + src_x0 * scale)))
@@ -68,7 +73,22 @@ def _render_image_8bit(data, scale, origin_x, origin_y,
 	sy = min(place_y0 + rendered_h, display_h)
 	cropped_h = min(sy - place_y0, scaled_region.shape[0])
 	cropped_w = min(sx - place_x0, scaled_region.shape[1])
-	padded[place_y0:sy, place_x0:sx] = scaled_region[:cropped_h, :cropped_w]
+
+	# Apply LUT to signal pixels only (background remains unchanged)
+	if histogram_mode > 0 and lut is not None:
+		region_lut = _hist_apply_lut(scaled_region[:cropped_h, :cropped_w],
+		                             lut, min_val, max_val)
+		padded[place_y0:sy, place_x0:sx] = region_lut
+	else:
+		padded[place_y0:sy, place_x0:sx] = scaled_region[:cropped_h, :cropped_w]
+
+	# Update min/max to reflect the equalized data range for contrast mapping
+	if histogram_mode > 0 and lut is not None:
+		eq_signal = _hist_apply_lut(scaled_region, lut, min_val, max_val)
+		new_min = eq_signal[eq_signal >= min_val].min()
+		new_max = eq_signal[eq_signal <= max_val].max()
+		if new_min < new_max:
+			min_val, max_val = new_min, new_max
 
 	# Compute histogram before contrast mapping
 	hist = None
@@ -128,6 +148,20 @@ def _resize_nearest(src, dst_h, dst_w):
 	y_idx = (np.arange(dst_h) * sy // dst_h).astype(int)
 	x_idx = (np.arange(dst_w) * sx // dst_w).astype(int)
 	return src[np.ix_(y_idx, x_idx)]
+
+
+def _compute_rendered_histogram(rgb_float):
+	"""Compute a 256-bin histogram of the rendered image intensities.
+
+	Takes the contrast-mapped RGB float32 array [0..1] and bins it
+	into 256 grayscale intensity levels (ignoring background regions).
+	Returns a numpy array of 256 non-negative integers.
+	"""
+	# Use red channel as representative grayscale intensity
+	# Sample every 8th pixel for performance on large images
+	gray = rgb_float[::8, ::8, 0].ravel()
+	hist, _ = np.histogram(gray * 255, bins=256, range=(0, 256))
+	return hist.astype(np.uint32)
 
 
 def _render_fft_complex_rgb(data_complex, scale, origin_x, origin_y,
@@ -233,6 +267,67 @@ def _hsv_to_rgb(h, s, v):
 	g[masks[5]] = q[masks[5]]; b[masks[5]] = v[masks[5]]
 
 	return np.stack([r, g, b], axis=-1) * 255
+
+
+def _hist_equalize_lut(data, min_val, max_val, mode):
+	"""Build a histogram-equalization LUT from signal pixel intensities.
+
+	mode=1: Flat (uniform) equalization.
+	mode=2: Gaussian matching.
+
+	Returns the LUT array of shape (NBINS,) with output intensity values,
+	or None if no valid pixels.
+	"""
+	NBINS = 4080
+	data = np.asarray(data, dtype=np.float32)
+
+	# Only use pixels within [min_val, max_val] for the histogram
+	mask = (data >= min_val) & (data <= max_val)
+	signal = data[mask]
+	if signal.size == 0:
+		return None
+
+	# Normalize to [0..1]
+	normed = (signal - min_val) / (max_val - min_val)
+	pdf, _ = np.histogram(normed, bins=NBINS, range=(0.0, 1.0))
+	total = pdf.sum()
+	if total < 1e-12:
+		return None
+
+	cdf = np.cumsum(pdf).astype(np.float64)
+
+	if mode == 1:
+		# Flat: spread pixels uniformly across [min_val, max_val]
+		lut = min_val + cdf / total * (max_val - min_val)
+	elif mode == 2:
+		# Gaussian matching
+		mean_b = NBINS / 2.0
+		std_b = mean_b / 3.0
+		g_pdf = np.exp(-0.5 * ((np.arange(NBINS) - mean_b) / std_b)**2)
+		g_cdf = np.cumsum(g_pdf)
+		g_cdf *= total / g_cdf[-1]
+		lut = min_val + np.searchsorted(g_cdf, cdf, side='left') * (max_val - min_val) / NBINS
+	else:
+		return None
+
+	# Clip LUT to valid range
+	lut = np.clip(lut, min_val, max_val)
+	return lut
+
+
+def _hist_apply_lut(data, lut, min_val, max_val):
+	"""Apply a pre-built equalization LUT to image data.
+
+	Pixels within [min_val, max_val] are remapped. Others pass through.
+	"""
+	NBINS = 4080
+	out = data.copy()
+	mask = (data >= min_val) & (data <= max_val)
+	normed = ((data - min_val) / (max_val - min_val)).astype(np.float32)
+	idx = np.floor(normed * NBINS).astype(int)
+	idx = np.clip(idx, 0, NBINS - 1)
+	out[mask] = lut[idx[mask]]
+	return out
 
 
 # ─── PyGfx Canvas with Mouse Event Forwarding ────────────────────────────
@@ -791,6 +886,11 @@ class EMImage2DWidget(QtWidgets.QWidget):
 
 		self.hist = hist
 
+		# Compute rendered histogram from contrast-mapped RGB data
+		rendered_hist = _compute_rendered_histogram(rgb)
+		if self.inspector and hasattr(self.inspector, 'hist_widget'):
+			self.inspector.hist_widget.set_histogram(rendered_hist)
+
 		# Update PyGfx texture (float32 in [0..1], no post-processing contrast/brightness)
 		self._update_texture(rgb)
 
@@ -1086,6 +1186,8 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			insp.show()
 			insp.raise_()
 			insp.activateWindow()
+			# Force re-render to update histogram widget
+			self._dirty = True
 		elif self.inspector:
 			self.inspector.hide()
 
@@ -1622,8 +1724,7 @@ class EMImageInspector2D(QtWidgets.QWidget):
 		self.hbl.setContentsMargins(0, 0, 0, 0)
 		self.hbl.setSpacing(6)
 
-		self.hist_widget = QtWidgets.QLabel("Histogram")
-		self.hist_widget.setMinimumSize(128, 64)
+		self.hist_widget = HistogramWidget(self)
 		self.hbl.addWidget(self.hist_widget)
 
 		self.btn_grid = QtWidgets.QGridLayout()
@@ -1729,6 +1830,7 @@ class EMImageInspector2D(QtWidgets.QWidget):
 		tgt = self.target()
 		if tgt:
 			tgt.histogram_mode = idx
+			tgt._dirty = True
 
 	def _on_auto_contrast(self):
 		tgt = self.target()
