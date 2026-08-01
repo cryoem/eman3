@@ -13,10 +13,7 @@ from PySide6 import QtCore, QtWidgets, QtGui
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QColor as QtGuiQColor
 from EMAN3.gui.valslider import ValSlider, ValBox
-from EMAN3.gui.emshape import (
-	PyGfxRenderer, ShapeScrRect, ShapeScrLine, ShapeScrLabel,
-	screen_to_world as _screen_to_world_util,
-)
+import pylinalg as la
 import numpy as np
 
 # Color palette - black first for publication style plotting
@@ -113,8 +110,11 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		# Mouse state
 		self._right_drag_pos = None
 		self._left_drag_active = False
-		self.shapes = {}  # shape name -> EMShape for crosshairs/zoom-box/labels
+		self.shapes = {}  # shape data dict for crosshairs/zoom-box/labels
 		self._shape_group = None
+		self._prev_shapes = {}  # track prev shapes to avoid redundant rebuilds
+		self._prev_xlabel = ""  # cache axis labels to detect changes
+		self._prev_ylabel = ""
 
 		# PyGfx setup
 		self._canvas = None
@@ -157,26 +157,26 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._scene.add(gfx.Background.from_color("#ffffff"))
 
 		# Grid for plot background - disabled for publication style
-		grid_material = gfx.GridMaterial(
-			major_step=1,
-			minor_step=0,
-			thickness_space="screen",
-			major_thickness=1,
-			minor_thickness=0,
-			infinite=True,
-		)
-		self._grid = gfx.Grid(None, grid_material, orientation="xy")
-		self._grid.visible = False
+		# grid_material = gfx.GridMaterial(
+		# 	major_step=1,
+		# 	minor_step=0,
+		# 	thickness_space="screen",
+		# 	major_thickness=1,
+		# 	minor_thickness=0,
+		# 	infinite=True,
+		# )
+		# self._grid = gfx.Grid(None, grid_material, orientation="xy")
+		# self._grid.visible = False
 
 		# Rulers for axis tick labels - all 4 edges. The directions here make no visual sense, but these are correct
 		self._ruler_x_bottom = gfx.Ruler(tick_side="right", tick_marker="tick_left",
-										 min_tick_distance=40, color=(0, 0, 0, 1.0))
+								 min_tick_distance=40, color=(0, 0, 0, 1.0))
 		self._ruler_y_left = gfx.Ruler(tick_side="left", tick_marker="tick_right",
-									   min_tick_distance=35, color=(0, 0, 0, 1.0))
+							   min_tick_distance=35, color=(0, 0, 0, 1.0))
 		self._ruler_x_top = gfx.Ruler(tick_side="left", tick_marker="tick_right",
-									  min_tick_distance=40, color=(0, 0, 0, 1.0))
+							    min_tick_distance=40, color=(0, 0, 0, 1.0))
 		self._ruler_y_right = gfx.Ruler(tick_side="right", tick_marker="tick_left",
-										min_tick_distance=35, color=(0, 0, 0, 1.0))
+								min_tick_distance=35, color=(0, 0, 0, 1.0))
 
 		# Hide numeric tick labels on top and right rulers (tick marks only)
 		self._ruler_x_top.text.material.opacity = 0
@@ -186,11 +186,38 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._ruler_x_bottom.text.material.color = (0, 0, 0, 1.0)
 		self._ruler_y_left.text.material.color = (0, 0, 0, 1.0)
 		self._camera = gfx.OrthographicCamera(maintain_aspect=False)
-		self._camera.local.scale_y = -1  # flip Y so positive is up
+		# Offscreen rendering + blitting flips Y, so pre-compensate with scale_y=-1
+		# to make positive data Y appear at the top of the screen
+		self._camera.local.scale_y = -1
+
+		# Ensure line materials are initialized early by adding an invisible placeholder
+		_dummy_verts = np.array([[0, 0, 2], [0, 0, 2]], dtype=np.float32)
+		self._line_init_placeholder = gfx.Line(
+			gfx.Geometry(positions=_dummy_verts),
+			gfx.LineMaterial(thickness=1, color=(0, 0, 0, 0)))
+		self._scene.add(self._line_init_placeholder)
+
+		# Ensure PointsMarkerMaterial is initialized early
+		_dummy_pts = np.array([[0, 0, 2]], dtype=np.float32)
+		self._point_init_placeholder = gfx.Points(
+			gfx.Geometry(positions=_dummy_pts),
+			gfx.PointsMarkerMaterial(size=1, marker='circle', color=(0, 0, 0, 0)))
+		self._scene.add(self._point_init_placeholder)
+
+		# Ensure Text/font renderer is primed early so labels appear immediately
+		try:
+			_dummy_text = gfx.Text("Init", font_size=12, render_order=999)
+			_dummy_text.material.color = (0, 0, 0, 0)
+			_dummy_text.local.position = (0, 0, 2)
+			self._scene.add(_dummy_text)
+		except Exception:
+			pass
 
 		self._controller = None
 
-		self._scene.add(self._grid, self._ruler_x_bottom, self._ruler_y_left,
+		# self._scene.add(self._grid, self._ruler_x_bottom, self._ruler_y_left,
+		# 				self._ruler_x_top, self._ruler_y_right)
+		self._scene.add(self._ruler_x_bottom, self._ruler_y_left,
 						self._ruler_x_top, self._ruler_y_right)
 
 		# Render loop
@@ -199,17 +226,61 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 	def _screen_to_world(self, sx, sy):
 		"""Convert screen pixel coordinates to plot data coordinates."""
 		w, h = self._renderer.logical_size[0], self._renderer.logical_size[1]
-		return _screen_to_world_util(sx, sy, w, h, self._camera)
+		try:
+			f = self._camera.frustum
+			near = f[0]
+			xmin, xmax = float(near[:, 0].min()), float(near[:, 0].max())
+			ymin, ymax = float(near[:, 1].min()), float(near[:, 1].max())
+			# X: normal mapping
+			wx = xmin + (sx / w) * (xmax - xmin)
+			# Y: screen sy=0 → world ymax (top of view), sy=h → ymin (bottom)
+			wy = ymax - (sy / h) * (ymax - ymin)
+			return wx, wy
+		except Exception:
+			nx = sx / w * 2 - 1
+			y = 1.0 - (sy / h) * 2  # screen top(0)→NDC y=+1, bottom(h)→y=-1
+			world = la.vec_unproject((nx, y), self._camera.camera_matrix, depth=0.5)
+			return (float(world[0]), float(world[1]))
 
 	def _update_camera_limits(self):
 		"""Update camera to match xlimits/ylimits if set."""
 		if self.xlimits is not None and self.ylimits is not None:
 			xmin, xmax = self.xlimits
 			ymin, ymax = self.ylimits
-			self._camera.show_rect(xmin, xmax, ymax, ymin)
+			# Validate that limits span a real area before updating camera
+			if xmin < xmax and ymin < ymax:
+				x_span = xmax - xmin
+				y_span = ymax - ymin
+				# Clamp extreme aspect ratios to prevent show_rect from failing
+				aspect_ratio = x_span / y_span
+				if aspect_ratio > 50 or aspect_ratio < 0.02:
+					if aspect_ratio > 50:
+						y_center = (ymin + ymax) / 2
+						y_span_new = x_span / 25
+						ymin, ymax = y_center - y_span_new/2, y_center + y_span_new/2
+					else:
+						x_center = (xmin + xmax) / 2
+						x_span_new = y_span * 25
+						xmin, xmax = x_center - x_span_new/2, x_center + x_span_new/2
+			try:
+				self._camera.show_rect(xmin, xmax, ymax, ymin)
+			except Exception:
+				# show_rect failed - sync limits back to what camera actually shows
+				try:
+					f = self._camera.frustum
+					near = f[0]
+					self.xlimits = (float(near[:, 0].min()), float(near[:, 0].max()))
+					self.ylimits = (float(near[:, 1].min()), float(near[:, 1].max()))
+				except Exception:
+					pass
+
+	def _request_render(self):
+		"""Request a render frame — only fires when something actually needs redrawing."""
+		if self._dirty or self.shapes:
+			self._canvas.request_draw(self._render_callback)
 
 	def _render_callback(self):
-		"""Main render loop - only safe per-frame ops here."""
+		"""Render frame — called only when something changed."""
 		try:
 			# Defer scene graph modifications to outside the render callback
 			if self._dirty and not self._rebuilding and not self._pending_rebuild:
@@ -221,13 +292,9 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 			self._render_plot()
 
-			# Render shape overlays on top of data
-			w, h = self._renderer.logical_size[0], self._renderer.logical_size[1]
-			if w > 0 and h > 0:
-				self._render_shapes(w, h)
-
-			# Schedule next frame for continuous rendering
-			self._canvas.request_draw(self._render_callback)
+			# Only schedule another frame if there's still pending work
+			if self._dirty or self.shapes:
+				self._canvas.request_draw(self._render_callback)
 		except Exception as e:
 			print(f"Plot render error: {e}")
 			import traceback
@@ -256,28 +323,30 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			label_color = (0, 0, 0, 1.0)
 
 			if self.xaxis_label:
-				xlbl = gfx.Text(self.xaxis_label, font_size=14,
-								screen_space=True)
+				xlbl = gfx.Text(self.xaxis_label, font_size=18,
+									screen_space=True)
 				xlbl.material.color = label_color
-				# Bottom-center, below tick labels
-				xlbl.local.position = (
-					margin_left + (w - margin_left - margin_right) / 2,
-					h - margin_bottom + 25,
-					0)
+				sx_lbl = margin_left + (w - margin_left - margin_right) / 2
+				sy_lbl = h - margin_bottom + 25
+				xlbl._screen_pos = (sx_lbl, sy_lbl)
+				xlbl.local.position = (*self._screen_to_world(sx_lbl, sy_lbl), 0)
 				self._scene.add(xlbl)
 				self._axis_labels.append(xlbl)
 
 			if self.yaxis_label:
-				ylbl = gfx.Text(self.yaxis_label, font_size=14,
-								screen_space=True)
+				ylbl = gfx.Text(self.yaxis_label, font_size=18,
+									screen_space=True)
 				ylbl.material.color = label_color
-				# Left edge, vertically centered on plot area
-				ylbl.local.position = (
-					5,
-					margin_top + (h - margin_top - margin_bottom) / 2 - 10,
-					0)
+				sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
+				ylbl._screen_pos = (10, sy_lbl)
+				ylbl.local.position = (*self._screen_to_world(10, sy_lbl), 0)
+				ylbl.local.rotation = la.quat_from_euler((0, 0, np.radians(90)))  # Rotate 90° CCW
 				self._scene.add(ylbl)
 				self._axis_labels.append(ylbl)
+
+			# Cache initial label values for change detection
+			self._prev_xlabel = self.xaxis_label
+			self._prev_ylabel = self.yaxis_label
 
 			# Border box outline
 			box_pts = np.zeros((5, 3), dtype=np.float32)
@@ -409,6 +478,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 						group.add(mn)
 		finally:
 			self._rebuilding = False
+		# After rebuild, schedule another render if still dirty or shapes pending
+		self._request_render()
 
 	def _create_markers(self, x, y, sym_type, size, color_hex, alpha):
 		"""Create marker points. Returns list of nodes (NOT added to scene)."""
@@ -506,21 +577,23 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._ruler_y_right.start_value = br_y
 
 		# Update rulers to compute tick spacing
+		# Set minimum tick spacing in world units to prevent rulers vanishing at extreme zoom
 		try:
 			stats_x = self._ruler_x_bottom.update(camera, (w, h))
 			stats_y = self._ruler_y_left.update(camera, (w, h))
 			self._ruler_x_top.update(camera, (w, h))
 			self._ruler_y_right.update(camera, (w, h))
 
-			major_x = stats_x.get("tick_step", 1)
-			major_y = stats_y.get("tick_step", 1)
+			major_x = max(stats_x.get("tick_step", 1), xspan * 0.01)
+			major_y = max(stats_y.get("tick_step", 1), yspan * 0.01)
+
 		except Exception:
-			major_x, major_y = 1, 1
+			major_x, major_y = xspan * 0.1, yspan * 0.1
 
 		# Grid step size (for reference, though grid is disabled)
-		self._grid.material.major_step = (major_x, major_y)
+		# self._grid.material.major_step = (major_x, major_y)
 
-		# Update border box - recreate each frame (positions change with zoom/pan)
+		# Update border box (positions change with zoom/pan)
 		box_pts = np.array([
 			[bl_x, bl_y, 5],
 			[br_x, br_y, 5],
@@ -538,10 +611,59 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			gfx.LineMaterial(thickness=1.5, color=(0, 0, 0, 1.0)))
 		self._scene.add(self._border_box)
 
+		# Render shape overlays on top of data (BEFORE render so they're visible)
+		self._render_shapes(w, h)
+
+		# Position axis labels in world coords so they stay fixed on screen
+		# Check if label text has changed and needs recreating
+		labels_need_update = (len(self._axis_labels) < 2) or (self.xaxis_label != self._prev_xlabel) or (self.yaxis_label != self._prev_ylabel)
+
+		if labels_need_update:
+			# Remove old axis labels
+			for lbl in self._axis_labels:
+				try:
+					self._scene.remove(lbl)
+				except Exception:
+					pass
+			self._axis_labels = []
+
+			label_color = (0, 0, 0, 1.0)
+			if self.xaxis_label:
+				xlbl = gfx.Text(self.xaxis_label, font_size=18,
+									screen_space=True)
+				xlbl.material.color = label_color
+				sx_lbl = margin_left + (w - margin_left - margin_right) / 2
+				sy_lbl = h - margin_bottom + 25
+				xlbl._screen_pos = (sx_lbl, sy_lbl)
+				xlbl.local.position = (*self._screen_to_world(sx_lbl, sy_lbl), 0)
+				self._scene.add(xlbl)
+				self._axis_labels.append(xlbl)
+
+			if self.yaxis_label:
+				ylbl = gfx.Text(self.yaxis_label, font_size=18,
+									screen_space=True)
+				ylbl.material.color = label_color
+				sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
+				ylbl._screen_pos = (10, sy_lbl)
+				ylbl.local.position = (*self._screen_to_world(10, sy_lbl), 0)
+				ylbl.local.rotation = la.quat_from_euler((0, 0, np.radians(90)))  # Rotate 90° CCW
+				self._scene.add(ylbl)
+				self._axis_labels.append(ylbl)
+
+			# Cache values for next comparison
+			self._prev_xlabel = self.xaxis_label
+			self._prev_ylabel = self.yaxis_label
+
+		for lbl in self._axis_labels:
+			sx_lbl, sy_lbl = lbl._screen_pos  # stored screen coords
+			wx_lbl, wy_lbl = self._screen_to_world(sx_lbl, sy_lbl)
+			lbl.local.position = (wx_lbl, wy_lbl, 0)
+
 		renderer.render(self._scene, camera)
 
 	def _rebuild_if_dirty(self):
 		self._dirty = True
+		self._request_render()
 
 	def set_data(self, input_data, key="data", replace=False, quiet=False,
 				 color=-1, linewidth=1, linetype=-2, symtype=-2, symsize=6,
@@ -663,6 +785,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		if not quiet:
 			self._dirty = True
+			self._request_render()
 
 	def clear_data(self, key):
 		"""Remove a data set by key."""
@@ -682,6 +805,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			del self.pparm[key]
 		except KeyError:
 			pass
+		self._dirty = True
+		self._request_render()
 
 	def _convert_data(self, input_data):
 		"""Convert various input types to a list of numpy arrays."""
@@ -768,6 +893,10 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self.ylimits = (y_finite.min() - padding_y, y_finite.max() + padding_y)
 		self._update_camera_limits()
 
+		# Update inspector limit boxes if open
+		if self.inspector:
+			self.inspector._update_limits_from_widget()
+
 	def set_axis_parms(self, xlabel="", ylabel="", x_scale="linear",
 					   y_scale="linear"):
 		"""Set axis labels and scale type."""
@@ -781,15 +910,18 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		if self.ylimits is not None:
 			self._update_camera_limits()
 		self._dirty = True
+		self._request_render()
 
 	def set_ylimits(self, ymin, ymax):
 		self.ylimits = (ymin, ymax)
 		if self.xlimits is not None:
 			self._update_camera_limits()
 		self._dirty = True
+		self._request_render()
 
 	def full_refresh(self):
 		self._dirty = True
+		self._request_render()
 
 	def get_inspector(self):
 		if self.inspector is None:
@@ -803,6 +935,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			insp.raise_()
 			insp.activateWindow()
 			self._dirty = True
+			self._request_render()
 		else:
 			if self.inspector:
 				self.inspector.close()
@@ -810,37 +943,83 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 	# Mouse event handlers
 
 	def _render_shapes(self, w, h):
-		"""Render shape overlays on top of data via EMShape render() methods."""
+		"""Render shape overlays on top of data."""
 		if self._shape_group is None:
 			self._shape_group = gfx.Group()
 			self._shape_group.render_order = 50
 			self._scene.add(self._shape_group)
 
-		# Clear old shapes each frame (they change with mouse)
+		# Only rebuild if shapes actually changed (avoids continuous updates when mouse still)
+		if not self.shapes and not self._shape_group.children:
+			return
+		if len(self.shapes) == 0 and len(self._shape_group.children) > 0:
+			while len(self._shape_group.children) > 0:
+				self._shape_group.remove(self._shape_group.children[0])
+			return
+		if len(self.shapes) == 0:
+			return
+
+		# Check if any shape data actually changed since last frame
+		shapes_changed = False
+		for name, shape_data in self.shapes.items():
+			if name not in self._prev_shapes or self._prev_shapes[name] != shape_data:
+				shapes_changed = True
+				break
+		# Also check for removed shapes
+		if set(self.shapes.keys()) != set(self._prev_shapes.keys()):
+			shapes_changed = True
+
+		if not shapes_changed:
+			return
+
+		# Save current shapes for next comparison
+		self._prev_shapes = dict(self.shapes)
+
+		# Clear old shapes and rebuild
 		while len(self._shape_group.children) > 0:
 			self._shape_group.remove(self._shape_group.children[0])
 
-		if not self.shapes:
-			return
-
-		# Convert screen pixel coords to world/data coords for line/rect shapes
-		def sw(sx, sy):
-			wx, wy = self._screen_to_world(sx, sy)
-			return wx, wy
-
-		renderer = PyGfxRenderer(self._shape_group, screen_to_world=sw)
-		renderer._viewport_height = h
-
-		# Handle text labels directly (PyGfxRenderer.text silently catches exceptions)
-		text_shapes = {k: v for k, v in self.shapes.items()
-					  if isinstance(v, ShapeScrLabel)}
-		line_shapes = {k: v for k, v in self.shapes.items()
-					   if not isinstance(v, ShapeScrLabel)}
-
-		# Render ALL shapes (text + lines) through the EMShape system
-		for name, shape in self.shapes.items():
+		for name, shape_data in self.shapes.items():
 			try:
-				shape.render(renderer)
+				stype = shape_data.get("type", "")
+				color = shape_data.get("color", (0.0, 0.0, 0.0))
+				lw = shape_data.get("lw", 1.0)
+
+				if stype == "line":
+					sx0, sy0 = shape_data["sx0"], shape_data["sy0"]
+					sx1, sy1 = shape_data["sx1"], shape_data["sy1"]
+					wx0, wy0 = self._screen_to_world(sx0, sy0)
+					wx1, wy1 = self._screen_to_world(sx1, sy1)
+					verts = np.array([[wx0, wy0, 0.1], [wx1, wy1 , 0.1]], dtype=np.float32)
+					node = gfx.Line(gfx.Geometry(positions=verts),
+					   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
+					node.render_order = 999
+					self._shape_group.add(node)
+
+				elif stype == "rect":
+					sx0, sy0 = shape_data["sx0"], shape_data["sy0"]
+					sx1, sy1 = shape_data["sx1"], shape_data["sy1"]
+					wx0, wy0 = self._screen_to_world(sx0, sy0)
+					wx1, wy1 = self._screen_to_world(sx1, sy1)
+					verts = np.array([
+						[wx0, wy0, 0.1], [wx1, wy0, 0.1],
+						[wx1, wy1, 0.1], [wx0, wy1, 0.1],
+						[wx0, wy0, 0.1]], dtype=np.float32)
+					node = gfx.Line(gfx.Geometry(positions=verts),
+					   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
+					node.render_order = 999
+					self._shape_group.add(node)
+
+				elif stype == "label":
+					sx_val = shape_data.get("sx", 100)
+					sy_val = shape_data.get("sy", 50)
+					fs = shape_data.get("font_size", 14)
+					node = gfx.Text(str(shape_data["text"]), font_size=fs,
+					   anchor='middle-center', screen_space=True, render_order=999)
+					node.local.position = (*self._screen_to_world(sx_val,sy_val), 0)
+					node.material.color = (color[0], color[1], color[2], 1.0)
+					self._shape_group.add(node)
+
 			except Exception as e:
 				print(f"Shape render error: {name}: {e}")
 
@@ -858,10 +1037,11 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			self.show_inspector(True)
 			return
 
-		# Right click -> start rubber-band zoom box
+			# Right click -> start rubber-band zoom box
 		if event.button() == Qt.MouseButton.RightButton:
 			self.shapes = {}
 			self._right_drag_pos = (sx, sy)
+			self._request_render()
 			return
 
 		# Left click -> crosshair probe mode
@@ -869,17 +1049,22 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			self._left_drag_active = True
 			margin_left = 65
 			margin_right = 20
+			margin_top = 20
 			# Horizontal crosshair (screen coords) - black for visibility on white bg
 			hx1, hy1 = margin_left, sy
 			hx2, hy2 = w - margin_right, sy
-			self.shapes["xcross"] = ShapeScrLine(0.0, 0.0, 0.0, hx1, hy1, hx2, hy2, line_width=1.0)
+			self.shapes["xcross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
+			                         "lw": 1.0, "sx0": hx1, "sy0": hy1, "sx1": hx2, "sy1": hy2}
 			# Vertical crosshair (screen coords) - full height of widget
 			vx1, vy1 = sx, 0
 			vx2, vy2 = sx, h
-			self.shapes["ycross"] = ShapeScrLine(0.0, 0.0, 0.0, vx1, vy1, vx2, vy2, line_width=1.0)
-			# Coordinate label - will be rendered black in _render_shapes
+			self.shapes["ycross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
+			                         "lw": 1.0, "sx0": vx1, "sy0": vy1, "sx1": vx2, "sy1": vy2}
 			label_text = "(%g, %g)" % (world_pos[0], world_pos[1])
-			self.shapes["coord"] = ShapeScrLabel(0, 0, 0, margin_left + 5, h - 35, label_text, font_size=12)
+			self.shapes["coord"] = {"type": "label", "color": (0.0, 0.0, 0.0),
+		                            "sx": w - margin_right - 100, "sy": margin_top + 30,
+		                            "text": label_text, "font_size": 15}
+			self._request_render()
 
 	def _on_mouse_move(self, event):
 		sx, sy = event.position().x(), event.position().y()
@@ -892,21 +1077,30 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		# Right-drag -> rubber-band zoom box (screen coords) - black
 		if self._right_drag_pos is not None:
 			x1r, y1r = self._right_drag_pos
-			self.shapes["zoombox"] = ShapeScrRect(0.0, 0.0, 0.0, x1r, y1r, sx, sy, line_width=1.5)
+			self.shapes["zoombox"] = {"type": "rect", "color": (0.0, 0.0, 0.0),
+		                          "lw": 1.5, "sx0": x1r, "sy0": y1r,
+		                          "sx1": sx, "sy1": sy}
+			self._request_render()
 			return
 
 		# Left-drag -> update crosshairs + coord label
 		if self._left_drag_active:
 			margin_left = 65
 			margin_right = 20
+			margin_top = 20
 			hx1, hy1 = margin_left, sy
 			hx2, hy2 = w - margin_right, sy
-			self.shapes["xcross"] = ShapeScrLine(0.0, 0.0, 0.0, hx1, hy1, hx2, hy2, line_width=1.0)
+			self.shapes["xcross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
+			                         "lw": 1.0, "sx0": hx1, "sy0": hy1, "sx1": hx2, "sy1": hy2}
 			vx1, vy1 = sx, 0
 			vx2, vy2 = sx, h
-			self.shapes["ycross"] = ShapeScrLine(0.0, 0.0, 0.0, vx1, vy1, vx2, vy2, line_width=1.0)
+			self.shapes["ycross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
+			                         "lw": 1.0, "sx0": vx1, "sy0": vy1, "sx1": vx2, "sy1": vy2}
 			label_text = "(%g, %g)" % (world_pos[0], world_pos[1])
-			self.shapes["coord"] = ShapeScrLabel(0, 0, 0, margin_left + 5, h - 35, label_text, font_size=12)
+			self.shapes["coord"] = {"type": "label", "color": (0.0, 0.0, 0.0),
+		                            "sx": w - margin_right - 100, "sy": margin_top + 30,
+		                            "text": label_text, "font_size": 15}
+			self._request_render()
 
 	def _on_mouse_release(self, event):
 		sx, sy = event.position().x(), event.position().y()
@@ -934,12 +1128,18 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 				pass
 			self._right_drag_pos = None
 			self._dirty = True
+			self._request_render()
+			# Update inspector limit boxes if open
+			if self.inspector:
+				self.inspector._update_limits_from_widget()
 			return
 
 		# Left release -> clear crosshairs
 		if self._left_drag_active:
+			self._dirty = True
 			self.shapes = {}
 			self._left_drag_active = False
+			self._request_render()
 
 		if self.mouseemit and event.button() == Qt.MouseButton.LeftButton:
 			world_pos = self._screen_to_world(sx, sy)
@@ -953,6 +1153,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		if self.xlimits is None or self.ylimits is None:
 			self.autoscale()
+			self._dirty = True
+			self._request_render()
 			return
 
 		xleft, xright = self.xlimits
@@ -973,6 +1175,10 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		self._update_camera_limits()
 		self._dirty = True
+		self._request_render()
+		# Update inspector limit boxes if open
+		if self.inspector:
+			self.inspector._update_limits_from_widget()
 
 	def _on_key_press(self, event):
 		if event.key() == Qt.Key_C:
@@ -980,6 +1186,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		elif event.key() == Qt.Key_F or event.key() == Qt.Key_R:
 			self.autoscale()
 			self._dirty = True
+			self._request_render()
 		else:
 			self.keypress.emit(event)
 
@@ -1207,8 +1414,8 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		# Labels and title
 
 		# Labels
-		self.xlabel_edit.textChanged.connect(self._on_label_change)
-		self.ylabel_edit.textChanged.connect(self._on_label_change)
+		self.xlabel_edit.editingFinished.connect(self._on_label_change)
+		self.ylabel_edit.editingFinished.connect(self._on_label_change)
 
 		# Alpha slider
 		self.alpha_slider.valueChanged.connect(self._on_alpha_change)
@@ -1237,9 +1444,27 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 
 		# Rebuild list and select first item
 		self.update_list()
-		if self.setlist.count() > 0:
-			self.setlist.setCurrentRow(0)
-			self._on_selection_changed(0)
+
+	def _update_limits_from_widget(self):
+		"""Update limit boxes from widget without triggering _on_limit_change."""
+		tgt = self._get_tgt()
+		if not tgt or tgt.xlimits is None or tgt.ylimits is None:
+			return
+		# Disconnect signals to avoid partial updates triggering changes
+		self.xmin_box.valueChanged.disconnect(self._on_limit_change)
+		self.xmax_box.valueChanged.disconnect(self._on_limit_change)
+		self.ymin_box.valueChanged.disconnect(self._on_limit_change)
+		self.ymax_box.valueChanged.disconnect(self._on_limit_change)
+		# Set values
+		self.xmin_box.setValue(tgt.xlimits[0])
+		self.xmax_box.setValue(tgt.xlimits[1])
+		self.ymin_box.setValue(tgt.ylimits[0])
+		self.ymax_box.setValue(tgt.ylimits[1])
+		# Reconnect
+		self.xmin_box.valueChanged.connect(self._on_limit_change)
+		self.xmax_box.valueChanged.connect(self._on_limit_change)
+		self.ymin_box.valueChanged.connect(self._on_limit_change)
+		self.ymax_box.valueChanged.connect(self._on_limit_change)
 
 	def _update_controls_for_key(self, key):
 		"""Populate controls with parameters of the selected data set."""
@@ -1301,6 +1526,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 				tgt.visibility[key] = True
 			self.update_list()
 			tgt._dirty = True
+			tgt._request_render()
 
 	def sel_none(self):
 		tgt = self._get_tgt()
@@ -1309,6 +1535,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 				tgt.visibility[key] = False
 			self.update_list()
 			tgt._dirty = True
+			tgt._request_render()
 
 	def update_list(self):
 		"""Rebuild the data set list, preserving selection."""
@@ -1379,7 +1606,10 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		pp[5] = self.symtype_combo.currentIndex()   # sym_type
 		pp[6] = max(1, self.symsize_spin.value())    # sym_size
 		self.target().pparm[key] = pp
-		self.target()._dirty = True
+		tgt = self.target()
+		if tgt:
+			tgt._dirty = True
+			tgt._request_render()
 
 	def _on_color_change(self, idx):
 		key = self._selected_key()
@@ -1398,6 +1628,8 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			self.update_list()
 
 		tgt._dirty = True
+		if tgt:
+			tgt._request_render()
 
 	def _on_column_change(self):
 		key = self._selected_key()
@@ -1417,6 +1649,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 
 		tgt.autoscale()
 		tgt._dirty = True
+		tgt._request_render()
 
 	def _on_scale_change(self):
 		tgt = self._get_tgt()
@@ -1424,14 +1657,16 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			tgt.xlog = self.xlog_tog.isChecked()
 			tgt.ylog = self.ylog_tog.isChecked()
 			tgt._dirty = True
+			tgt._request_render()
 
 	def _on_rescale(self):
 		tgt = self._get_tgt()
 		if tgt:
 			tgt.autoscale()
 			tgt._dirty = True
+			tgt._request_render()
 
-		# Update limit boxes to reflect new auto-scaled range
+			# Update limit boxes to reflect new auto-scaled range
 			if tgt.xlimits is not None:
 				self.xmin_box.setValue(tgt.xlimits[0])
 				self.xmax_box.setValue(tgt.xlimits[1])
@@ -1458,15 +1693,17 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 				except Exception:
 					pass  # Camera may reject extreme aspect ratios
 				tgt._dirty = True
+				tgt._request_render()
 			except (ValueError, TypeError):
 				pass
 
-	def _on_label_change(self):
+	def _on_label_change(self, new_text=None):
 		tgt = self._get_tgt()
 		if tgt:
 			tgt.xaxis_label = self.xlabel_edit.text()
 			tgt.yaxis_label = self.ylabel_edit.text()
 			tgt._dirty = True
+			tgt._request_render()
 
 	def _on_alpha_change(self, val):
 		key = self._selected_key()
@@ -1478,7 +1715,10 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		pp = list(pp)
 		pp[10] = val
 		self.target().pparm[key] = pp
-		self.target()._dirty = True
+		tgt = self.target()
+		if tgt:
+			tgt._dirty = True
+			tgt._request_render()
 
 	def closeEvent(self, event):
 		tgt = self._get_tgt()

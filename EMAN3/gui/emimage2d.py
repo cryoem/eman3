@@ -10,10 +10,6 @@ from rendercanvas.qt import QRenderWidget
 
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
-from EMAN3.gui.emshape import (
-	ShapeLine, ShapeRectPoint,
-	PyGfxRenderer,
-)
 from EMAN3.gui.histogramwidget import HistogramWidget
 import numpy as np
 
@@ -487,7 +483,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			_dummy_verts = np.array([[0, 0, 2], [0, 0, 2]], dtype=np.float32)
 			self._line_init_placeholder = gfx.Line(
 				gfx.Geometry(positions=_dummy_verts),
-				gfx.LineThinMaterial(thickness=1, color=(0, 0, 0, 0)))
+				gfx.LineMaterial(thickness=1, color=(0, 0, 0, 0)))
 			self._scene.add(self._line_init_placeholder)
 
 			self.setAcceptDrops(True)
@@ -894,8 +890,8 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		# Update PyGfx texture (float32 in [0..1], no post-processing contrast/brightness)
 		self._update_texture(rgb)
 
-		# Render shape overlays on top (always render when there's a stack for the counter)
-		if self.display_shapes and (self.shapes or self._list_data):
+		# Render shape overlays on top (always render for the counter and any shapes)
+		if self.display_shapes:
 			self._render_shapes(w, h)
 
 		# Apply frozen/excluded overlays (rgb is now float32 in [0..1])
@@ -952,19 +948,106 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			self._shape_group.render_order = 10
 			self._scene.add(self._shape_group)
 
-		# Clear old shapes
+		# Clear old shapes each frame
 		while len(self._shape_group.children) > 0:
 			self._shape_group.remove(self._shape_group.children[0])
 
-		# Data-to-screen transform: (data_x, data_y) -> pygfx world coords
-		def d2s(dx, dy):
+		# Data-to-world transform: camera at (w/2, h/2) means world coords = screen coords
+		# (no Y flip needed for this camera config)
+		def d2w(dx, dy):
 			sx = self.origin[0] + dx * self.scale
 			sy = self.origin[1] + dy * self.scale
-			return sx, sy
+			return float(sx), float(sy)
 
-		renderer = PyGfxRenderer(self._shape_group)
+		# Render shape overlays if any exist
+		for name, shape_data in self.shapes.items():
+			try:
+				stype = shape_data.get("type", "")
+				color = shape_data.get("color", (0.5, 0.1, 0.5))
+				lw = shape_data.get("lw", 1.0)
+				fs = shape_data.get("font_size", 12)
 
-		# Add image counter label (screen coords, lower-right corner)
+				if stype == "line":
+					wx0, wy0 = d2w(shape_data["x0"], shape_data["y0"])
+					wx1, wy1 = d2w(shape_data["x1"], shape_data["y1"])
+					verts = np.array([[wx0, wy0, 15.0], [wx1, wy1, 15.0]], dtype=np.float32)
+					node = gfx.Line(gfx.Geometry(positions=verts),
+							   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
+					node.render_order = 999
+					self._shape_group.add(node)
+
+				elif stype == "rect":
+					wx0, wy0 = d2w(shape_data["x0"], shape_data["y0"])
+					wx1, wy1 = d2w(shape_data["x1"], shape_data["y1"])
+					verts = np.array([
+						[wx0, wy0, 15.0], [wx1, wy0, 15.0],
+						[wx1, wy1, 15.0], [wx0, wy1, 15.0],
+						[wx0, wy0, 15.0]], dtype=np.float32)
+					node = gfx.Line(gfx.Geometry(positions=verts),
+							   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
+					node.render_order = 999
+					self._shape_group.add(node)
+
+				elif stype == "rectpoint":
+					# Draw rect outline + corner points (probe box)
+					for pt_idx in range(4):
+						if pt_idx < 2:
+							px, py = (shape_data["x0"], shape_data["y0"]) if pt_idx == 0 else (shape_data["x1"], shape_data["y0"])
+						else:
+							px, py = (shape_data["x0"], shape_data["y1"]) if pt_idx == 2 else (shape_data["x1"], shape_data["y1"])
+						wpx, wpy = d2w(px, py)
+						pt_verts = np.array([[wpx, wpy, 15.0]], dtype=np.float32)
+						node = gfx.Points(gfx.Geometry(positions=pt_verts),
+								     gfx.PointsMarkerMaterial(size=4, marker='circle', color=(color[0], color[1], color[2], 1.0)))
+						node.render_order = 999
+						self._shape_group.add(node)
+					# Also draw rect outline
+					wx0, wy0 = d2w(shape_data["x0"], shape_data["y0"])
+					wx1, wy1 = d2w(shape_data["x1"], shape_data["y1"])
+					verts = np.array([
+						[wx0, wy0, 15.0], [wx1, wy0, 15.0],
+						[wx1, wy1, 15.0], [wx0, wy1, 15.0],
+						[wx0, wy0, 15.0]], dtype=np.float32)
+					node = gfx.Line(gfx.Geometry(positions=verts),
+							   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
+					node.render_order = 999
+					self._shape_group.add(node)
+
+				elif stype == "label":
+					wx, wy = d2w(shape_data["x"], shape_data["y"])
+					node = gfx.Text(str(shape_data["text"]), font_size=fs,
+								anchor='middle-left', render_order=999)
+					node.local.position = (wx + 5, wy - 2, 15.0)
+					node.material.color = (color[0], color[1], color[2], 1.0)
+					self._shape_group.add(node)
+
+				elif stype == "centerpoint":
+					# Rect outline + single center point (probe box)
+					wx0, wy0 = d2w(shape_data["x0"], shape_data["y0"])
+					wx1, wy1 = d2w(shape_data["x1"], shape_data["y1"])
+					# Center point
+					cpx = (shape_data["x0"] + shape_data["x1"]) / 2.0
+					cpy = (shape_data["y0"] + shape_data["y1"]) / 2.0
+					wcx, wcy = d2w(cpx, cpy)
+					pt_verts = np.array([[wcx, wcy, 15.0]], dtype=np.float32)
+					node = gfx.Points(gfx.Geometry(positions=pt_verts),
+							     gfx.PointsMarkerMaterial(size=2, marker='circle', color=(color[0], color[1], color[2], 1.0)))
+					node.render_order = 999
+					self._shape_group.add(node)
+					# Rect outline
+					verts = np.array([
+						[wx0, wy0, 15.0], [wx1, wy0, 15.0],
+						[wx1, wy1, 15.0], [wx0, wy1, 15.0],
+						[wx0, wy0, 15.0]], dtype=np.float32)
+					node = gfx.Line(gfx.Geometry(positions=verts),
+						   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
+					node.render_order = 999
+					self._shape_group.add(node)
+
+			except Exception as e:
+				print(f"Shape render error ({name}): {e}")
+
+		# Add image counter label (screen coords, lower-right corner) - always render this
 		if self._list_data is not None and len(self._list_data) > 1:
 			label_text = f"{self._list_idx} ({len(self._list_data)})"
 			x_pos = w - 80
@@ -973,13 +1056,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 				node = gfx.Text(label_text, font_size=14, screen_space=True)
 				node.local.position = (float(x_pos), float(y_pos), 0)
 				node.material.color = (0.9, 0.9, 0.7, 1.0)
-				renderer._group.add(node)
-			except Exception:
-				pass
-
-		for name, shape in self.shapes.items():
-			try:
-				shape.render(renderer, d2s=d2s)
+				self._shape_group.add(node)
 			except Exception:
 				pass
 
@@ -1023,7 +1100,9 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			else:
 				vn = (v[i] - min(v)) / (max(v) - min(v)) if max(v) > min(v) else 0.5
 				color = (1.0 - vn, 0.2, vn)
-			shapes_dict[f"vl_{i}"] = ShapeLine(*color, x0[i], y0[i], x1[i], y1[i])
+			shapes_dict[f"vl_{i}"] = {"type": "line", "color": color,
+			                          "lw": 1.0, "x0": x0[i], "y0": y0[i],
+			                          "x1": x1[i], "y1": y1[i]}
 		self.shapes.update(shapes_dict)
 		self._request_render()
 
@@ -1079,7 +1158,9 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		elif mode == "measure":
 			if event.button() == Qt.MouseButton.LeftButton:
 				self.shapes.pop("MEAS", None)
-				self.shapes["MEAS"] = ShapeLine(0.5, 0.1, 0.5, lc[0], lc[1], lc[0]+1, lc[1])
+				self.shapes["MEAS"] = {"type": "line", "color": (0.5, 0.1, 0.5),
+				                       "lw": 2.0, "x0": lc[0], "y0": lc[1],
+				                       "x1": lc[0]+1, "y1": lc[1]}
 				self._request_render()
 		elif mode == "draw":
 			if event.button() == Qt.MouseButton.LeftButton:
@@ -1236,9 +1317,9 @@ class EMImage2DWidget(QtWidgets.QWidget):
 	def _update_measure_shape(self, lc):
 		if "MEAS" in self.shapes:
 			shape = self.shapes["MEAS"]
-			shape.x1 = lc[0]
-			shape.y1 = lc[1]
-			self._update_measure_info(shape.x0, shape.y0, shape.x1, shape.y1)
+			shape["x1"] = lc[0]
+			shape["y1"] = lc[1]
+			self._update_measure_info(shape["x0"], shape["y0"], shape["x1"], shape["y1"])
 			self._request_render()
 
 	def _do_probe(self, x, y):
@@ -1282,7 +1363,9 @@ class EMImage2DWidget(QtWidgets.QWidget):
 				self.inspector.set_probe_values(None, None, None, None, None, None, None, x, y, nx, ny)
 			# Draw probe box even when outside image bounds
 			self.shapes.pop("PROBE", None)
-			self.add_shape("PROBE", ShapeRectPoint(0.5, 0.1, 0.5, float(actual_x0), float(actual_y0), float(actual_x1), float(actual_y1), 2))
+			self.add_shape("PROBE", {"type": "centerpoint", "color": (0.5, 0.1, 0.5),
+			                        "lw": 2.0, "x0": float(actual_x0), "y0": float(actual_y0),
+			                        "x1": float(actual_x1), "y1": float(actual_y1)})
 			self._request_render()
 			return
 
@@ -1327,7 +1410,9 @@ class EMImage2DWidget(QtWidgets.QWidget):
 
 		# Draw probe rectangle overlay (in data coordinates) - uses actual unclamped coords
 		self.shapes.pop("PROBE", None)
-		self.add_shape("PROBE", ShapeRectPoint(0.5, 0.1, 0.5, float(actual_x0), float(actual_y0), float(actual_x1), float(actual_y1), 2))
+		self.add_shape("PROBE", {"type": "centerpoint", "color": (0.5, 0.1, 0.5),
+		                        "lw": 2.0, "x0": float(actual_x0), "y0": float(actual_y0),
+		                        "x1": float(actual_x1), "y1": float(actual_y1)})
 		self._request_render()
 
 	def closeEvent(self, event):
