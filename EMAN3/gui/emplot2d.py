@@ -13,6 +13,10 @@ from PySide6 import QtCore, QtWidgets, QtGui
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QColor as QtGuiQColor
 from EMAN3.gui.valslider import ValSlider, ValBox
+from EMAN3.gui.emshape import (
+	PyGfxRenderer, ShapeScrRect, ShapeScrLine, ShapeScrLabel,
+	screen_to_world as _screen_to_world_util,
+)
 import numpy as np
 
 # Color palette - black first for publication style plotting
@@ -108,6 +112,9 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		# Mouse state
 		self._right_drag_pos = None
+		self._left_drag_active = False
+		self.shapes = {}  # shape name -> EMShape for crosshairs/zoom-box/labels
+		self._shape_group = None
 
 		# PyGfx setup
 		self._canvas = None
@@ -181,8 +188,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._camera = gfx.OrthographicCamera(maintain_aspect=False)
 		self._camera.local.scale_y = -1  # flip Y so positive is up
 
-		self._controller = gfx.PanZoomController(
-			self._camera, register_events=self._renderer)
+		self._controller = None
 
 		self._scene.add(self._grid, self._ruler_x_bottom, self._ruler_y_left,
 						self._ruler_x_top, self._ruler_y_right)
@@ -191,15 +197,9 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._canvas.request_draw(self._render_callback)
 
 	def _screen_to_world(self, sx, sy):
-		"""Convert screen coordinates to world/plot coordinates."""
-		from pylinalg import vec_transform, vec_unproject
+		"""Convert screen pixel coordinates to plot data coordinates."""
 		w, h = self._renderer.logical_size[0], self._renderer.logical_size[1]
-		x = sx / w * 2 - 1
-		y = -(sy / h * 2 - 1)
-		pos_ndc = (x, y, 0)
-		pos_ndc = tuple(np.array(pos_ndc) + vec_transform(
-			self._camera.world.position, self._camera.camera_matrix))
-		return vec_unproject(pos_ndc[:2], self._camera.camera_matrix)
+		return _screen_to_world_util(sx, sy, w, h, self._camera)
 
 	def _update_camera_limits(self):
 		"""Update camera to match xlimits/ylimits if set."""
@@ -220,6 +220,14 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 				QtCore.QTimer.singleShot(0, self._rebuild_data_groups)
 
 			self._render_plot()
+
+			# Render shape overlays on top of data
+			w, h = self._renderer.logical_size[0], self._renderer.logical_size[1]
+			if w > 0 and h > 0:
+				self._render_shapes(w, h)
+
+			# Schedule next frame for continuous rendering
+			self._canvas.request_draw(self._render_callback)
 		except Exception as e:
 			print(f"Plot render error: {e}")
 			import traceback
@@ -289,8 +297,6 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		"""Rebuild data groups - called outside render callback (timer or direct)."""
 		if self._pending_rebuild:
 			self._pending_rebuild = False
-		if self._rebuilding:
-			return
 		self._rebuilding = True
 		try:
 			# Process all data sets - rebuild only changed or new keys
@@ -406,99 +412,34 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 	def _create_markers(self, x, y, sym_type, size, color_hex, alpha):
 		"""Create marker points. Returns list of nodes (NOT added to scene)."""
-		positions = np.column_stack([x, y, np.zeros_like(x)])
+		n = len(x)
+		if n == 0:
+			return []
 
+		positions = np.column_stack([x, y, np.zeros_like(x)])
 		marker_color = _hex_to_rgba(color_hex)[:3] + (alpha,)
 
+		# Marker shape mapping: index -> pygfx PointsMarkerMaterial marker name
+		shape_map = {
+			0: "circle",
+			1: "square",
+			2: "plus",
+			3: "triangle_up",
+			4: "triangle_down",
+		}
+		marker_name = shape_map.get(sym_type, "circle")
+
 		try:
-			if sym_type == 0:
-				# Circle markers
-				marker_obj = gfx.Points(
-					gfx.Geometry(positions=positions),
-					gfx.PointsMaterial(
-						size=size,
-						color=marker_color,
-						edge_mode="centered",
-					))
-				return [marker_obj]
-
-			elif sym_type == 1:
-				# Square markers (visually similar to circles in pygfx)
-				marker_obj = gfx.Points(
-					gfx.Geometry(positions=positions),
-					gfx.PointsMaterial(
-						size=size,
-						color=marker_color,
-						edge_mode="centered",
-					))
-				return [marker_obj]
-
-			elif sym_type == 2:
-				# Plus markers - line crosses at each point (NOT added to scene)
-				line_nodes = []
-				for xi, yi in zip(x, y):
-					hs = size / 2.0
-					pts_v = np.array([
-						[xi, yi - hs, 0],
-						[xi, yi + hs, 0],
-					], dtype=np.float32)
-					line_v = gfx.Line(
-						gfx.Geometry(positions=pts_v),
-						gfx.LineMaterial(thickness=1.5, color=marker_color))
-					pts_h = np.array([
-						[xi - hs, yi, 0],
-						[xi + hs, yi, 0],
-					], dtype=np.float32)
-					line_h = gfx.Line(
-						gfx.Geometry(positions=pts_h),
-						gfx.LineMaterial(thickness=1.5, color=marker_color))
-					line_nodes.extend([line_v, line_h])
-				return line_nodes
-
-			elif sym_type == 3:
-				# Triangle up markers (NOT added to scene)
-				mesh_nodes = []
-				for xi, yi in zip(x, y):
-					hs = size / 2.0
-					tris = np.array([
-						[xi, yi + hs, 0],
-						[xi - hs * 0.87, yi - hs * 0.5, 0],
-						[xi + hs * 0.87, yi - hs * 0.5, 0],
-					], dtype=np.float32)
-					mesh = gfx.Mesh(
-						gfx.Geometry(positions=tris),
-						gfx.MeshPhongMaterial(color=_hex_to_rgba(color_hex)[:3]))
-					mesh_nodes.append(mesh)
-				return mesh_nodes
-
-			elif sym_type == 4:
-				# Triangle down markers (NOT added to scene)
-				mesh_nodes = []
-				for xi, yi in zip(x, y):
-					hs = size / 2.0
-					tris = np.array([
-						[xi, yi - hs, 0],
-						[xi - hs * 0.87, yi + hs * 0.5, 0],
-						[xi + hs * 0.87, yi + hs * 0.5, 0],
-					], dtype=np.float32)
-					mesh = gfx.Mesh(
-						gfx.Geometry(positions=tris),
-						gfx.MeshPhongMaterial(color=_hex_to_rgba(color_hex)[:3]))
-					mesh_nodes.append(mesh)
-				return mesh_nodes
-
-			# Default: circle markers
 			marker_obj = gfx.Points(
 				gfx.Geometry(positions=positions),
-				gfx.PointsMaterial(
+				gfx.PointsMarkerMaterial(
 					size=size,
+					marker=marker_name,
 					color=marker_color,
-					edge_mode="centered",
 				))
 			return [marker_obj]
-
 		except Exception as e:
-			print(f"Marker creation failed: {e}")
+			print(f"Marker creation failed ({marker_name}): {e}")
 			return []
 
 	def _render_plot(self):
@@ -868,23 +809,170 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 	# Mouse event handlers
 
+	def _render_shapes(self, w, h):
+		"""Render shape overlays on top of data via EMShape render() methods."""
+		if self._shape_group is None:
+			self._shape_group = gfx.Group()
+			self._shape_group.render_order = 50
+			self._scene.add(self._shape_group)
+
+		# Clear old shapes each frame (they change with mouse)
+		while len(self._shape_group.children) > 0:
+			self._shape_group.remove(self._shape_group.children[0])
+
+		if not self.shapes:
+			return
+
+		# Convert screen pixel coords to world/data coords for line/rect shapes
+		def sw(sx, sy):
+			wx, wy = self._screen_to_world(sx, sy)
+			return wx, wy
+
+		renderer = PyGfxRenderer(self._shape_group, screen_to_world=sw)
+		renderer._viewport_height = h
+
+		# Handle text labels directly (PyGfxRenderer.text silently catches exceptions)
+		text_shapes = {k: v for k, v in self.shapes.items()
+					  if isinstance(v, ShapeScrLabel)}
+		line_shapes = {k: v for k, v in self.shapes.items()
+					   if not isinstance(v, ShapeScrLabel)}
+
+		# Render ALL shapes (text + lines) through the EMShape system
+		for name, shape in self.shapes.items():
+			try:
+				shape.render(renderer)
+			except Exception as e:
+				print(f"Shape render error: {name}: {e}")
+
 	def _on_mouse_press(self, event):
+		sx, sy = event.position().x(), event.position().y()
+		w, h = self._renderer.logical_size[0], self._renderer.logical_size[1]
+		world_pos = self._screen_to_world(sx, sy)
+
 		if self.mouseemit:
-			self.mousedown.emit(event, event.pos())
+			self.mousedown.emit(event, world_pos)
+
+		# Middle click -> show inspector
 		if event.button() == Qt.MouseButton.MiddleButton or \
 		   (event.button() == Qt.MouseButton.LeftButton and event.modifiers() & Qt.AltModifier):
 			self.show_inspector(True)
+			return
+
+		# Right click -> start rubber-band zoom box
+		if event.button() == Qt.MouseButton.RightButton:
+			self.shapes = {}
+			self._right_drag_pos = (sx, sy)
+			return
+
+		# Left click -> crosshair probe mode
+		if event.button() == Qt.MouseButton.LeftButton:
+			self._left_drag_active = True
+			margin_left = 65
+			margin_right = 20
+			# Horizontal crosshair (screen coords) - black for visibility on white bg
+			hx1, hy1 = margin_left, sy
+			hx2, hy2 = w - margin_right, sy
+			self.shapes["xcross"] = ShapeScrLine(0.0, 0.0, 0.0, hx1, hy1, hx2, hy2, line_width=1.0)
+			# Vertical crosshair (screen coords) - full height of widget
+			vx1, vy1 = sx, 0
+			vx2, vy2 = sx, h
+			self.shapes["ycross"] = ShapeScrLine(0.0, 0.0, 0.0, vx1, vy1, vx2, vy2, line_width=1.0)
+			# Coordinate label - will be rendered black in _render_shapes
+			label_text = "(%g, %g)" % (world_pos[0], world_pos[1])
+			self.shapes["coord"] = ShapeScrLabel(0, 0, 0, margin_left + 5, h - 35, label_text, font_size=12)
 
 	def _on_mouse_move(self, event):
-		if self.mouseemit:
-			self.mousedrag.emit(event, event.pos())
+		sx, sy = event.position().x(), event.position().y()
+		w, h = self._renderer.logical_size[0], self._renderer.logical_size[1]
+		world_pos = self._screen_to_world(sx, sy)
+
+		if self.mouseemit and self._left_drag_active:
+			self.mousedrag.emit(event, world_pos)
+
+		# Right-drag -> rubber-band zoom box (screen coords) - black
+		if self._right_drag_pos is not None:
+			x1r, y1r = self._right_drag_pos
+			self.shapes["zoombox"] = ShapeScrRect(0.0, 0.0, 0.0, x1r, y1r, sx, sy, line_width=1.5)
+			return
+
+		# Left-drag -> update crosshairs + coord label
+		if self._left_drag_active:
+			margin_left = 65
+			margin_right = 20
+			hx1, hy1 = margin_left, sy
+			hx2, hy2 = w - margin_right, sy
+			self.shapes["xcross"] = ShapeScrLine(0.0, 0.0, 0.0, hx1, hy1, hx2, hy2, line_width=1.0)
+			vx1, vy1 = sx, 0
+			vx2, vy2 = sx, h
+			self.shapes["ycross"] = ShapeScrLine(0.0, 0.0, 0.0, vx1, vy1, vx2, vy2, line_width=1.0)
+			label_text = "(%g, %g)" % (world_pos[0], world_pos[1])
+			self.shapes["coord"] = ShapeScrLabel(0, 0, 0, margin_left + 5, h - 35, label_text, font_size=12)
 
 	def _on_mouse_release(self, event):
-		if self.mouseemit:
-			self.mouseup.emit(event, event.pos())
+		sx, sy = event.position().x(), event.position().y()
+
+		# Right release -> apply rubber-band zoom or rescale
+		if self._right_drag_pos is not None:
+			self.shapes = {}  # clear overlay shapes
+			x1r, y1r = self._right_drag_pos
+			dx = abs(sx - x1r) + abs(sy - y1r)
+			if dx < 3:
+				self.autoscale()
+			else:
+				p1 = self._screen_to_world(x1r, y1r)
+				p2 = self._screen_to_world(sx, sy)
+				xmin, xmax = min(p1[0], p2[0]), max(p1[0], p2[0])
+				ymin, ymax = min(p1[1], p2[1]), max(p1[1], p2[1])
+				if xmin < xmax and ymin < ymax:
+					self.xlimits = (xmin, xmax)
+					self.ylimits = (ymin, ymax)
+				else:
+					self.autoscale()
+			try:
+				self._update_camera_limits()
+			except Exception as e:
+				pass
+			self._right_drag_pos = None
+			self._dirty = True
+			return
+
+		# Left release -> clear crosshairs
+		if self._left_drag_active:
+			self.shapes = {}
+			self._left_drag_active = False
+
+		if self.mouseemit and event.button() == Qt.MouseButton.LeftButton:
+			world_pos = self._screen_to_world(sx, sy)
+			self.mouseup.emit(event, world_pos)
 
 	def _on_wheel(self, event):
-		pass  # PanZoomController handles zoom
+		"""Scroll wheel zooms about cursor position."""
+		sx, sy = event.position().x(), event.position().y()
+		world_pos = self._screen_to_world(sx, sy)
+		xc, yc = world_pos
+
+		if self.xlimits is None or self.ylimits is None:
+			self.autoscale()
+			return
+
+		xleft, xright = self.xlimits
+		ybottom, ytop = self.ylimits
+		xfrac = (xc - xleft) / (xright - xleft) if xright != xleft else 0.5
+		yfrac = (yc - ybottom) / (ytop - ybottom) if ytop != ybottom else 0.5
+
+		delta = event.angleDelta().y()
+		if delta > 0:
+			zoom_factor = 1.2  # zoom in
+		else:
+			zoom_factor = 1.0 / 1.2  # zoom out
+
+		xspan = (xright - xleft) / zoom_factor
+		ypan = (ytop - ybottom) / zoom_factor
+		self.xlimits = (xc - xfrac * xspan, xc + (1 - xfrac) * xspan)
+		self.ylimits = (yc - yfrac * ypan, yc + (1 - yfrac) * ypan)
+
+		self._update_camera_limits()
+		self._dirty = True
 
 	def _on_key_press(self, event):
 		if event.key() == Qt.Key_C:
@@ -1309,7 +1397,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		if tgt:
 			self.update_list()
 
-		self.target()._dirty = True
+		tgt._dirty = True
 
 	def _on_column_change(self):
 		key = self._selected_key()

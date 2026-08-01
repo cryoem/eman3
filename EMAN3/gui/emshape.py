@@ -49,6 +49,36 @@ Usage:
 import numpy as np
 from math import sqrt
 import pygfx as gfx
+import pylinalg as la
+
+
+def screen_to_world(sx, sy, width, height, camera):
+	"""Convert screen pixel coords to world coords using camera matrix.
+
+	Equivalent to Viewport.screen_to_world() which doesn't exist yet in
+	pygfx 0.17.0, but achieves the same result via vec_unproject.
+	"""
+	nx = sx / width * 2 - 1
+	ny = -(sy / height * 2 - 1)
+	world = la.vec_unproject((nx, ny), camera.camera_matrix, depth=0.5)
+	return (float(world[0]), float(world[1]))
+
+
+def world_to_screen(wx, wy, width, height, camera):
+	"""Convert world coords back to screen pixel coordinates.
+
+	Equivalent to Viewport.world_to_screen().
+	"""
+	# Project: transform through combined camera matrix
+	import numpy as np
+	point = np.array([wx, wy, 0.5, 1.0])
+	clip = camera.camera_matrix @ point
+	if clip[3] == 0:
+		return (float('nan'), float('nan'))
+	nx, ny = clip[0] / clip[3], clip[1] / clip[3]
+	sx = (nx + 1) / 2 * width
+	sy = (1 - ny) / 2 * height
+	return (float(sx), float(sy))
 
 
 class PyGfxRenderer:
@@ -57,24 +87,32 @@ class PyGfxRenderer:
 	Shapes call renderer.line_strip(), renderer.points(), renderer.text(),
 	and the helper creates pygfx nodes and adds them to the scene group.
 	"""
-	def __init__(self, scene_group):
+	def __init__(self, scene_group, screen_to_world=None):
 		self._group = scene_group
 		if self._group is None:
 			self._group = gfx.Group()
 		self._group.render_order = 10
+		self._screen_to_world = screen_to_world
 
-	def line_strip(self, vertices_2d, color=(1, 1, 1), width=1.0):
+	def line_strip(self, vertices_2d, color=(1, 1, 1), width=1.0, render_order=999):
 		"""Draw a line strip from 2D vertices."""
 		h, w = vertices_2d.shape if len(vertices_2d.shape) == 2 else (vertices_2d.size, 2)
 		if h < 2:
 			return
-		# Convert 2D to 3D for pygfx - place in front of image at slightly positive Z
+		# Convert 2D to 3D for pygfx
 		pos = np.zeros((h, 3), dtype=np.float32)
 		pos[:, :2] = vertices_2d.astype(np.float32)
-		pos[:, 2] = 1.0  # In front (positive Z is closer to camera looking down +Z axis in pygfx ortho camera)
+		# Apply screen-to-world conversion if available (for screen-space shapes)
+		if self._screen_to_world is not None:
+			sw = self._screen_to_world
+			for i in range(h):
+				pos[i, 0], pos[i, 1] = sw(float(pos[i, 0]), float(pos[i, 1]))
+		# Place overlays at high Z so they render on top of data at Z=0
+		pos[:, 2] = 10.0
 		node = gfx.Line(
 			gfx.Geometry(positions=pos),
 			gfx.LineThinMaterial(thickness=max(1.0, float(width)), color=(*color, 1.0)))
+		node.render_order = render_order
 		self._group.add(node)
 
 	def points(self, positions_2d, color=(1, 1, 1), size=5.0):
@@ -89,14 +127,21 @@ class PyGfxRenderer:
 		self._group.add(node)
 
 	def text(self, x, y, txt, color=(1, 1, 1), size=12, bg=False):
-		"""Draw text at screen position."""
+		"""Draw text at screen position. Y is from top of viewport (Qt convention)."""
 		try:
-			node = gfx.Text(str(txt), font_size=size, screen_space=True)
-			node.local.position = (float(x), float(y), 0)
+			# Convert screen coords to world coords (same as lines) for camera compatibility
+			if self._screen_to_world is not None:
+				wx, wy = self._screen_to_world(float(x), float(y))
+			else:
+				sy = self._viewport_height - y if hasattr(self, '_viewport_height') else y
+				wx, wy = float(x), float(sy)
+			node = gfx.Text(str(txt), font_size=size,
+							anchor='middle-left', render_order=999)
+			node.local.position = (float(wx), float(wy), 15.0)
 			node.material.color = (*color, 1.0)
 			self._group.add(node)
-		except Exception:
-			pass
+		except Exception as e:
+			print(f"PyGfxRenderer.text failed: {e}")
 
 
 # Circle vertex cache (60 segments)
@@ -681,6 +726,7 @@ class ShapeScrLabel(EMShape):
 	def render(self, renderer, d2s=shidentity):
 		if not self._visible:
 			return
+		print("text ",self.x, self.y, self.text, self.color,self.font_size)
 		renderer.text(self.x, self.y, self.text, color=self.color, size=self.font_size, bg=self._bg)
 
 
