@@ -1188,6 +1188,9 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		self.setWindowTitle("Plot Controls")
 		self.resize(400, 500)
 
+		# Flag to suppress _on_selection_changed during programmatic list rebuilds
+		self._selection_suppressed = False
+
 		self._build_ui()
 		# Wire signals (without limit signals) before sync
 		self._wire_signals()
@@ -1211,6 +1214,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		dsl = QtWidgets.QVBoxLayout(dsg)
 
 		self.setlist = QtWidgets.QListWidget()
+		self.setlist.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
 		dsl.addWidget(self.setlist)
 
 		h_sel = QtWidgets.QHBoxLayout()
@@ -1221,6 +1225,22 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		self.all_but.clicked.connect(self.sel_all)
 		h_sel.addWidget(self.all_but)
 		dsl.addLayout(h_sel)
+
+		# Slider for stepping through data sets
+		self.showslide = ValSlider(label="Sel:", value=0)
+		self.showslide.setIntonly(True)
+		self.showslide.setRange(0, 30)
+		dsl.addWidget(self.showslide)
+
+		# ns and stp boxes for slider range selection
+		h_slide_vals = QtWidgets.QHBoxLayout()
+		self.nbox = ValBox(label="ns:", value=1)
+		self.nbox.setIntonly(True)
+		h_slide_vals.addWidget(self.nbox)
+		self.stepbox = ValBox(label="stp:", value=1)
+		self.stepbox.setIntonly(True)
+		h_slide_vals.addWidget(self.stepbox)
+		dsl.addLayout(h_slide_vals)
 
 		vbl.addWidget(dsg)
 
@@ -1391,6 +1411,12 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		# Alpha slider
 		self.alpha_slider.valueChanged.connect(self._on_alpha_change)
 
+		# Item checkbox changed -> visibility toggle
+		self.setlist.itemChanged.connect(self._on_item_changed)
+
+		# Slider for stepping through data sets
+		self.showslide.valueChanged.connect(self._on_slide_change)
+
 	def _sync_from_widget(self):
 		"""Sync inspector controls to match widget state on open."""
 		tgt = self._get_tgt()
@@ -1494,22 +1520,36 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		self.col_y_spin.valueChanged.connect(self._on_column_change)
 
 	def _on_selection_changed(self, row):
-		"""Called when the user selects a data set in the list."""
-		item = self.setlist.item(row)
+		"""Called when the user selects a data set in the list.
+
+		Only populates controls when there is exactly one selection and
+		not suppressed during programmatic list rebuilds.
+		"""
+		if self._selection_suppressed:
+			return
+		# Only sync controls to a single item; multi-select leaves controls as-is
+		selected = self.setlist.selectedItems()
+		if len(selected) != 1:
+			return
+		item = selected[0]
 		if item is None:
 			return
 		key = item.data(QtCore.Qt.UserRole)
 		self._update_controls_for_key(key)
 
+	def _selected_keys(self):
+		"""Get keys of all selected data sets (supports multi-select)."""
+		keys = []
+		for item in self.setlist.selectedItems():
+			key = item.data(QtCore.Qt.UserRole)
+			if key is not None:
+				keys.append(key)
+		return keys
+
 	def _selected_key(self):
-		"""Get the currently selected data set key."""
-		current_row = self.setlist.currentRow()
-		if current_row < 0:
-			return None
-		item = self.setlist.item(current_row)
-		if item is None:
-			return None
-		return item.data(QtCore.Qt.UserRole)
+		"""Get the primary selected data set key (first selection)."""
+		keys = self._selected_keys()
+		return keys[0] if keys else None
 
 	def sel_all(self):
 		tgt = self._get_tgt()
@@ -1529,40 +1569,94 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			tgt._dirty = True
 			tgt._request_render()
 
+	def _on_item_changed(self, item):
+		"""Handle checkbox state changes for visibility toggling."""
+		key = item.data(QtCore.Qt.UserRole)
+		if key is None:
+			return
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		checked = (item.checkState() == QtCore.Qt.Checked)
+		tgt.visibility[key] = checked
+		tgt._dirty = True
+		tgt._request_render()
+
+	def _on_slide_change(self, val):
+		"""Handle slider stepping for selective visibility."""
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		rng_n0 = int(val)
+		rng_n1 = int(self.nbox.getValue()) if self.nbox else 1
+		rng_stp = int(self.stepbox.getValue()) if self.stepbox else 1
+		range_list = list(range(rng_n0, rng_n0 + rng_stp * rng_n1, rng_stp))
+		sorted_keys = sorted(tgt.visibility.keys(), key=lambda k: str(k))
+		for i, k in enumerate(sorted_keys):
+			tgt.visibility[k] = (i in range_list)
+		self.update_list()
+		tgt._dirty = True
+		tgt._request_render()
+
 	def update_list(self):
 		"""Rebuild the data set list, preserving selection."""
 		tgt = self._get_tgt()
 		if not tgt:
 			return
 
-		# Remember current selection
-		old_key = self._selected_key()
+		# Remember current selection row (index)
+		old_row = self.setlist.currentRow()
 
-		self.setlist.clear()
-		for key in tgt.data:
-			pp = tgt.pparm.get(key)
-			color_idx = pp[0] % len(COLORS) if pp else 0
-			item_text = key
-			if color_idx >= 0 and color_idx < len(COLOR_NAMES):
-				item_text = f"{COLOR_NAMES[color_idx]} - {key}"
+		# Block itemChanged signal during list rebuild
+		self.setlist.blockSignals(True)
+		try:
+			self.setlist.clear()
 
-			item = QtWidgets.QListWidgetItem(item_text)
-			item.setData(QtCore.Qt.UserRole, key)
+			for key in tgt.data:
+				pp = tgt.pparm.get(key)
+				color_idx = pp[0] % len(COLORS) if pp else 0
 
-			if not tgt.visibility.get(key, True):
-				item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEnabled)
+				item = QtWidgets.QListWidgetItem(key)
+				item.setData(QtCore.Qt.UserRole, key)
 
-			self.setlist.addItem(item)
+				# Set checkbox flag
+				flags = item.flags()
+				flags |= QtCore.Qt.ItemIsUserCheckable
+				item.setFlags(flags)
 
-		self.setlist.repaint()
+				# Set check state based on visibility
+				if tgt.visibility.get(key, True):
+					item.setCheckState(QtCore.Qt.Checked)
+				else:
+					item.setCheckState(QtCore.Qt.Unchecked)
 
-		# Try to re-select the previously selected item
-		if old_key is not None:
-			for i in range(self.setlist.count()):
-				it = self.setlist.item(i)
-				if it and it.data(QtCore.Qt.UserRole) == old_key:
-					self.setlist.setCurrentRow(i)
-					break
+				# Color the text to match the plot color
+				if color_idx in COLOR_RGB:
+					item.setForeground(COLOR_RGB[color_idx])
+
+				self.setlist.addItem(item)
+		finally:
+			self.setlist.blockSignals(False)
+
+		# Update slider range to match number of data sets
+		try:
+			self.showslide.valueChanged.disconnect(self._on_slide_change)
+		except Exception:
+			pass
+		num_sets = self.setlist.count()
+		if num_sets > 1:
+			self.showslide.setRange(0, num_sets - 1)
+		else:
+			self.showslide.setRange(0, 0)
+		self.showslide.valueChanged.connect(self._on_slide_change)
+
+		# Restore selection (suppress handler to avoid unwanted sync)
+		if 0 <= old_row < self.setlist.count():
+			self._selection_suppressed = True
+			try:
+				self.setlist.setCurrentRow(old_row)
+			finally:
+				self._selection_suppressed = False
 
 	def datachange(self):
 		self.update_list()
@@ -1583,45 +1677,58 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			pass  # Implement later
 
 	def _on_appearance_change(self):
-		key = self._selected_key()
-		if key is None or not self.target():
-			return
-		pp = self.target().pparm.get(key)
-		if pp is None:
-			return
+		"""Handle individual appearance control changes for multi-select.
 
-		pp = list(pp)
-		pp[1] = self.line_tog.isChecked()       # do_line
-		pp[2] = self.linetype_combo.currentIndex()  # line_type
-		pp[3] = max(1, self.linewidth_spin.value())  # line_width
-		pp[4] = self.sym_tog.isChecked()          # do_sym
-		pp[5] = self.symtype_combo.currentIndex()   # sym_type
-		pp[6] = max(1, self.symsize_spin.value())    # sym_size
-		self.target().pparm[key] = pp
+		Only applies the specific property that changed to all selected items.
+		"""
+		keys = self._selected_keys()
+		if not keys or not self.target():
+			return
 		tgt = self.target()
-		if tgt:
-			tgt._dirty = True
-			tgt._request_render()
+		sender = self.sender()
 
-	def _on_color_change(self, idx):
-		key = self._selected_key()
-		if key is None or not self.target():
-			return
-		pp = self.target().pparm.get(key)
-		if pp is None:
-			return
-		pp = list(pp)
-		pp[0] = idx % len(COLORS)
-		self.target().pparm[key] = pp
-
-		# Update the list display to reflect new color
-		tgt = self._get_tgt()
-		if tgt:
-			self.update_list()
+		for key in keys:
+			pp = tgt.pparm.get(key)
+			if pp is None:
+				continue
+			pp = list(pp)
+			if sender == self.line_tog:
+				pp[1] = self.line_tog.isChecked()
+			elif sender == self.linetype_combo:
+				pp[2] = self.linetype_combo.currentIndex()
+			elif sender == self.linewidth_spin:
+				pp[3] = max(1, self.linewidth_spin.value())
+			elif sender == self.sym_tog:
+				pp[4] = self.sym_tog.isChecked()
+			elif sender == self.symtype_combo:
+				pp[5] = self.symtype_combo.currentIndex()
+			elif sender == self.symsize_spin:
+				pp[6] = max(1, self.symsize_spin.value())
+			else:
+				continue
+			tgt.pparm[key] = pp
 
 		tgt._dirty = True
-		if tgt:
-			tgt._request_render()
+		tgt._request_render()
+
+	def _on_color_change(self, idx):
+		keys = self._selected_keys()
+		if not keys or not self.target():
+			return
+		tgt = self.target()
+
+		for key in keys:
+			pp = tgt.pparm.get(key)
+			if pp is None:
+				continue
+			pp = list(pp)
+			pp[0] = idx % len(COLORS)
+			tgt.pparm[key] = pp
+
+		# Update the list display to reflect new color
+		self.update_list()
+		tgt._dirty = True
+		tgt._request_render()
 
 	def _on_column_change(self):
 		key = self._selected_key()
@@ -1693,19 +1800,23 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			tgt._request_render()
 
 	def _on_alpha_change(self, val):
-		key = self._selected_key()
-		if key is None or not self.target():
+		keys = self._selected_keys()
+		if not keys or not self.target():
 			return
-		pp = self.target().pparm.get(key)
-		if pp is None:
-			return
-		pp = list(pp)
-		pp[10] = val
-		self.target().pparm[key] = pp
 		tgt = self.target()
-		if tgt:
-			tgt._dirty = True
-			tgt._request_render()
+
+		for key in keys:
+			pp = tgt.pparm.get(key)
+			if pp is None:
+				continue
+			pp = list(pp)
+			while len(pp) <= 10:
+				pp.append(0.8)
+			pp[10] = val
+			tgt.pparm[key] = pp
+
+		tgt._dirty = True
+		tgt._request_render()
 
 	def closeEvent(self, event):
 		tgt = self._get_tgt()
