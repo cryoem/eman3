@@ -373,7 +373,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			# Process all data sets - rebuild only changed or new keys
 			keys = list(self.data.keys())
 			old_keys = list(self._data_groups.keys())
-			all_keys = sorted(set(keys + old_keys))
+			all_keys = list(dict.fromkeys(keys + old_keys))
 
 			for key in all_keys:
 				is_new = key not in old_keys
@@ -478,11 +478,40 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 						x, y, sym_type, marker_size, color_hex, alpha)
 					for mn in marker_nodes:
 						group.add(mn)
+
+				# Reorder scene children to match list insertion order (last loaded = on top)
+			self._reorder_data_groups()
 		finally:
 			self._rebuilding = False
 		# Mark as needing a final render frame after rebuild completes
 		self._redraw = True
 		self._request_render()
+
+	def _reorder_data_groups(self):
+		"""Reorder scene children so data groups appear in list insertion order.
+
+		First-loaded datasets render at the bottom, last-loaded on top.
+		Non-data-group scene children stay in their original relative order.
+		"""
+		data_order = list(self.data.keys())
+		new_children = []
+		for child in self._scene.children:
+			if child not in self._data_groups.values():
+				new_children.append(child)
+
+		# Append data groups in insertion order (first at bottom, last on top)
+		for key in data_order:
+			group = self._data_groups.get(key)
+			if group is not None and group not in new_children:
+				new_children.append(group)
+
+		# Only modify scene if order actually changed
+		current = list(self._scene.children)
+		if current != new_children:
+			while len(self._scene.children) > 0:
+				self._scene.remove(self._scene.children[0])
+			for child in new_children:
+				self._scene.add(child)
 
 	def _create_markers(self, x, y, sym_type, size, color_hex, alpha):
 		"""Create marker points. Returns list of nodes (NOT added to scene)."""
@@ -1672,9 +1701,78 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			pass  # Implement later
 
 	def _on_regression(self):
-		tgt = self._get_tgt()
-		if tgt:
-			pass  # Implement later
+		"""Perform linear regression on the selected data set.
+
+		Creates a new data set named "d_ycol = m d_xcol + b" with 5 points
+		at x coordinates spanning min-max range with 5% padding.
+		"""
+		key = self._selected_key()
+		if key is None or not self.target():
+			return
+		tgt = self.target()
+
+		dl = tgt.data.get(key)
+		if not dl:
+			return
+
+		x_idx, y_idx = tgt.axes.get(key, (0, 1))
+
+		# Handle x_idx == -1 (index-based)
+		if x_idx < 0:
+			x_vals = np.arange(len(dl[y_idx]), dtype=np.float64)
+		else:
+			x_vals = np.asarray(dl[x_idx], dtype=np.float64)
+		y_vals = np.asarray(dl[y_idx], dtype=np.float64)
+
+		n = len(x_vals)
+		if n < 2 or len(y_vals) != n:
+			return
+
+		# Simple linear regression: y = m*x + b
+		x_mean = np.mean(x_vals)
+		y_mean = np.mean(y_vals)
+		sxy = np.sum((x_vals - x_mean) * (y_vals - y_mean))
+		sxx = np.sum((x_vals - x_mean) ** 2)
+
+		if sxx == 0:
+			m, b = 0.0, y_mean
+		else:
+			m = sxy / sxx
+			b = y_mean - m * x_mean
+
+		x_min = float(np.min(x_vals))
+		x_max = float(np.max(x_vals))
+		w = x_max - x_min
+
+		# 5 fit points: min-5%, min, mid, max, max+5%
+		fit_x = np.array([
+			x_min - w * 0.05,
+			x_min,
+			(x_min + x_max) / 2.0,
+			x_max,
+			x_max + w * 0.05,
+		], dtype=np.float64)
+		fit_y = m * fit_x + b
+
+		# Build new dataset with same column count, zeros except x and y columns
+		n_cols = len(dl)
+		new_data = []
+		for col in range(n_cols):
+			if col == y_idx:
+				new_data.append(fit_y.copy())
+			elif x_idx >= 0 and col == x_idx:
+				new_data.append(fit_x.copy())
+			else:
+				new_data.append(np.zeros(5, dtype=np.float64))
+
+		# Generate name like "d_1 = 2.34 d_0 + -0.12"
+		reg_key = f"d_{y_idx} = {m:.5g} d_{x_idx if x_idx >= 0 else '?'} + {b:.5g}"
+		print(f"Regression: y = {m:.8g} * x + {b:.8g}")
+
+		tgt.set_data(new_data, key=reg_key)
+		tgt._dirty = True
+		tgt._request_render()
+		self.update_list()
 
 	def _on_appearance_change(self):
 		"""Handle individual appearance control changes for multi-select.
