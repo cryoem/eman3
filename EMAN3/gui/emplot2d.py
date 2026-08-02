@@ -1696,9 +1696,41 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			pass  # Implement later
 
 	def _on_statistics(self):
-		tgt = self._get_tgt()
-		if tgt:
-			pass  # Implement later
+		"""Compute and print summary statistics for each column of the selected data set."""
+		key = self._selected_key()
+		if key is None or not self.target():
+			return
+		tgt = self.target()
+
+		dl = tgt.data.get(key)
+		if not dl:
+			return
+
+		n_cols = len(dl)
+		n_rows = max(len(c) for c in dl) if dl else 0
+		if n_rows == 0:
+			print(f"Statistics: no data in '{key}'")
+			return
+
+		print(f"\n=== Statistics for '{key}' ({n_rows} rows, {n_cols} columns) ===")
+		print(f"{'Col':<6} {'Min':>14} {'Max':>14} {'Mean':>14} {'Std':>14}")
+		print("-" * 62)
+
+		for col_idx in range(n_cols):
+			arr = np.asarray(dl[col_idx], dtype=np.float64)
+			if len(arr) < n_rows:
+				# Pad with NaN if column is shorter
+				padded = np.full(n_rows, np.nan)
+				padded[:len(arr)] = arr
+				arr = padded
+
+			cmin = float(np.min(arr))
+			cmax = float(np.max(arr))
+			cmean = float(np.mean(arr))
+			cstd = float(np.std(arr, ddof=0))  # population std dev
+
+			print(f"{col_idx:<6} {cmin:>14.6g} {cmax:>14.6g} {cmean:>14.6g} {cstd:>14.6g}")
+		print()
 
 	def _on_regression(self):
 		"""Perform linear regression on the selected data set.
