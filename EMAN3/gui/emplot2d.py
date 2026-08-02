@@ -110,9 +110,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		# Mouse state
 		self._right_drag_pos = None
 		self._left_drag_active = False
-		self.shapes = {}  # shape data dict for crosshairs/zoom-box/labels
 		self._shape_group = None
-		self._prev_shapes = {}  # track prev shapes to avoid redundant rebuilds
 		self._prev_xlabel = ""  # cache axis labels to detect changes
 		self._prev_ylabel = ""
 
@@ -129,6 +127,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._data_nodes = {}
 		self._border_box = None
 		self._dirty = True
+		self._redraw = False  # lightweight redraw flag for annotation-only changes
 		self._rebuilding = False
 		self._pending_rebuild = False
 		self._data_groups = {}
@@ -263,7 +262,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 						x_span_new = y_span * 25
 						xmin, xmax = x_center - x_span_new/2, x_center + x_span_new/2
 			try:
-				self._camera.show_rect(xmin, xmax, ymax, ymin)
+				self._camera.show_rect(xmin, xmax, ymax, ymin,depth=20)
 			except Exception:
 				# show_rect failed - sync limits back to what camera actually shows
 				try:
@@ -275,13 +274,16 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 					pass
 
 	def _request_render(self):
-		"""Request a render frame — only fires when something actually needs redrawing."""
-		if self._dirty or self.shapes:
+		"""Request a render frame - fires when data needs rebuilding or annotations changed."""
+		if self._dirty or self._redraw:
 			self._canvas.request_draw(self._render_callback)
 
 	def _render_callback(self):
-		"""Render frame — called only when something changed."""
+		"""Render frame - called only when something changed."""
 		try:
+			# Clear the lightweight redraw flag on each frame
+			self._redraw = False
+
 			# Defer scene graph modifications to outside the render callback
 			if self._dirty and not self._rebuilding and not self._pending_rebuild:
 				self._rebuilding = True
@@ -293,7 +295,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			self._render_plot()
 
 			# Only schedule another frame if there's still pending work
-			if self._dirty or self.shapes:
+			if self._dirty or self._redraw:
 				self._canvas.request_draw(self._render_callback)
 		except Exception as e:
 			print(f"Plot render error: {e}")
@@ -413,7 +415,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 					continue
 
 				data_list = self.data[key]
-				x_idx, y_idx, c_idx, s_idx = ax_cfg
+				x_idx, y_idx = ax_cfg
 				color_hex = COLORS[pp[0] % len(COLORS)]
 				do_line = pp[1]
 				line_type = pp[2]
@@ -478,7 +480,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 						group.add(mn)
 		finally:
 			self._rebuilding = False
-		# After rebuild, schedule another render if still dirty or shapes pending
+		# Mark as needing a final render frame after rebuild completes
+		self._redraw = True
 		self._request_render()
 
 	def _create_markers(self, x, y, sym_type, size, color_hex, alpha):
@@ -611,9 +614,6 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			gfx.LineMaterial(thickness=1.5, color=(0, 0, 0, 1.0)))
 		self._scene.add(self._border_box)
 
-		# Render shape overlays on top of data (BEFORE render so they're visible)
-		self._render_shapes(w, h)
-
 		# Position axis labels in world coords so they stay fixed on screen
 		# Check if label text has changed and needs recreating
 		labels_need_update = (len(self._axis_labels) < 2) or (self.xaxis_label != self._prev_xlabel) or (self.yaxis_label != self._prev_ylabel)
@@ -706,11 +706,11 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		if is_new_key:
 			n_cols = len(data_list)
 			if n_cols == 1:
-				self.axes[key] = (-1, 0, -2, -2)
+				self.axes[key] = (-1, 0)
 			elif n_cols == 2:
-				self.axes[key] = (0, 1, -2, -2)
+				self.axes[key] = (0, 1)
 			else:
-				self.axes[key] = (0, 1, -2, -2)
+				self.axes[key] = (0, 1)
 
 		# Determine plot parameters
 		if is_new_key:
@@ -771,7 +771,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		if column_labels is not None:
 			self.column_labels[key] = column_labels
 			try:
-				xa, ya = self.axes[key][:2]
+				xa, ya = self.axes[key]
 				if xa >= 0 and ya >= 0:
 					self.set_axis_parms(
 						str(column_labels[xa]), str(column_labels[ya]))
@@ -845,11 +845,12 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		for key, data_list in self.data.items():
 			if not self.visibility.get(key, True):
 				continue
+
 			ax_cfg = self.axes.get(key)
 			if ax_cfg is None:
 				continue
 
-			x_idx, y_idx = ax_cfg[:2]
+			x_idx, y_idx = ax_cfg
 			try:
 				if x_idx == -1:
 					x = np.arange(len(data_list[y_idx]), dtype=np.float32)
@@ -942,86 +943,80 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 	# Mouse event handlers
 
-	def _render_shapes(self, w, h):
-		"""Render shape overlays on top of data."""
+	def _get_shape_group(self):
+		"""Ensure the shape group exists."""
 		if self._shape_group is None:
 			self._shape_group = gfx.Group()
 			self._shape_group.render_order = 50
 			self._scene.add(self._shape_group)
+		return self._shape_group
 
-		# Only rebuild if shapes actually changed (avoids continuous updates when mouse still)
-		if not self.shapes and not self._shape_group.children:
-			return
-		if len(self.shapes) == 0 and len(self._shape_group.children) > 0:
+	def _get_or_create_node(self, name, node):
+		"""Replace a named child in shape_group if it exists; else add."""
+		group = self._get_shape_group()
+		for child in list(group.children):
+			if getattr(child, "name", None) == name:
+				group.remove(child)
+		node.name = name
+		group.add(node)
+
+	def _update_crosshairs(self, sx, sy, world_x, world_y, w, h):
+		"""Create or update crosshair lines and coord label."""
+		margin_left, margin_right, margin_top = 65, 20, 20
+		color = (0.0, 0.0, 0.0)
+
+		# Horizontal line
+		hx1, hy1 = margin_left, sy
+		hx2, hy2 = w - margin_right, sy
+		wx_hy1 = self._screen_to_world(hx1, hy1)
+		wx_hy2 = self._screen_to_world(hx2, hy2)
+		verts = np.array([[wx_hy1[0], wx_hy1[1], 0.1], [wx_hy2[0], wx_hy2[1], 0.1]], dtype=np.float32)
+		xline = gfx.Line(gfx.Geometry(positions=verts),
+			gfx.LineMaterial(thickness=1.0, color=(color[0], color[1], color[2], 1.0)))
+		xline.render_order = 999
+		self._get_or_create_node("xcross", xline)
+
+		# Vertical line
+		vx1, vy1 = sx, 0
+		vx2, vy2 = sx, h
+		wx_vy1 = self._screen_to_world(vx1, vy1)
+		wx_vy2 = self._screen_to_world(vx2, vy2)
+		verts = np.array([[wx_vy1[0], wx_vy1[1], 0.1], [wx_vy2[0], wx_vy2[1], 0.1]], dtype=np.float32)
+		yline = gfx.Line(gfx.Geometry(positions=verts),
+			gfx.LineMaterial(thickness=1.0, color=(color[0], color[1], color[2], 1.0)))
+		yline.render_order = 999
+		self._get_or_create_node("ycross", yline)
+
+		# Coord label (upper right inside plot area)
+		label_text = "(%g, %g)" % (world_x, world_y)
+		sx_lbl = w - margin_right - 100
+		sy_lbl = margin_top + 30
+		wx_lbl = self._screen_to_world(sx_lbl, sy_lbl)
+		text_node = gfx.Text(label_text, material=gfx.TextMaterial(color='#000', outline_color='#fff', outline_thickness=0.1), font_size=16,
+			anchor='middle-center', screen_space=True, render_order=999)
+		text_node.local.position = (wx_lbl[0], wx_lbl[1], 0)
+		text_node.material.color = (color[0], color[1], color[2], 1.0)
+		self._get_or_create_node("coord", text_node)
+
+	def _update_zoom_box(self, sx0, sy0, sx1, sy1):
+		"""Create or update the rubber-band zoom rectangle."""
+		color = (0.0, 0.0, 0.0)
+		p0 = self._screen_to_world(sx0, sy0)
+		p1 = self._screen_to_world(sx1, sy1)
+		verts = np.array([
+			[p0[0], p0[1], 0.1], [p1[0], p0[1], 0.1],
+			[p1[0], p1[1], 0.1], [p0[0], p1[1], 0.1],
+			[p0[0], p0[1], 0.1]], dtype=np.float32)
+		rect = gfx.Line(gfx.Geometry(positions=verts),
+			gfx.LineMaterial(thickness=1.5, color=(color[0], color[1], color[2], 1.0)))
+		rect.render_order = 999
+		self._get_or_create_node("zoombox", rect)
+
+	def _clear_shapes(self):
+		"""Remove all overlay annotations from the shape group."""
+		if self._shape_group:
 			while len(self._shape_group.children) > 0:
 				self._shape_group.remove(self._shape_group.children[0])
-			return
-		if len(self.shapes) == 0:
-			return
-
-		# Check if any shape data actually changed since last frame
-		shapes_changed = False
-		for name, shape_data in self.shapes.items():
-			if name not in self._prev_shapes or self._prev_shapes[name] != shape_data:
-				shapes_changed = True
-				break
-		# Also check for removed shapes
-		if set(self.shapes.keys()) != set(self._prev_shapes.keys()):
-			shapes_changed = True
-
-		if not shapes_changed:
-			return
-
-		# Save current shapes for next comparison
-		self._prev_shapes = dict(self.shapes)
-
-		# Clear old shapes and rebuild
-		while len(self._shape_group.children) > 0:
-			self._shape_group.remove(self._shape_group.children[0])
-
-		for name, shape_data in self.shapes.items():
-			try:
-				stype = shape_data.get("type", "")
-				color = shape_data.get("color", (0.0, 0.0, 0.0))
-				lw = shape_data.get("lw", 1.0)
-
-				if stype == "line":
-					sx0, sy0 = shape_data["sx0"], shape_data["sy0"]
-					sx1, sy1 = shape_data["sx1"], shape_data["sy1"]
-					wx0, wy0 = self._screen_to_world(sx0, sy0)
-					wx1, wy1 = self._screen_to_world(sx1, sy1)
-					verts = np.array([[wx0, wy0, 0.1], [wx1, wy1 , 0.1]], dtype=np.float32)
-					node = gfx.Line(gfx.Geometry(positions=verts),
-					   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
-					node.render_order = 999
-					self._shape_group.add(node)
-
-				elif stype == "rect":
-					sx0, sy0 = shape_data["sx0"], shape_data["sy0"]
-					sx1, sy1 = shape_data["sx1"], shape_data["sy1"]
-					wx0, wy0 = self._screen_to_world(sx0, sy0)
-					wx1, wy1 = self._screen_to_world(sx1, sy1)
-					verts = np.array([
-						[wx0, wy0, 0.1], [wx1, wy0, 0.1],
-						[wx1, wy1, 0.1], [wx0, wy1, 0.1],
-						[wx0, wy0, 0.1]], dtype=np.float32)
-					node = gfx.Line(gfx.Geometry(positions=verts),
-					   gfx.LineMaterial(thickness=lw, color=(color[0], color[1], color[2], 1.0)))
-					node.render_order = 999
-					self._shape_group.add(node)
-
-				elif stype == "label":
-					sx_val = shape_data.get("sx", 100)
-					sy_val = shape_data.get("sy", 50)
-					fs = shape_data.get("font_size", 14)
-					node = gfx.Text(str(shape_data["text"]), font_size=fs,
-					   anchor='middle-center', screen_space=True, render_order=999)
-					node.local.position = (*self._screen_to_world(sx_val,sy_val), 0)
-					node.material.color = (color[0], color[1], color[2], 1.0)
-					self._shape_group.add(node)
-
-			except Exception as e:
-				print(f"Shape render error: {name}: {e}")
 
 	def _on_mouse_press(self, event):
 		sx, sy = event.position().x(), event.position().y()
@@ -1037,33 +1032,19 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			self.show_inspector(True)
 			return
 
-			# Right click -> start rubber-band zoom box
+		# Right click -> start rubber-band zoom box
 		if event.button() == Qt.MouseButton.RightButton:
-			self.shapes = {}
+			self._clear_shapes()
 			self._right_drag_pos = (sx, sy)
+			self._redraw = True
 			self._request_render()
 			return
 
 		# Left click -> crosshair probe mode
 		if event.button() == Qt.MouseButton.LeftButton:
 			self._left_drag_active = True
-			margin_left = 65
-			margin_right = 20
-			margin_top = 20
-			# Horizontal crosshair (screen coords) - black for visibility on white bg
-			hx1, hy1 = margin_left, sy
-			hx2, hy2 = w - margin_right, sy
-			self.shapes["xcross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
-			                         "lw": 1.0, "sx0": hx1, "sy0": hy1, "sx1": hx2, "sy1": hy2}
-			# Vertical crosshair (screen coords) - full height of widget
-			vx1, vy1 = sx, 0
-			vx2, vy2 = sx, h
-			self.shapes["ycross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
-			                         "lw": 1.0, "sx0": vx1, "sy0": vy1, "sx1": vx2, "sy1": vy2}
-			label_text = "(%g, %g)" % (world_pos[0], world_pos[1])
-			self.shapes["coord"] = {"type": "label", "color": (0.0, 0.0, 0.0),
-		                            "sx": w - margin_right - 100, "sy": margin_top + 30,
-		                            "text": label_text, "font_size": 15}
+			self._dirty = True
+			self._update_crosshairs(sx, sy, world_pos[0], world_pos[1], w, h)
 			self._request_render()
 
 	def _on_mouse_move(self, event):
@@ -1074,32 +1055,18 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		if self.mouseemit and self._left_drag_active:
 			self.mousedrag.emit(event, world_pos)
 
-		# Right-drag -> rubber-band zoom box (screen coords) - black
+		# Right-drag -> rubber-band zoom box
 		if self._right_drag_pos is not None:
 			x1r, y1r = self._right_drag_pos
-			self.shapes["zoombox"] = {"type": "rect", "color": (0.0, 0.0, 0.0),
-		                          "lw": 1.5, "sx0": x1r, "sy0": y1r,
-		                          "sx1": sx, "sy1": sy}
+			self._dirty = True
+			self._update_zoom_box(x1r, y1r, sx, sy)
 			self._request_render()
 			return
 
 		# Left-drag -> update crosshairs + coord label
 		if self._left_drag_active:
-			margin_left = 65
-			margin_right = 20
-			margin_top = 20
-			hx1, hy1 = margin_left, sy
-			hx2, hy2 = w - margin_right, sy
-			self.shapes["xcross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
-			                         "lw": 1.0, "sx0": hx1, "sy0": hy1, "sx1": hx2, "sy1": hy2}
-			vx1, vy1 = sx, 0
-			vx2, vy2 = sx, h
-			self.shapes["ycross"] = {"type": "line", "color": (0.0, 0.0, 0.0),
-			                         "lw": 1.0, "sx0": vx1, "sy0": vy1, "sx1": vx2, "sy1": vy2}
-			label_text = "(%g, %g)" % (world_pos[0], world_pos[1])
-			self.shapes["coord"] = {"type": "label", "color": (0.0, 0.0, 0.0),
-		                            "sx": w - margin_right - 100, "sy": margin_top + 30,
-		                            "text": label_text, "font_size": 15}
+			self._dirty = True
+			self._update_crosshairs(sx, sy, world_pos[0], world_pos[1], w, h)
 			self._request_render()
 
 	def _on_mouse_release(self, event):
@@ -1107,7 +1074,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		# Right release -> apply rubber-band zoom or rescale
 		if self._right_drag_pos is not None:
-			self.shapes = {}  # clear overlay shapes
+			self._clear_shapes()
 			x1r, y1r = self._right_drag_pos
 			dx = abs(sx - x1r) + abs(sy - y1r)
 			if dx < 3:
@@ -1136,8 +1103,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		# Left release -> clear crosshairs
 		if self._left_drag_active:
-			self._dirty = True
-			self.shapes = {}
+			self._clear_shapes()
+			self._redraw = True
 			self._left_drag_active = False
 			self._request_render()
 
@@ -1295,25 +1262,25 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 
 		# Line type and width
 		line_row = QtWidgets.QHBoxLayout()
-		line_row.addWidget(QtWidgets.QLabel("Line:"))
+		line_row.addWidget(QtWidgets.QLabel("Line:"),alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 		self.linetype_combo = QtWidgets.QComboBox()
 		self.linetype_combo.addItems(["Solid", "Dashed", "Dotted", "Dash-Dot"])
 		line_row.addWidget(self.linetype_combo)
 		self.linewidth_spin = QtWidgets.QSpinBox()
 		self.linewidth_spin.setRange(1, 10)
-		line_row.addWidget(QtWidgets.QLabel("Width:"))
+		line_row.addWidget(QtWidgets.QLabel("Width:",alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter))
 		line_row.addWidget(self.linewidth_spin)
 		apl.addLayout(line_row)
 
 		# Symbol type and size
 		sym_row = QtWidgets.QHBoxLayout()
-		sym_row.addWidget(QtWidgets.QLabel("Symbol:"))
+		sym_row.addWidget(QtWidgets.QLabel("Symbol:",alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter))
 		self.symtype_combo = QtWidgets.QComboBox()
 		self.symtype_combo.addItems(["Circle", "Square", "Plus", "TriUp", "TriDown"])
 		sym_row.addWidget(self.symtype_combo)
 		self.symsize_spin = QtWidgets.QSpinBox()
 		self.symsize_spin.setRange(1, 30)
-		sym_row.addWidget(QtWidgets.QLabel("Size:"))
+		sym_row.addWidget(QtWidgets.QLabel("Size:",alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter))
 		sym_row.addWidget(self.symsize_spin)
 		apl.addLayout(sym_row)
 
@@ -1322,11 +1289,15 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		# ── Column selectors ──
 		cg = QtWidgets.QGroupBox("Columns")
 		cl = QtWidgets.QGridLayout()
-		cl.addWidget(QtWidgets.QLabel("X:"), 0, 0)
+		xlabel = QtWidgets.QLabel("X:")
+		xlabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+		cl.addWidget(xlabel, 0, 0)
 		self.col_x_spin = QtWidgets.QSpinBox()
 		self.col_x_spin.setRange(-1, 5)
 		cl.addWidget(self.col_x_spin, 0, 1)
-		cl.addWidget(QtWidgets.QLabel("Y:"), 0, 2)
+		ylabel = QtWidgets.QLabel("Y:")
+		ylabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+		cl.addWidget(ylabel, 0, 2)
 		self.col_y_spin = QtWidgets.QSpinBox()
 		self.col_y_spin.setRange(-1, 5)
 		cl.addWidget(self.col_y_spin, 0, 3)
@@ -1496,10 +1467,31 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		alpha = pp[10] if len(pp) > 10 else 0.8
 		self.alpha_slider.setValue(alpha)
 
-		# Column selectors
-		ax_cfg = tgt.axes.get(key, (-1, 0, -2, -2))
-		self.col_x_spin.setValue(max(-1, min(ax_cfg[0], 5)))
-		self.col_y_spin.setValue(max(-1, min(ax_cfg[1], 5)))
+		# Column selectors - disconnect signals to avoid spurious updates
+		try:
+			self.col_x_spin.valueChanged.disconnect(self._on_column_change)
+		except Exception:
+			pass
+		try:
+			self.col_y_spin.valueChanged.disconnect(self._on_column_change)
+		except Exception:
+			pass
+
+		# Compute dynamic column range from data
+		max_cols = 0
+		for k, dl in tgt.data.items():
+			if isinstance(dl, list) and len(dl) > max_cols:
+				max_cols = len(dl)
+		self.col_x_spin.setRange(-1, max(5, max_cols - 1))
+		self.col_y_spin.setRange(-1, max(5, max_cols - 1))
+
+		ax_cfg = tgt.axes.get(key, (-1, 0))
+		self.col_x_spin.setValue(ax_cfg[0])
+		self.col_y_spin.setValue(ax_cfg[1])
+
+		# Reconnect signals
+		self.col_x_spin.valueChanged.connect(self._on_column_change)
+		self.col_y_spin.valueChanged.connect(self._on_column_change)
 
 	def _on_selection_changed(self, row):
 		"""Called when the user selects a data set in the list."""
@@ -1639,15 +1631,10 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 
 		x_idx = self.col_x_spin.value()
 		y_idx = self.col_y_spin.value()
-
-		ax = tgt.axes.get(key)
-		if ax:
-			ax_cfg = list(ax)
-			ax_cfg[0] = x_idx
-			ax_cfg[1] = y_idx
-			tgt.axes[key] = tuple(ax_cfg)
+		tgt.axes[key] = (x_idx,y_idx)
 
 		tgt.autoscale()
+		# Set dirty AFTER autoscale so limits are computed before rebuild starts
 		tgt._dirty = True
 		tgt._request_render()
 
