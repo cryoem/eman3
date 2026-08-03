@@ -262,19 +262,14 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 						x_span_new = y_span * 25
 						xmin, xmax = x_center - x_span_new/2, x_center + x_span_new/2
 			try:
-				self._camera.show_rect(xmin, xmax, ymax, ymin,depth=20)
+				self._camera.show_rect(xmin, xmax, ymax, ymin)
 			except Exception:
-				# show_rect failed - sync limits back to what camera actually shows
-				try:
-					f = self._camera.frustum
-					near = f[0]
-					self.xlimits = (float(near[:, 0].min()), float(near[:, 0].max()))
-					self.ylimits = (float(near[:, 1].min()), float(near[:, 1].max()))
-				except Exception:
-					pass
+				pass  # show_rect failed - leave limits as-is
 
 	def _request_render(self):
 		"""Request a render frame - fires when data needs rebuilding or annotations changed."""
+		if self._canvas is None:
+			return  # renderer not ready yet
 		if self._dirty or self._redraw:
 			self._canvas.request_draw(self._render_callback)
 
@@ -324,8 +319,20 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			# Create axis labels once (screen_space)
 			label_color = (0, 0, 0, 1.0)
 
-			if self.xaxis_label:
-				xlbl = gfx.Text(self.xaxis_label, font_size=18,
+			# Compute display labels with log suffix if active
+			x_lbl = self.xaxis_label
+			if self.xlog and x_lbl:
+				x_lbl = x_lbl + " (log10)"
+			elif not x_lbl and self.xlog:
+				x_lbl = "X (log10)"
+			y_lbl = self.yaxis_label
+			if self.ylog and y_lbl:
+				y_lbl = y_lbl + " (log10)"
+			elif not y_lbl and self.ylog:
+				y_lbl = "Y (log10)"
+
+			if x_lbl:
+				xlbl = gfx.Text(x_lbl, font_size=18,
 									screen_space=True)
 				xlbl.material.color = label_color
 				sx_lbl = margin_left + (w - margin_left - margin_right) / 2
@@ -335,8 +342,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 				self._scene.add(xlbl)
 				self._axis_labels.append(xlbl)
 
-			if self.yaxis_label:
-				ylbl = gfx.Text(self.yaxis_label, font_size=18,
+			if y_lbl:
+				ylbl = gfx.Text(y_lbl, font_size=18,
 									screen_space=True)
 				ylbl.material.color = label_color
 				sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
@@ -349,6 +356,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			# Cache initial label values for change detection
 			self._prev_xlabel = self.xaxis_label
 			self._prev_ylabel = self.yaxis_label
+			self._prev_xlog = self.xlog
+			self._prev_ylog = self.ylog
 
 			# Border box outline
 			box_pts = np.zeros((5, 3), dtype=np.float32)
@@ -363,6 +372,11 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			print(f"Scene init error: {e}")
 			import traceback
 			traceback.print_exc()
+
+		# Trigger final render after full scene initialization
+		self._dirty = True
+		self._redraw = True
+		self._request_render()
 
 	def _rebuild_data_groups(self):
 		"""Rebuild data groups - called outside render callback (timer or direct)."""
@@ -560,17 +574,14 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		margin_top = 20
 		margin_right = 20
 
-		# Compute current visible world bounds from camera frustum
-		try:
-			f = camera.frustum  # shape (2, 4, 3): [near|far, corners, xyz]
-			near_corners = f[0]  # (4, 3)
-			xleft = float(near_corners[:, 0].min())
-			xright = float(near_corners[:, 0].max())
-			ybottom = float(near_corners[:, 1].min())
-			ytop = float(near_corners[:, 1].max())
-		except Exception:
-			xleft, xright = self.xlimits if self.xlimits else (0, 1)
-			ybottom, ytop = self.ylimits if self.ylimits else (0, 1)
+		# Compute current visible world bounds from stored limits
+		# (frustum Y is inverted by scale_y=-1 so read directly)
+		if self.xlimits and self.ylimits:
+			xleft, xright = self.xlimits
+			ybottom, ytop = self.ylimits
+		else:
+			xleft, xright = 0, 1
+			ybottom, ytop = 0, 1
 		xspan = xright - xleft
 		yspan = ytop - ybottom
 		frac_left = margin_left / w
@@ -645,7 +656,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		# Position axis labels in world coords so they stay fixed on screen
 		# Check if label text has changed and needs recreating
-		labels_need_update = (len(self._axis_labels) < 2) or (self.xaxis_label != self._prev_xlabel) or (self.yaxis_label != self._prev_ylabel)
+		labels_need_update = (len(self._axis_labels) < 2) or (self.xaxis_label != self._prev_xlabel) or (self.yaxis_label != self._prev_ylabel) or (getattr(self, "_prev_xlog", False) != self.xlog) or (getattr(self, "_prev_ylog", False) != self.ylog)
 
 		if labels_need_update:
 			# Remove old axis labels
@@ -657,8 +668,21 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			self._axis_labels = []
 
 			label_color = (0, 0, 0, 1.0)
-			if self.xaxis_label:
-				xlbl = gfx.Text(self.xaxis_label, font_size=18,
+
+			# Compute display labels with log suffix if active
+			x_lbl = self.xaxis_label
+			if self.xlog and x_lbl:
+				x_lbl = x_lbl + " (log10)"
+			elif not x_lbl and self.xlog:
+				x_lbl = "X (log10)"
+			y_lbl = self.yaxis_label
+			if self.ylog and y_lbl:
+				y_lbl = y_lbl + " (log10)"
+			elif not y_lbl and self.ylog:
+				y_lbl = "Y (log10)"
+
+			if x_lbl:
+				xlbl = gfx.Text(x_lbl, font_size=18,
 									screen_space=True)
 				xlbl.material.color = label_color
 				sx_lbl = margin_left + (w - margin_left - margin_right) / 2
@@ -668,8 +692,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 				self._scene.add(xlbl)
 				self._axis_labels.append(xlbl)
 
-			if self.yaxis_label:
-				ylbl = gfx.Text(self.yaxis_label, font_size=18,
+			if y_lbl:
+				ylbl = gfx.Text(y_lbl, font_size=18,
 									screen_space=True)
 				ylbl.material.color = label_color
 				sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
@@ -682,6 +706,8 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			# Cache values for next comparison
 			self._prev_xlabel = self.xaxis_label
 			self._prev_ylabel = self.yaxis_label
+			self._prev_xlog = self.xlog
+			self._prev_ylog = self.ylog
 
 		for lbl in self._axis_labels:
 			sx_lbl, sy_lbl = lbl._screen_pos  # stored screen coords
@@ -912,6 +938,12 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		if len(x_finite) == 0:
 			return
+
+		# Apply log transforms to match what _rebuild_data_groups renders
+		if self.xlog and np.min(x_finite) > 0:
+			x_finite = np.log10(x_finite)
+		if self.ylog and np.min(y_finite) > 0:
+			y_finite = np.log10(y_finite)
 
 		x_range = x_finite.max() - x_finite.min()
 		y_range = y_finite.max() - y_finite.min()
