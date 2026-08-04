@@ -102,6 +102,11 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self.xlog = False
 		self.ylog = False
 
+		# Contour plot params
+		self.contour_enabled = False
+		self.contour_bins = 100
+		self.contour_levels = 15
+
 		# Selection
 		self.selectpoints = True
 		self.selected = []
@@ -131,6 +136,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._rebuilding = False
 		self._pending_rebuild = False
 		self._data_groups = {}
+		self._contour_group = None  # holds contour line objects
 
 		self._setup_gfx()
 
@@ -248,23 +254,10 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			ymin, ymax = self.ylimits
 			# Validate that limits span a real area before updating camera
 			if xmin < xmax and ymin < ymax:
-				x_span = xmax - xmin
-				y_span = ymax - ymin
-				# Clamp extreme aspect ratios to prevent show_rect from failing
-				aspect_ratio = x_span / y_span
-				if aspect_ratio > 50 or aspect_ratio < 0.02:
-					if aspect_ratio > 50:
-						y_center = (ymin + ymax) / 2
-						y_span_new = x_span / 25
-						ymin, ymax = y_center - y_span_new/2, y_center + y_span_new/2
-					else:
-						x_center = (xmin + xmax) / 2
-						x_span_new = y_span * 25
-						xmin, xmax = x_center - x_span_new/2, x_center + x_span_new/2
-			try:
-				self._camera.show_rect(xmin, xmax, ymax, ymin)
-			except Exception:
-				pass  # show_rect failed - leave limits as-is
+				try:
+					self._camera.show_rect(xmin, xmax, ymax, ymin, depth=20)
+				except Exception:
+					pass  # show_rect failed - leave limits as-is
 
 	def _request_render(self):
 		"""Request a render frame - fires when data needs rebuilding or annotations changed."""
@@ -276,7 +269,6 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 	def _render_callback(self):
 		"""Render frame - called only when something changed."""
 		try:
-			# Clear the lightweight redraw flag on each frame
 			self._redraw = False
 
 			# Defer scene graph modifications to outside the render callback
@@ -493,8 +485,10 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 					for mn in marker_nodes:
 						group.add(mn)
 
-				# Reorder scene children to match list insertion order (last loaded = on top)
+			# Reorder scene children to match list insertion order (last loaded = on top)
 			self._reorder_data_groups()
+			# Render contours after data groups
+			self._render_contours()
 		finally:
 			self._rebuilding = False
 		# Mark as needing a final render frame after rebuild completes
@@ -526,6 +520,133 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 				self._scene.remove(self._scene.children[0])
 			for child in new_children:
 				self._scene.add(child)
+
+	def _render_contours(self):
+		"""Build contour lines from visible point data using matplotlib contour extraction."""
+		if not self.contour_enabled or self.xlimits is None or self.ylimits is None:
+			# Remove existing contours if disabled
+			if self._contour_group is not None:
+				self._scene.remove(self._contour_group)
+				self._contour_group = None
+			return
+
+		# Collect all visible point data (already log-transformed if needed)
+		all_x, all_y = [], []
+		for key, data_list in self.data.items():
+			if not self.visibility.get(key, True):
+				continue
+			ax_cfg = self.axes.get(key)
+			if ax_cfg is None:
+				continue
+			x_idx, y_idx = ax_cfg
+			try:
+				if x_idx == -1:
+					x = np.arange(len(data_list[y_idx]), dtype=np.float64)
+				elif x_idx < len(data_list):
+					x = np.asarray(data_list[x_idx], dtype=np.float64)
+				else:
+					continue
+				if y_idx < len(data_list):
+					y = np.asarray(data_list[y_idx], dtype=np.float64)
+				else:
+					continue
+				n = min(len(x), len(y))
+				xx, yy = x[:n], y[:n]
+				# Apply log transforms to match what _rebuild_data_groups renders
+				if self.xlog and np.min(xx) > 0:
+					xx = np.log10(xx)
+				if self.ylog and np.min(yy) > 0:
+					yy = np.log10(yy)
+				all_x.append(xx)
+				all_y.append(yy)
+			except Exception:
+				pass
+
+		if not all_x or len(all_x[0]) == 0:
+			if self._contour_group is not None:
+				self._scene.remove(self._contour_group)
+				self._contour_group = None
+			return
+
+		x_all = np.concatenate(all_x)
+		y_all = np.concatenate(all_y)
+
+		# Create 2D histogram (density mesh) using current plot limits as boundaries
+		try:
+			xmin, xmax = self.xlimits
+			ymin, ymax = self.ylimits
+			bins = self.contour_bins
+			hist, xedges, yedges = np.histogram2d(
+				x_all, y_all,
+				bins=[bins, bins],
+				range=[[xmin, xmax], [ymin, ymax]])
+			# hist is (ny, nx) with y increasing upwards
+		except Exception:
+			if self._contour_group is not None:
+				self._scene.remove(self._contour_group)
+				self._contour_group = None
+			return
+
+		# Compute contour levels from mesh min/max (skip zeros)
+		nz = hist[hist > 0]
+		if len(nz) == 0:
+			return
+		mesh_min, mesh_max = float(nz.min()), float(nz.max())
+		if mesh_min == mesh_max:
+			mesh_min = max(0.0, mesh_max * 0.9)
+		num_levels = max(self.contour_levels, 2)
+		levels = np.linspace(mesh_min, mesh_max, num_levels)
+
+		# Use matplotlib to extract contour paths
+		import matplotlib
+		matplotlib.use('Agg')
+		from matplotlib.figure import Figure as MPLFigure
+		fig = MPLFigure()
+		ax = fig.add_subplot(111)
+		# Create meshgrid for contour (centered on bin edges)
+		xc = 0.5 * (xedges[:-1] + xedges[1:])
+		yc = 0.5 * (yedges[:-1] + yedges[1:])
+		CX, CY = np.meshgrid(xc, yc)
+		try:
+			cs = ax.contour(CX, CY, hist.T, levels=levels)
+		except Exception:
+			fig._destroy_aggs()
+			if self._contour_group is not None:
+				self._scene.remove(self._contour_group)
+				self._contour_group = None
+			return
+
+		# Determine contour color from first visible dataset's pparm
+		con_color = (0, 0, 0, 1.0)  # default black
+		for key in self.data:
+			if not self.visibility.get(key, True):
+				continue
+			pp = self.pparm.get(key)
+			if pp is not None:
+				con_color = _hex_to_rgba(COLORS[pp[0] % len(COLORS)])
+				break
+
+		# Extract contour segments and create pygfx Line objects
+		con_group = gfx.Group()
+		con_group.name = "contours"
+		con_group.render_order = -1  # behind data points
+		allsegs = cs.allsegs
+		for level_segs in allsegs:
+			for curve in level_segs:
+				if len(curve) < 2:
+					continue
+				positions = np.column_stack([
+					curve[:, 0].astype(np.float32),
+					curve[:, 1].astype(np.float32),
+					np.zeros(len(curve), dtype=np.float32)])
+				mat = gfx.LineMaterial(thickness=1.0, color=con_color)
+				con_group.add(gfx.Line(gfx.Geometry(positions=positions), mat))
+
+		# Replace or add contour group in scene (before data groups)
+		if self._contour_group is not None:
+			self._scene.remove(self._contour_group)
+		self._contour_group = con_group
+		self._scene.add(con_group)
 
 	def _create_markers(self, x, y, sym_type, size, color_hex, alpha):
 		"""Create marker points. Returns list of nodes (NOT added to scene)."""
@@ -834,6 +955,11 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 				pass
 
 		self.autoscale()
+
+		# Set default contour bins based on number of data points (first load only)
+		if is_new_key:
+			ry = data_list[self.axes[key][1]]
+			self.contour_bins = max(10, round(sqrt(len(ry)) / 5))
 
 		if self.inspector:
 			self.inspector.datachange()
@@ -1276,14 +1402,17 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 
 		self.setlist = QtWidgets.QListWidget()
 		self.setlist.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+		self.setlist.setToolTip("Select data sets to view and edit. Check/uncheck to toggle visibility.")
 		dsl.addWidget(self.setlist)
 
 		h_sel = QtWidgets.QHBoxLayout()
 		self.none_but = QtWidgets.QPushButton("None")
 		self.none_but.clicked.connect(self.sel_none)
+		self.none_but.setToolTip("Deselect all data sets")
 		h_sel.addWidget(self.none_but)
 		self.all_but = QtWidgets.QPushButton("All")
 		self.all_but.clicked.connect(self.sel_all)
+		self.all_but.setToolTip("Select all data sets")
 		h_sel.addWidget(self.all_but)
 		dsl.addLayout(h_sel)
 
@@ -1291,15 +1420,18 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		self.showslide = ValSlider(label="Sel:", value=0)
 		self.showslide.setIntonly(True)
 		self.showslide.setRange(0, 30)
+		self.showslide.setToolTip("Show only the data set at this index in the list")
 		dsl.addWidget(self.showslide)
 
 		# ns and stp boxes for slider range selection
 		h_slide_vals = QtWidgets.QHBoxLayout()
 		self.nbox = ValBox(label="ns:", value=1)
 		self.nbox.setIntonly(True)
+		self.nbox.setToolTip("Number of consecutive sets to show with slider")
 		h_slide_vals.addWidget(self.nbox)
 		self.stepbox = ValBox(label="stp:", value=1)
 		self.stepbox.setIntonly(True)
+		self.stepbox.setToolTip("Step size between shown sets with slider")
 		h_slide_vals.addWidget(self.stepbox)
 		dsl.addLayout(h_slide_vals)
 
@@ -1309,12 +1441,15 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		btn_row = QtWidgets.QHBoxLayout()
 		self.save_btn = QtWidgets.QPushButton("Save")
 		self.save_btn.clicked.connect(self._on_save_plot)
+		self.save_btn.setToolTip("Save plot to file (not yet implemented)")
 		btn_row.addWidget(self.save_btn)
 		self.stats_btn = QtWidgets.QPushButton("Statistics")
 		self.stats_btn.clicked.connect(self._on_statistics)
+		self.stats_btn.setToolTip("Print min/max/mean/std for each column of selected data")
 		btn_row.addWidget(self.stats_btn)
 		self.regress_btn = QtWidgets.QPushButton("Regression")
 		self.regress_btn.clicked.connect(self._on_regression)
+		self.regress_btn.setToolTip("Fit linear regression (y=mx+b) to selected columns, add as new set")
 		btn_row.addWidget(self.regress_btn)
 		vbl.addLayout(btn_row)
 
@@ -1324,46 +1459,64 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 
 		self.color_combo = QtWidgets.QComboBox()
 		self.color_combo.addItems(COLOR_NAMES)
+		self.color_combo.setToolTip("Set color for selected data sets")
 		h_color = QtWidgets.QHBoxLayout()
 		h_color.addWidget(QtWidgets.QLabel("Color:"))
 		h_color.addWidget(self.color_combo)
 		apl.addLayout(h_color)
 
-		# Line/Symbol toggles
-		toggle_row = QtWidgets.QHBoxLayout()
+		# 3x3 grid: toggles on top row, then Line/Width/Bins, then Symbol/Size/Levels
+		ag = QtWidgets.QGridLayout()
+
 		self.line_tog = QtWidgets.QPushButton("Line")
 		self.line_tog.setCheckable(True)
 		self.line_tog.clicked.connect(self._on_appearance_change)
+		self.line_tog.setToolTip("Toggle line display for selected data sets")
 		self.sym_tog = QtWidgets.QPushButton("Symbol")
 		self.sym_tog.setCheckable(True)
 		self.sym_tog.clicked.connect(self._on_appearance_change)
-		toggle_row.addWidget(self.line_tog)
-		toggle_row.addWidget(self.sym_tog)
-		apl.addLayout(toggle_row)
+		self.sym_tog.setToolTip("Toggle symbol markers for selected data sets")
+		self.con_tog = QtWidgets.QPushButton("Contour")
+		self.con_tog.setCheckable(True)
+		self.con_tog.clicked.connect(self._on_contour_change)
+		self.con_tog.setToolTip("Enable/disable density contour overlay")
+		ag.addWidget(self.line_tog, 0, 0)
+		ag.addWidget(self.sym_tog, 0, 1)
+		ag.addWidget(self.con_tog, 0, 2)
 
-		# Line type and width
-		line_row = QtWidgets.QHBoxLayout()
-		line_row.addWidget(QtWidgets.QLabel("Line:"),alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 		self.linetype_combo = QtWidgets.QComboBox()
 		self.linetype_combo.addItems(["Solid", "Dashed", "Dotted", "Dash-Dot"])
-		line_row.addWidget(self.linetype_combo)
+		self.linetype_combo.setToolTip("Set line style for selected data sets")
 		self.linewidth_spin = QtWidgets.QSpinBox()
 		self.linewidth_spin.setRange(1, 10)
-		line_row.addWidget(QtWidgets.QLabel("Width:",alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter))
-		line_row.addWidget(self.linewidth_spin)
-		apl.addLayout(line_row)
+		self.linewidth_spin.valueChanged.connect(self._on_appearance_change)
+		self.linewidth_spin.setToolTip("Set line thickness (1-10 pixels)")
+		self.contour_bins_spin = QtWidgets.QSpinBox()
+		self.contour_bins_spin.setRange(10, 500)
+		self.contour_bins_spin.setValue(100)
+		self.contour_bins_spin.valueChanged.connect(self._on_contour_change)
+		self.contour_bins_spin.setToolTip("Grid resolution for contour density estimation")
+		ag.addWidget(self.linetype_combo, 1, 0)
+		ag.addWidget(self.linewidth_spin, 1, 1)
+		ag.addWidget(self.contour_bins_spin, 1, 2)
 
-		# Symbol type and size
-		sym_row = QtWidgets.QHBoxLayout()
-		sym_row.addWidget(QtWidgets.QLabel("Symbol:",alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter))
 		self.symtype_combo = QtWidgets.QComboBox()
 		self.symtype_combo.addItems(["Circle", "Square", "Plus", "TriUp", "TriDown"])
-		sym_row.addWidget(self.symtype_combo)
+		self.symtype_combo.setToolTip("Set marker shape for selected data sets")
 		self.symsize_spin = QtWidgets.QSpinBox()
 		self.symsize_spin.setRange(1, 30)
-		sym_row.addWidget(QtWidgets.QLabel("Size:",alignment=QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter))
-		sym_row.addWidget(self.symsize_spin)
-		apl.addLayout(sym_row)
+		self.symsize_spin.valueChanged.connect(self._on_appearance_change)
+		self.symsize_spin.setToolTip("Set marker size (1-30 pixels)")
+		self.contour_levels_spin = QtWidgets.QSpinBox()
+		self.contour_levels_spin.setRange(2, 50)
+		self.contour_levels_spin.setValue(15)
+		self.contour_levels_spin.valueChanged.connect(self._on_contour_change)
+		self.contour_levels_spin.setToolTip("Number of contour lines to draw")
+		ag.addWidget(self.symtype_combo, 2, 0)
+		ag.addWidget(self.symsize_spin, 2, 1)
+		ag.addWidget(self.contour_levels_spin, 2, 2)
+
+		apl.addLayout(ag)
 
 		vbl.addWidget(apg)
 
@@ -1375,12 +1528,14 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		cl.addWidget(xlabel, 0, 0)
 		self.col_x_spin = QtWidgets.QSpinBox()
 		self.col_x_spin.setRange(-1, 5)
+		self.col_x_spin.setToolTip("Column index for X axis (-1 = row index)")
 		cl.addWidget(self.col_x_spin, 0, 1)
 		ylabel = QtWidgets.QLabel("Y:")
 		ylabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 		cl.addWidget(ylabel, 0, 2)
 		self.col_y_spin = QtWidgets.QSpinBox()
 		self.col_y_spin.setRange(-1, 5)
+		self.col_y_spin.setToolTip("Column index for Y axis (-1 = row index)")
 		cl.addWidget(self.col_y_spin, 0, 3)
 		cg.setLayout(cl)
 		vbl.addWidget(cg)
@@ -1389,20 +1544,27 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		scale_row = QtWidgets.QHBoxLayout()
 		self.xlog_tog = QtWidgets.QPushButton("X Log")
 		self.xlog_tog.setCheckable(True)
+		self.xlog_tog.setToolTip("Toggle log10 scale on X axis")
 		scale_row.addWidget(self.xlog_tog)
 		self.ylog_tog = QtWidgets.QPushButton("Y Log")
 		self.ylog_tog.setCheckable(True)
+		self.ylog_tog.setToolTip("Toggle log10 scale on Y axis")
 		scale_row.addWidget(self.ylog_tog)
 		self.rescale_btn = QtWidgets.QPushButton("Rescale")
+		self.rescale_btn.setToolTip("Auto-scale axes to fit all visible data")
 		scale_row.addWidget(self.rescale_btn)
 		vbl.addLayout(scale_row)
 
 		# ── Axis limits ──
 		limit_g = QtWidgets.QGridLayout()
 		self.xmin_box = ValBox(label="X:", value=0)
+		self.xmin_box.setToolTip("X axis minimum")
 		self.xmax_box = ValBox(label="", value=1)
+		self.xmax_box.setToolTip("X axis maximum")
 		self.ymin_box = ValBox(label="Y:", value=0)
+		self.ymin_box.setToolTip("Y axis minimum")
 		self.ymax_box = ValBox(label="", value=1)
+		self.ymax_box.setToolTip("Y axis maximum")
 		limit_g.addWidget(self.xmin_box, 0, 0)
 		limit_g.addWidget(self.xmax_box, 0, 1)
 		limit_g.addWidget(self.ymin_box, 1, 0)
@@ -1412,7 +1574,9 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		# ── Labels only (no title) ──
 		label_g = QtWidgets.QGridLayout()
 		self.xlabel_edit = QtWidgets.QLineEdit()
+		self.xlabel_edit.setToolTip("X axis title text")
 		self.ylabel_edit = QtWidgets.QLineEdit()
+		self.ylabel_edit.setToolTip("Y axis title text")
 		label_g.addWidget(QtWidgets.QLabel("X Label:"), 0, 0)
 		label_g.addWidget(self.xlabel_edit, 0, 1)
 		label_g.addWidget(QtWidgets.QLabel("Y Label:"), 1, 0)
@@ -1422,6 +1586,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		# ── Transparency slider ──
 		self.alpha_slider = ValSlider(label="Alpha", value=0.8)
 		self.alpha_slider.setRange(0.1, 1.0)
+		self.alpha_slider.setToolTip("Transparency for selected data sets (0.1-1.0)")
 		vbl.addWidget(self.alpha_slider)
 
 		vbl.addStretch()
@@ -1499,6 +1664,11 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		# Log scale toggles
 		self.xlog_tog.setChecked(tgt.xlog)
 		self.ylog_tog.setChecked(tgt.ylog)
+
+		# Contour settings
+		self.con_tog.setChecked(tgt.contour_enabled)
+		self.contour_bins_spin.setValue(tgt.contour_bins)
+		self.contour_levels_spin.setValue(tgt.contour_levels)
 
 		# Rebuild list and select first item
 		self.update_list()
@@ -1583,16 +1753,14 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 	def _on_selection_changed(self, row):
 		"""Called when the user selects a data set in the list.
 
-		Only populates controls when there is exactly one selection and
-		not suppressed during programmatic list rebuilds.
+		Always syncs inspector controls from the first/primary selected item,
+		even during multi-select. This gives a guaranteed valid baseline;
+		individual property changes then apply to all currently selected items.
+		Not suppressed during programmatic list rebuilds.
 		"""
 		if self._selection_suppressed:
 			return
-		# Only sync controls to a single item; multi-select leaves controls as-is
-		selected = self.setlist.selectedItems()
-		if len(selected) != 1:
-			return
-		item = selected[0]
+		item = self.setlist.selectedItems()[0] if self.setlist.selectedItems() else None
 		if item is None:
 			return
 		key = item.data(QtCore.Qt.UserRole)
@@ -1718,6 +1886,19 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 				self.setlist.setCurrentRow(old_row)
 			finally:
 				self._selection_suppressed = False
+
+		# On initial load (nothing previously selected), select first item and sync controls
+		if old_row < 0 and self.setlist.count() > 0:
+			self._selection_suppressed = True
+			try:
+				self.setlist.setCurrentRow(0)
+			finally:
+				self._selection_suppressed = False
+			# Sync inspector from the first selected item without suppression
+			item = self.setlist.item(0)
+			if item is not None:
+				key = item.data(QtCore.Qt.UserRole)
+				self._update_controls_for_key(key)
 
 	def datachange(self):
 		self.update_list()
@@ -1870,8 +2051,14 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 				continue
 			tgt.pparm[key] = pp
 
-		tgt._dirty = True
-		tgt._request_render()
+			tgt._dirty = True
+			# Also trigger contour rebuild if enabled
+			if tgt.contour_enabled:
+				con_group = tgt._contour_group
+				if con_group is not None:
+					while len(con_group.children) > 0:
+						con_group.remove(con_group.children[0])
+			tgt._request_render()
 
 	def _on_color_change(self, idx):
 		keys = self._selected_keys()
@@ -1915,6 +2102,15 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			tgt._dirty = True
 			tgt._request_render()
 
+	def _on_contour_change(self):
+		tgt = self._get_tgt()
+		if tgt:
+			tgt.contour_enabled = self.con_tog.isChecked()
+			tgt.contour_bins = self.contour_bins_spin.value()
+			tgt.contour_levels = self.contour_levels_spin.value()
+			tgt._dirty = True
+			tgt._request_render()
+
 	def _on_rescale(self):
 		tgt = self._get_tgt()
 		if tgt:
@@ -1945,9 +2141,9 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 				tgt.xlimits = (xmin, xmax)
 				tgt.ylimits = (ymin, ymax)
 				try:
-					tgt._camera.show_rect(xmin, xmax, ymax, ymin)
+					tgt._camera.show_rect(xmin, xmax, ymax, ymin, depth=20)
 				except Exception:
-					pass  # Camera may reject extreme aspect ratios
+					pass  # show_rect can fail with degenerate limits
 				tgt._dirty = True
 				tgt._request_render()
 			except (ValueError, TypeError):
