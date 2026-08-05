@@ -114,7 +114,8 @@ class EMPlot3DWidget(QtWidgets.QWidget):
 		self._camera = None
 		self._controller = None
 		self._axis_labels = []
-		self._rulers = {}       # 12 gfx.Ruler objects by edge name
+		self._rulers = {}
+		self._ref_camera_pos = None
 		self._data_groups = {}
 		self._dirty = True
 		self._redraw = False
@@ -233,6 +234,7 @@ class EMPlot3DWidget(QtWidgets.QWidget):
 			import numpy as np
 			self._camera.world.position = (1.8, 1.2, 1.8)
 			self._camera.look_at(np.array([0, 0, 0]))
+			self._ref_camera_pos = np.array(self._camera.world.position)
 
 			# Orbit controller for interactive rotation/zoom
 			self._controller = gfx.OrbitController()
@@ -1093,6 +1095,13 @@ class EMPlot3DInspector(QtWidgets.QWidget):
 		ag.addWidget(self.symsize_spin, 2, 1)
 
 		apl.addLayout(ag)
+
+		# ── Alpha slider (inside Appearance group) ──
+		self.alpha_slider = ValSlider(label="Alpha", value=0.8)
+		self.alpha_slider.setRange(0.1, 1.0)
+		self.alpha_slider.setToolTip("Transparency for selected data sets")
+		apl.addWidget(self.alpha_slider)
+
 		vbl.addWidget(apg)
 
 		# ── Columns + Limits merged grid: Col | Min | Max per axis row ──
@@ -1161,11 +1170,11 @@ class EMPlot3DInspector(QtWidgets.QWidget):
 		label_g.addWidget(self.zlabel_edit, 2, 1)
 		vbl.addLayout(label_g)
 
-		# ── Alpha slider ──
-		self.alpha_slider = ValSlider(label="Alpha", value=0.8)
-		self.alpha_slider.setRange(0.1, 1.0)
-		self.alpha_slider.setToolTip("Transparency for selected data sets")
-		vbl.addWidget(self.alpha_slider)
+		# ── Perspective/FOV slider ──
+		self.fov_slider = ValSlider(label="Perspective", value=1.0)
+		self.fov_slider.setRange(1.0, 8.0)
+		self.fov_slider.setToolTip("Distance factor: 1=default perspective, higher=near-orthographic")
+		vbl.addWidget(self.fov_slider)
 
 		# ── Rescale button ──
 		self.rescale_btn = QtWidgets.QPushButton("Rescale")
@@ -1195,6 +1204,7 @@ class EMPlot3DInspector(QtWidgets.QWidget):
 		self.zlabel_edit.editingFinished.connect(self._on_label_change)
 
 		self.alpha_slider.valueChanged.connect(self._on_alpha_change)
+		self.fov_slider.valueChanged.connect(self._on_fov_change)
 		self.setlist.itemChanged.connect(self._on_item_changed)
 		self.showslide.valueChanged.connect(self._on_slide_change)
 
@@ -1632,6 +1642,30 @@ class EMPlot3DInspector(QtWidgets.QWidget):
 				pp.append(val)
 			tgt.pparm[key] = pp
 		tgt._dirty = True
+		tgt._request_render()
+
+	def _on_fov_change(self, val):
+		tgt = self._get_tgt()
+		if not tgt or tgt._camera is None:
+			return
+		f = float(val)
+		ref_pos = tgt._ref_camera_pos
+		if ref_pos is None:
+			return
+		# Scale distance from origin while preserving current viewing direction
+		orig_dist = np.linalg.norm(ref_pos)
+		cur_pos = np.array(tgt._camera.world.position, dtype=np.float64)
+		cur_dist = np.linalg.norm(cur_pos)
+		if cur_dist > 1e-10:
+			# Move camera to target distance along its current viewing direction
+			new_pos = (cur_pos / cur_dist) * orig_dist * f
+		else:
+			new_pos = ref_pos * f
+		tgt._camera.world.position = new_pos
+		ref_fov_half = np.radians(45.0 / 2.0)
+		new_fov = 2.0 * np.degrees(np.arctan(ref_fov_half / f))
+		tgt._camera.fov = new_fov
+		tgt._redraw = True
 		tgt._request_render()
 
 	def closeEvent(self, event):
