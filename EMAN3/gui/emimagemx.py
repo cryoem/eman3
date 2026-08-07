@@ -333,9 +333,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 			material = gfx.ImageBasicMaterial()
 			image_node = gfx.Image(geometry=geometry, material=material)
 
-			center_x = tx + tw / 2
-			center_y = ty + th / 2
-			image_node.world.position = (center_x, center_y, 0)
+			image_node.world.position = (tx,ty, 0)	# Position needs to be lower left corner of image
 			image_node.world_bounds = ((tx, ty, 0), (tx + tw, ty + th, 0))
 
 			self._image_group.add(image_node)
@@ -371,11 +369,10 @@ class EMImageMXWidget(QtWidgets.QWidget):
 
 	def _draw_set_outline(self, tx, ty, rw, rh, color):
 		"""Draw a small colored square outline for set membership."""
-		label_ratio = 0.15
-		outline_w = rw * label_ratio
-		outline_h = rh * label_ratio
+		outline_w = 8
+		outline_h = 8
 
-		ox = tx + rw / 2 - outline_w / 2
+		ox = tx + rw - outline_w - self.min_sep
 		oy = ty + rh - outline_h - self.min_sep
 
 		hw, hh = outline_w / 2, outline_h / 2
@@ -389,10 +386,11 @@ class EMImageMXWidget(QtWidgets.QWidget):
 			[cx - hw, cy - hh, 0.5],
 		], dtype=np.float32)
 
-		geometry = gfx.Geometry(positions=vertices)
-		material = gfx.LineMaterial(thickness=2.0, color=color)
-		line = gfx.Line(geometry, material)
-		self._set_outline_group.add(line)
+		geometry = gfx.Geometry(positions=vertices,indices=[[0,1,2],[0,2,3]])
+		# material = gfx.LineMaterial(thickness=2.0, color=color)
+		material = gfx.MeshBasicMaterial(color=color)
+		square = gfx.Mesh(geometry, material)
+		self._set_outline_group.add(square)
 
 	def _render_labels(self, rowstart, visiblerows, visiblecols, rw, rh):
 		"""Render metadata text labels for each visible tile."""
@@ -411,13 +409,9 @@ class EMImageMXWidget(QtWidgets.QWidget):
 				if not label_text:
 					continue
 
-				text_x = tx + 2
-				text_y = ty + self.font_size + 2
-
-				text_node = gfx.Text(label_text, font_size=self.font_size,
-				                     render_order=999)
+				text_node = gfx.Text(label_text, font_size=self.font_size, render_order=999, anchor="bottom-left", material=gfx.TextMaterial(color='#fff',outline_color='#000', outline_thickness=0.5))
 				text_node.material.color = (1.0, 1.0, 1.0, 1.0)
-				text_node.local.position = (text_x, text_y, 0.5)
+				text_node.local.position = (tx+2, ty+2, 0.5)
 
 				self._text_group.add(text_node)
 
@@ -661,6 +655,72 @@ class EMImageMXWidget(QtWidgets.QWidget):
 	def get_font_size(self):
 		return self.font_size
 
+	def auto_contrast(self):
+		"""Auto-contrast: mean +/- 3 sigma sampled across images."""
+		if not self._data or self.nimg == 0:
+			return
+
+		valid = [img for img in self._data if img is not None]
+		if not valid:
+			return
+
+		n_sample = min(len(valid), 64)
+		stp = max(len(valid) // n_sample, 1)
+
+		mean_sum = 0.0
+		max_sigma = 0.0
+		count = 0
+
+		for i in range(0, len(valid), stp):
+			img = valid[i]
+			if img is None:
+				continue
+			mean_sum += float(np.mean(img))
+			count += 1
+			max_sigma = max(max_sigma, float(np.std(img)))
+
+		if count == 0:
+			return
+
+		mean_sum /= count
+		# Use global min/max from first sample pass
+		global_min = min(float(np.min(valid[i])) for i in range(0, len(valid), stp) if valid[i] is not None)
+		global_max = max(float(np.max(valid[i])) for i in range(0, len(valid), stp) if valid[i] is not None)
+
+		self.minden = max(global_min, mean_sum - 3.0 * max_sigma)
+		self.maxden = min(global_max, mean_sum + 4.0 * max_sigma)
+
+		self._dirty = True
+		self._request_render()
+
+	def full_contrast(self):
+		"""Full contrast: global min to max of all data."""
+		if not self._data or self.nimg == 0:
+			return
+
+		valid = [img for img in self._data if img is not None]
+		if not valid:
+			return
+
+		n_sample = min(len(valid), 64)
+		stp = max(len(valid) // n_sample, 1)
+
+		global_min = float('inf')
+		global_max = float('-inf')
+
+		for i in range(0, len(valid), stp):
+			img = valid[i]
+			if img is None:
+				continue
+			global_min = min(global_min, float(np.min(img)))
+			global_max = max(global_max, float(np.max(img)))
+
+		self.minden = global_min
+		self.maxden = global_max
+
+		self._dirty = True
+		self._request_render()
+
 	# ─── Sets management ────────────────────────────────────────
 
 	def enable_set(self, name, lst=None, display=True, force=False):
@@ -900,49 +960,6 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		mode_layout.addWidget(self._btn_sets)
 		main_layout.addLayout(mode_layout)
 
-		# Display controls
-		self._scale = ValSlider(None, (0.05, 10.0), "Scale:")
-		self._scale.setValue(1.0)
-		self._scale.setToolTip("Magnification of each image tile")
-		main_layout.addWidget(self._scale)
-
-		self._min = ValSlider(None, (0, 1), "Min:")
-		self._min.setToolTip("Minimum density value for contrast mapping")
-		main_layout.addWidget(self._min)
-
-		self._max = ValSlider(None, (0, 1), "Max:")
-		self._max.setToolTip("Maximum density value for contrast mapping")
-		main_layout.addWidget(self._max)
-
-		self._brt = ValSlider(None, (-1.0, 1.0), "Brt:")
-		self._brt.setValue(0.0)
-		self._brt.setToolTip("Brightness offset")
-		main_layout.addWidget(self._brt)
-
-		self._cont = ValSlider(None, (0, 1.0), "Cont:")
-		self._cont.setValue(0.5)
-		self._cont.setToolTip("Contrast multiplier")
-		main_layout.addWidget(self._cont)
-
-		self._gamma = ValSlider(None, (0.1, 5.0), "Gamma:")
-		self._gamma.setValue(1.0)
-		self._gamma.setToolTip("Gamma correction")
-		main_layout.addWidget(self._gamma)
-
-		# Action buttons
-		btn_layout = QtWidgets.QHBoxLayout()
-		self._btn_snapshot = QtWidgets.QPushButton("Snapshot")
-		self._btn_snapshot.setToolTip("Save screenshot of current view")
-		self._btn_save = QtWidgets.QPushButton("Save Data")
-		self._btn_save.setToolTip("Export displayed images to file")
-		self._btn_open2d = QtWidgets.QPushButton("Open 2D")
-		self._btn_open2d.setToolTip("Open selected image in single-image viewer")
-
-		btn_layout.addWidget(self._btn_snapshot)
-		btn_layout.addWidget(self._btn_save)
-		btn_layout.addWidget(self._btn_open2d)
-		main_layout.addLayout(btn_layout)
-
 		# Sets panel
 		sets_group = QtWidgets.QGroupBox("Sets")
 		sets_layout = QtWidgets.QHBoxLayout(sets_group)
@@ -972,6 +989,64 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._set_list.itemChanged.connect(self._on_set_item_changed)
 		self._set_list.currentRowChanged.connect(self._on_set_row_changed)
 
+		# Display controls
+		self._scale = ValSlider(None, (0.05, 10.0), "Scale:")
+		self._scale.setValue(1.0)
+		self._scale.setToolTip("Magnification of each image tile")
+		main_layout.addWidget(self._scale)
+
+		self._min = ValSlider(None, (0, 1), "Min:")
+		self._min.setToolTip("Minimum density value for contrast mapping")
+		main_layout.addWidget(self._min)
+
+		self._max = ValSlider(None, (0, 1), "Max:")
+		self._max.setToolTip("Maximum density value for contrast mapping")
+		main_layout.addWidget(self._max)
+
+		self._brt = ValSlider(None, (-1.0, 1.0), "Brt:")
+		self._brt.setValue(0.0)
+		self._brt.setToolTip("Brightness offset")
+		main_layout.addWidget(self._brt)
+
+		self._cont = ValSlider(None, (0, 1.0), "Cont:")
+		self._cont.setValue(0.5)
+		self._cont.setToolTip("Contrast multiplier")
+		main_layout.addWidget(self._cont)
+
+		self._gamma = ValSlider(None, (0.1, 5.0), "Gamma:")
+		self._gamma.setValue(1.0)
+		self._gamma.setToolTip("Gamma correction")
+		main_layout.addWidget(self._gamma)
+
+		# AutoC / FullC / Invert row
+		ctrl_layout = QtWidgets.QHBoxLayout()
+		self._btn_autoc = QtWidgets.QPushButton("AutoC")
+		self._btn_autoc.setToolTip("Auto-contrast: mean +/- 3 sigma")
+		self._btn_fullc = QtWidgets.QPushButton("FullC")
+		self._btn_fullc.setToolTip("Full contrast: min to max of all data")
+		self._btn_invert = QtWidgets.QPushButton("Invert")
+		self._btn_invert.setCheckable(True)
+		self._btn_invert.setToolTip("Invert grayscale display")
+
+		ctrl_layout.addWidget(self._btn_autoc)
+		ctrl_layout.addWidget(self._btn_fullc)
+		ctrl_layout.addWidget(self._btn_invert)
+		main_layout.addLayout(ctrl_layout)
+
+		# Action buttons
+		btn_layout = QtWidgets.QHBoxLayout()
+		self._btn_snapshot = QtWidgets.QPushButton("Snapshot")
+		self._btn_snapshot.setToolTip("Save screenshot of current view")
+		self._btn_save = QtWidgets.QPushButton("Save Data")
+		self._btn_save.setToolTip("Export displayed images to file")
+		self._btn_open2d = QtWidgets.QPushButton("Open 2D")
+		self._btn_open2d.setToolTip("Open selected image in single-image viewer")
+
+		btn_layout.addWidget(self._btn_snapshot)
+		btn_layout.addWidget(self._btn_save)
+		btn_layout.addWidget(self._btn_open2d)
+		main_layout.addLayout(btn_layout)
+
 	def _wire_signals(self):
 		tgt = self._tgt()
 		if not tgt:
@@ -994,6 +1069,10 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._btn_save_set.clicked.connect(self._on_save_set)
 		self._btn_save_txt.clicked.connect(self._on_save_set_text)
 
+		self._btn_autoc.clicked.connect(self._on_auto_contrast)
+		self._btn_fullc.clicked.connect(self._on_full_contrast)
+		self._btn_invert.toggled.connect(self._on_invert_toggled)
+
 	def _sync_from_widget(self):
 		"""Pull current values from the widget into inspector controls."""
 		tgt = self._tgt()
@@ -1005,8 +1084,10 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._max.setValue(tgt.maxden)
 		self._gamma.setValue(tgt.gamma)
 
-		self._min.setRange(tgt.minden, tgt.maxden)
-		self._max.setRange(tgt.minden, tgt.maxden)
+		self._min.setRange(tgt.minden - 0.5, tgt.maxden + 0.5)
+		self._max.setRange(tgt.minden - 0.5, tgt.maxden + 0.5)
+
+		self._btn_invert.setChecked(tgt.invert)
 
 		mode = tgt.mmode
 		btn_map = {
@@ -1079,6 +1160,26 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		tgt = self._tgt()
 		if tgt:
 			tgt.set_gamma(val)
+
+	def _on_auto_contrast(self):
+		"""Auto-contrast: mean +/- 3 sigma sampled across images."""
+		tgt = self._tgt()
+		if tgt:
+			tgt.auto_contrast()
+			self._sync_from_widget()
+
+	def _on_full_contrast(self):
+		"""Full contrast: global min to max of all data."""
+		tgt = self._tgt()
+		if tgt:
+			tgt.full_contrast()
+			self._sync_from_widget()
+
+	def _on_invert_toggled(self, checked):
+		"""Toggle grayscale inversion."""
+		tgt = self._tgt()
+		if tgt:
+			tgt.set_invert(checked)
 
 	def _on_snapshot(self):
 		fsp, _ = QtWidgets.QFileDialog.getSaveFileName(
