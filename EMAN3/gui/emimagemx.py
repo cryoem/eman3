@@ -302,7 +302,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		h = self.height()
 
 		tx = col * (rw + self.min_sep) + self.min_sep
-		ty = row * (rh + self.min_sep) + self.min_sep + self.scroll_offset
+		ty = row * (rh + self.min_sep) + self.min_sep - self.scroll_offset
 
 		tw = min(rw, w - tx)
 		th = min(rh, h - ty)
@@ -358,7 +358,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 					continue
 
 				tx = col * (rw + self.min_sep) + self.min_sep
-				ty = row * (rh + self.min_sep) + self.min_sep + self.scroll_offset
+				ty = row * (rh + self.min_sep) + self.min_sep - self.scroll_offset
 
 				for set_i, (set_name, set_list) in enumerate(sorted_sets):
 					if set_name not in self.sets_visible:
@@ -405,7 +405,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 					continue
 
 				tx = col * (rw + self.min_sep) + self.min_sep
-				ty = row * (rh + self.min_sep) + self.min_sep + self.scroll_offset
+				ty = row * (rh + self.min_sep) + self.min_sep - self.scroll_offset
 
 				label_text = self._get_label_text(idx)
 				if not label_text:
@@ -692,8 +692,12 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		self.minden = max(global_min, mean_sum - 3.0 * max_sigma)
 		self.maxden = min(global_max, mean_sum + 4.0 * max_sigma)
 
+		self._clear_scene_groups()
 		self._dirty = True
 		self._request_render()
+
+		if self.inspector:
+			self.inspector._sync_from_widget()
 
 	def full_contrast(self):
 		"""Full contrast: global min to max of all data."""
@@ -720,8 +724,12 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		self.minden = global_min
 		self.maxden = global_max
 
+		self._clear_scene_groups()
 		self._dirty = True
 		self._request_render()
+
+		if self.inspector:
+			self.inspector._sync_from_widget()
 
 	# ─── Sets management ────────────────────────────────────────
 
@@ -915,7 +923,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 					break
 
 				tx = col * (rw + self.min_sep) + self.min_sep
-				ty = row * (rh + self.min_sep) + self.min_sep + self.scroll_offset
+				ty = row * (rh + self.min_sep) + self.min_sep - self.scroll_offset
 
 				if tx <= x <= tx + rw and ty <= y <= ty + rh:
 					return idx
@@ -1048,6 +1056,21 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._set_list.itemChanged.connect(self._on_set_item_changed)
 		self._set_list.currentRowChanged.connect(self._on_set_row_changed)
 
+		# AutoC / FullC / Invert row
+		ctrl_layout = QtWidgets.QHBoxLayout()
+		self._btn_autoc = QtWidgets.QPushButton("AutoC")
+		self._btn_autoc.setToolTip("Auto-contrast: mean +/- 3 sigma")
+		self._btn_fullc = QtWidgets.QPushButton("FullC")
+		self._btn_fullc.setToolTip("Full contrast: min to max of all data")
+		self._btn_invert = QtWidgets.QPushButton("Invert")
+		self._btn_invert.setCheckable(True)
+		self._btn_invert.setToolTip("Invert grayscale display")
+
+		ctrl_layout.addWidget(self._btn_autoc)
+		ctrl_layout.addWidget(self._btn_fullc)
+		ctrl_layout.addWidget(self._btn_invert)
+		main_layout.addLayout(ctrl_layout)
+
 		# Display controls
 		self._scale = ValSlider(None, (0.05, 10.0), "Scale:")
 		self._scale.setValue(1.0)
@@ -1076,21 +1099,6 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._gamma.setValue(1.0)
 		self._gamma.setToolTip("Gamma correction")
 		main_layout.addWidget(self._gamma)
-
-		# AutoC / FullC / Invert row
-		ctrl_layout = QtWidgets.QHBoxLayout()
-		self._btn_autoc = QtWidgets.QPushButton("AutoC")
-		self._btn_autoc.setToolTip("Auto-contrast: mean +/- 3 sigma")
-		self._btn_fullc = QtWidgets.QPushButton("FullC")
-		self._btn_fullc.setToolTip("Full contrast: min to max of all data")
-		self._btn_invert = QtWidgets.QPushButton("Invert")
-		self._btn_invert.setCheckable(True)
-		self._btn_invert.setToolTip("Invert grayscale display")
-
-		ctrl_layout.addWidget(self._btn_autoc)
-		ctrl_layout.addWidget(self._btn_fullc)
-		ctrl_layout.addWidget(self._btn_invert)
-		main_layout.addLayout(ctrl_layout)
 
 		# Action buttons
 		btn_layout = QtWidgets.QHBoxLayout()
