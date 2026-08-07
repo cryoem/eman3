@@ -30,7 +30,7 @@ def main():
 	data = []
 	for i in range(n_images):
 		# Generate varied test images: some uniform, some with gradients, some noisy
-		kind = i % 4
+		kind = (i // 4)%4
 		if kind == 0:
 			# Random noise
 			img = np.random.rand(img_size, img_size).astype(np.float32)
@@ -56,8 +56,8 @@ def main():
 	widget.setWindowTitle(f"EMImageMX Test - {n_images} images ({img_size}x{img_size})")
 
 	# Create a couple of test sets
-	widget.enable_set("gradients", {i for i in range(n_images) if i % 4 == 1}, display=True)
-	widget.enable_set("circles", {i for i in range(n_images) if i % 4 == 2}, display=True)
+	widget.enable_set("gradients", {i for i in range(n_images) if (i//4) % 4 == 1}, display=True)
+	widget.enable_set("circles", {i for i in range(n_images) if (i//4) % 4 == 2}, display=True)
 	widget.current_set = "gradients"
 
 	widget.show()

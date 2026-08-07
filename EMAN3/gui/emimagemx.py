@@ -110,6 +110,9 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		self.mmode = "App"
 		self._drag_start_pos = None
 		self._drag_scroll_at_start = None
+		# Right-drag scroll state
+		self._right_drag_active = False
+		self._right_drag_start = None
 
 		# Sets system
 		self.sets = {}              # name -> set of image indices
@@ -242,7 +245,6 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		total_rows = math.ceil(self.nimg / visiblecols)
 
 		row_h = rendered_h + self.min_sep
-		effective_scroll = abs(self.scroll_offset) % row_h if self.scroll_offset != 0 else 0
 
 		if self.scroll_offset < 0:
 			ybelow = math.floor(-self.scroll_offset // row_h)
@@ -253,7 +255,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		if rowstart < 0:
 			rowstart = 0
 
-		visiblerows = max(1, int(math.ceil((h + effective_scroll) / row_h)))
+		visiblerows = max(1, int(math.ceil(h / row_h)) + 1)
 		if rowstart + visiblerows > total_rows:
 			visiblerows = max(1, total_rows - rowstart)
 
@@ -817,10 +819,24 @@ class EMImageMXWidget(QtWidgets.QWidget):
 
 		pos = (event.position().x(), event.position().y()) if hasattr(event, 'position') else (event.x(), event.y())
 
+		# Right-drag vertical scroll (consistent with other widgets)
+		if event.button() == Qt.RightButton:
+			self._right_drag_active = True
+			self._right_drag_start = pos[1]
+			event.accept()
+			return
+
 		if self.mmode == "App" and event.button() == Qt.LeftButton:
 			img = self._hit_test_image(pos[0], pos[1])
 			if img is not None:
 				self.mx_image_selected.emit(event, (img,))
+
+		elif self.mmode == "Sets" and event.button() == Qt.LeftButton:
+			# Toggle set membership on press so user sees immediate feedback
+			img = self._hit_test_image(pos[0], pos[1])
+			if img is not None:
+				self._ensure_active_set()
+				self._toggle_set_membership(img)
 
 		elif self.mmode == "Drag":
 			self._drag_start_pos = pos
@@ -829,6 +845,19 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		event.accept()
 
 	def _on_mouse_move(self, event):
+		# Right-drag vertical scroll
+		if self._right_drag_active:
+			pos = (event.position().x(), event.position().y()) if hasattr(event, 'position') else (event.x(), event.y())
+			dy = pos[1] - self._right_drag_start
+			self.scroll_offset += dy
+			min_sc, max_sc = self._compute_scroll_range()
+			self.scroll_offset = max(min_sc, min(max_sc, self.scroll_offset))
+			self._dirty = True
+			self._request_render()
+			self._right_drag_start = pos[1]
+			event.accept()
+			return
+
 		if self.mmode == "Drag" and self._drag_start_pos:
 			pos = (event.position().x(), event.position().y()) if hasattr(event, 'position') else (event.x(), event.y())
 			dy = pos[1] - self._drag_start_pos[1]
@@ -841,11 +870,9 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		event.accept()
 
 	def _on_mouse_release(self, event):
-		if event.button() == Qt.LeftButton:
-			pos = (event.position().x(), event.position().y()) if hasattr(event, 'position') else (event.x(), event.y())
-			img = self._hit_test_image(pos[0], pos[1])
-			if img is not None and self.mmode == "Sets":
-				self._toggle_set_membership(img)
+		if event.button() == Qt.RightButton:
+			self._right_drag_active = False
+			self._right_drag_start = None
 
 		if self.mmode == "Drag":
 			self._drag_start_pos = None
@@ -853,17 +880,29 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		event.accept()
 
 	def _on_wheel(self, event):
+		"""Mouse wheel adjusts the tile scale rather than scrolling."""
 		delta = event.angleDelta().y()
 		if delta > 0:
-			self.scroll_by(-50)
+			self.scale *= 1.1
 		else:
-			self.scroll_by(50)
+			self.scale /= 1.1
+		self.scale = max(0.05, min(self.scale, 50.0))
+		self.scroll_offset = 0
+		self._dirty = True
+		self._request_render()
+
+		if self.inspector:
+			self.inspector._sync_from_widget()
 		event.accept()
 
-	def _hit_test_image(self, x, y):
+	def _hit_test_image(self, sx, sy):
 		"""Find which image index is at the given screen position."""
 		if self._data is None or self.nimg == 0:
 			return None
+
+		# Compensate for Y-flip caused by offscreen blitting
+		y = self.height() - sy
+		x = sx
 
 		rowstart, visiblerows, visiblecols, _ = self._compute_grid()
 		rw = self._img_xsize * self.scale
@@ -883,6 +922,25 @@ class EMImageMXWidget(QtWidgets.QWidget):
 
 		return None
 
+	def _ensure_active_set(self):
+		"""Ensure there is an active set for membership toggling.
+
+		Creates a 'Default' set if none exist, or selects the first set
+		if no set is currently active. Also refreshes inspector list.
+		"""
+		created = False
+		if not self.sets:
+			# No sets exist → create Default
+			self.enable_set("Default", [], display=True)
+			self.current_set = "Default"
+			created = True
+		elif self.current_set is None:
+			# Sets exist but none selected → pick first
+			self.current_set = sorted(self.sets.keys())[0]
+
+		if created and self.inspector:
+			self.inspector._refresh_set_list()
+
 	def _toggle_set_membership(self, img_idx):
 		"""Toggle the clicked image's membership in the current set."""
 		if self.current_set is None:
@@ -892,6 +950,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 			s.discard(img_idx)
 		else:
 			s.add(img_idx)
+		self._clear_scene_groups()
 		self._dirty = True
 		self._request_render()
 
