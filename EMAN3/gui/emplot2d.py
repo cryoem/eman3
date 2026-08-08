@@ -777,52 +777,52 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 
 		# Position axis labels in world coords so they stay fixed on screen
 		# Check if label text has changed and needs recreating
-		labels_need_update = (len(self._axis_labels) < 2) or (self.xaxis_label != self._prev_xlabel) or (self.yaxis_label != self._prev_ylabel) or (getattr(self, "_prev_xlog", False) != self.xlog) or (getattr(self, "_prev_ylog", False) != self.ylog)
+		# labels_need_update = (len(self._axis_labels) < 2) or (self.xaxis_label != self._prev_xlabel) or (self.yaxis_label != self._prev_ylabel) or (getattr(self, "_prev_xlog", False) != self.xlog) or (getattr(self, "_prev_ylog", False) != self.ylog) or 
 
-		if labels_need_update:
+		# if labels_need_update:
 			# Remove old axis labels
-			for lbl in self._axis_labels:
-				try:
-					self._scene.remove(lbl)
-				except Exception:
-					pass
-			self._axis_labels = []
+		for lbl in self._axis_labels:
+			try:
+				self._scene.remove(lbl)
+			except Exception:
+				pass
+		self._axis_labels = []
 
-			label_color = (0, 0, 0, 1.0)
+		label_color = (0, 0, 0, 1.0)
 
-			# Compute display labels with log suffix if active
-			x_lbl = self.xaxis_label
-			if self.xlog and x_lbl:
-				x_lbl = x_lbl + " (log10)"
-			elif not x_lbl and self.xlog:
-				x_lbl = "X (log10)"
-			y_lbl = self.yaxis_label
-			if self.ylog and y_lbl:
-				y_lbl = y_lbl + " (log10)"
-			elif not y_lbl and self.ylog:
-				y_lbl = "Y (log10)"
+		# Compute display labels with log suffix if active
+		x_lbl = self.xaxis_label
+		if self.xlog and x_lbl:
+			x_lbl = x_lbl + " (log10)"
+		elif not x_lbl and self.xlog:
+			x_lbl = "X (log10)"
+		y_lbl = self.yaxis_label
+		if self.ylog and y_lbl:
+			y_lbl = y_lbl + " (log10)"
+		elif not y_lbl and self.ylog:
+			y_lbl = "Y (log10)"
 
-			if x_lbl:
-				xlbl = gfx.Text(x_lbl, font_size=18,
-									screen_space=True)
-				xlbl.material.color = label_color
-				sx_lbl = margin_left + (w - margin_left - margin_right) / 2
-				sy_lbl = h - margin_bottom + 25
-				xlbl._screen_pos = (sx_lbl, sy_lbl)
-				xlbl.local.position = (*self._screen_to_world(sx_lbl, sy_lbl), 0)
-				self._scene.add(xlbl)
-				self._axis_labels.append(xlbl)
+		if x_lbl:
+			xlbl = gfx.Text(x_lbl, font_size=18,
+								screen_space=True)
+			xlbl.material.color = label_color
+			sx_lbl = margin_left + (w - margin_left - margin_right) / 2
+			sy_lbl = h - margin_bottom + 25
+			xlbl._screen_pos = (sx_lbl, sy_lbl)
+			xlbl.local.position = (*self._screen_to_world(sx_lbl, sy_lbl), 0)
+			self._scene.add(xlbl)
+			self._axis_labels.append(xlbl)
 
-			if y_lbl:
-				ylbl = gfx.Text(y_lbl, font_size=18,
-									screen_space=True)
-				ylbl.material.color = label_color
-				sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
-				ylbl._screen_pos = (10, sy_lbl)
-				ylbl.local.position = (*self._screen_to_world(10, sy_lbl), 0)
-				ylbl.local.rotation = la.quat_from_euler((0, 0, np.radians(90)))  # Rotate 90° CCW
-				self._scene.add(ylbl)
-				self._axis_labels.append(ylbl)
+		if y_lbl:
+			ylbl = gfx.Text(y_lbl, font_size=18,
+								screen_space=True)
+			ylbl.material.color = label_color
+			sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
+			ylbl._screen_pos = (10, sy_lbl)
+			ylbl.local.position = (*self._screen_to_world(10, sy_lbl), 0)
+			ylbl.local.rotation = la.quat_from_euler((0, 0, np.radians(90)))  # Rotate 90° CCW
+			self._scene.add(ylbl)
+			self._axis_labels.append(ylbl)
 
 			# Cache values for next comparison
 			self._prev_xlabel = self.xaxis_label
