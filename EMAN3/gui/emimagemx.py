@@ -24,10 +24,12 @@ from EMAN3.gui.emimage2d import (
 
 
 # Set outline colors (RGBA floats)
+# SET_COLORS[0] (red) is reserved for the "Deleted" set.
+# Other sets use indices 1..N, skipping index 0.
 SET_COLORS = [
+	(1.0, 0.0, 0.0, 1.0),       # red - reserved for Deleted set only
 	(0.0, 0.0, 1.0, 1.0),       # blue
 	(0.0, 0.85, 0.0, 1.0),      # green
-	(1.0, 0.0, 0.0, 1.0),       # red
 	(0.0, 0.8, 0.8, 1.0),       # cyan
 	(0.502, 0.0, 0.502, 1.0),   # purple
 	(1.0, 0.647, 0.0, 1.0),     # orange
@@ -96,7 +98,13 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		self.scale = 1.0
 		self.minden = 0.0
 		self.maxden = 1.0
+		# Current contrast values (modified by Brt/Cont, bounded by minden/maxden)
+		self.curmin = 0.0
+		self.curmax = 1.0
 		self.invert = False
+		# Full data range across all images (set by set_data/auto_contrast)
+		self._global_min = 0.0
+		self._global_max = 1.0
 		self.gamma = 1.0
 		self.brightness = 0.0
 		self.contrast = 1.0
@@ -106,10 +114,8 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		self.scroll_offset = 0       # vertical scroll offset in px
 
 		# Mouse mode
-		self.mouse_modes = ["App", "Del", "Drag", "Sets"]
+		self.mouse_modes = ["App", "Del", "Sets"]
 		self.mmode = "App"
-		self._drag_start_pos = None
-		self._drag_scroll_at_start = None
 		# Right-drag scroll state
 		self._right_drag_active = False
 		self._right_drag_start = None
@@ -168,6 +174,11 @@ class EMImageMXWidget(QtWidgets.QWidget):
 			# Orthographic camera for screen-aligned tiled display
 			self._camera = gfx.OrthographicCamera(maintain_aspect=False)
 			self._camera.world.position = (0, 0, 1)
+
+			# Add the background object to the scene
+			bg_material = gfx.BackgroundMaterial((0.0, 0.0, 0.0, 1.0))
+			background = gfx.Background(None, bg_material)
+			self._scene.add(background)
 
 			# Initialize text material with a dummy node
 			try:
@@ -317,7 +328,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 			rgb, _ = _render_image_8bit(
 				data, self.scale, 0, 0,
 				int_tw, int_th,
-				self.minden, self.maxden,
+				self.curmin, self.curmax,
 				gamma=self.gamma,
 				invert=self.invert,
 			)
@@ -428,15 +439,14 @@ class EMImageMXWidget(QtWidgets.QWidget):
 				if isinstance(header, dict):
 					val = header.get(val_name, "?")
 					parts.append(str(val))
-		return " ".join(parts)
+		return "\n".join(parts)
 
 	# ─── Data handling ──────────────────────────────────────────
 
 	def set_data(self, obj, filename="", metadata=None):
 		"""Set the data to display.
 
-		Accepts a list of numpy 2D arrays (float), EMData objects, or
-		an iterable of images.
+		Accepts a list of numpy 2D arrays (float), or an iterable of images.
 		"""
 		self.file_name = filename
 		if filename:
@@ -447,12 +457,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 
 		if isinstance(obj, (list, tuple)):
 			for item in obj:
-				if hasattr(item, 'get_data'):
-					# EMData-like object
-					arr = self._emdata_to_numpy(item)
-					images.append(arr)
-					headers.append(self._emdata_header(item))
-				elif isinstance(item, np.ndarray):
+				if isinstance(item, np.ndarray):
 					arr = item.astype(np.float32)
 					if arr.ndim == 2:
 						images.append(arr)
@@ -465,17 +470,10 @@ class EMImageMXWidget(QtWidgets.QWidget):
 					images.append(None)
 					headers.append({})
 		else:
-			try:
-				if hasattr(obj, 'nproc'):
-					for i in range(len(obj)):
-						frame = obj[i]
-						images.append(self._emdata_to_numpy(frame))
-						headers.append(self._emdata_header(frame))
-			except Exception:
-				arr = np.asarray(obj, dtype=np.float32)
-				if arr.ndim == 2:
-					images = [arr]
-					headers = [metadata or {}]
+			arr = np.asarray(obj, dtype=np.float32)
+			if arr.ndim == 2:
+				images = [arr]
+				headers = [metadata or {}]
 
 		self._data = images
 		self._data_headers = headers
@@ -487,84 +485,11 @@ class EMImageMXWidget(QtWidgets.QWidget):
 				self._img_ysize, self._img_xsize = img.shape
 				break
 
-		self._auto_contrast()
+		# Auto-contrast on new data
+		self.auto_contrast(inspector_update=False)
 
 		self._dirty = True
 		self._request_render()
-
-	def _emdata_to_numpy(self, emd):
-		"""Convert an EMData-like object to a 2D numpy float32 array."""
-		try:
-			arr = emd.get_data(process=False)
-		except AttributeError:
-			try:
-				arr = np.array(emd)
-			except Exception:
-				return None
-
-		arr = arr.astype(np.float32)
-		if arr.ndim == 3:
-			if arr.shape[0] == 1:
-				arr = arr[0]
-			else:
-				min_dim = arr.shape.index(min(arr.shape))
-				arr = np.take(arr, 0, axis=min_dim)
-
-		return arr
-
-	def _emdata_header(self, emd):
-		"""Extract header metadata from an EMData-like object."""
-		header = {}
-		try:
-			keys = emd.get_all_headers()
-			for key in keys:
-				try:
-					val = emd.get_attr(key)
-					header[key] = val
-				except Exception:
-					pass
-		except Exception:
-			pass
-		return header
-
-	def _auto_contrast(self):
-		"""Compute automatic contrast range by sampling images."""
-		if not self._data or self.nimg == 0:
-			self.minden = 0.0
-			self.maxden = 1.0
-			return
-
-		valid = [img for img in self._data if img is not None]
-		if not valid:
-			return
-
-		n_sample = min(len(valid), 64)
-		stp = max(len(valid) // n_sample, 1)
-
-		mean_sum = 0.0
-		max_sigma = 0.0
-		global_min = float('inf')
-		global_max = float('-inf')
-		count = 0
-
-		for i in range(0, len(valid), stp):
-			img = valid[i]
-			if img is None:
-				continue
-			mean_sum += float(np.mean(img))
-			count += 1
-			max_sigma = max(max_sigma, float(np.std(img)))
-			global_min = min(global_min, float(np.min(img)))
-			global_max = max(global_max, float(np.max(img)))
-
-		if count == 0:
-			self.minden = 0.0
-			self.maxden = 1.0
-			return
-
-		mean_sum /= count
-		self.minden = max(global_min, mean_sum - 3.0 * max_sigma)
-		self.maxden = min(global_max, mean_sum + 4.0 * max_sigma)
 
 	def clear_data(self):
 		"""Clear all displayed data."""
@@ -593,24 +518,24 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		return self.scale
 
 	def set_density_min(self, val):
-		self.minden = val
+		self.curmin = float(val)
 		self._dirty = True
 		self._request_render()
 
 	def get_density_min(self):
-		return self.minden
+		return self.curmin
 
 	def set_density_max(self, val):
-		self.maxden = val
+		self.curmax = float(val)
 		self._dirty = True
 		self._request_render()
 
 	def get_density_max(self):
-		return self.maxden
+		return self.curmax
 
 	def set_den_range(self, mn, mx):
-		self.minden = mn
-		self.maxden = mx
+		self.curmin = float(mn)
+		self.curmax = float(mx)
 		self._dirty = True
 		self._request_render()
 
@@ -657,7 +582,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 	def get_font_size(self):
 		return self.font_size
 
-	def auto_contrast(self):
+	def auto_contrast(self, inspector_update=True):
 		"""Auto-contrast: mean +/- 3 sigma sampled across images."""
 		if not self._data or self.nimg == 0:
 			return
@@ -671,6 +596,8 @@ class EMImageMXWidget(QtWidgets.QWidget):
 
 		mean_sum = 0.0
 		max_sigma = 0.0
+		global_min = float('inf')
+		global_max = float('-inf')
 		count = 0
 
 		for i in range(0, len(valid), stp):
@@ -680,49 +607,40 @@ class EMImageMXWidget(QtWidgets.QWidget):
 			mean_sum += float(np.mean(img))
 			count += 1
 			max_sigma = max(max_sigma, float(np.std(img)))
+			global_min = min(global_min, float(np.min(img)))
+			global_max = max(global_max, float(np.max(img)))
 
 		if count == 0:
 			return
 
 		mean_sum /= count
-		# Use global min/max from first sample pass
-		global_min = min(float(np.min(valid[i])) for i in range(0, len(valid), stp) if valid[i] is not None)
-		global_max = max(float(np.max(valid[i])) for i in range(0, len(valid), stp) if valid[i] is not None)
-
-		self.minden = max(global_min, mean_sum - 3.0 * max_sigma)
-		self.maxden = min(global_max, mean_sum + 4.0 * max_sigma)
+		
+		self._global_min = global_min
+		self._global_max = global_max
+		
+		# minden/maxden store the full data range
+		self.minden = global_min
+		self.maxden = global_max
+		
+		# curmin/curmax are the actual contrast values (mean±3σ)
+		self.curmin = max(global_min, mean_sum - 3.0 * max_sigma)
+		self.curmax = min(global_max, mean_sum + 3.0 * max_sigma)
 
 		self._clear_scene_groups()
 		self._dirty = True
 		self._request_render()
 
-		if self.inspector:
+		if inspector_update and self.inspector:
 			self.inspector._sync_from_widget()
 
-	def full_contrast(self):
-		"""Full contrast: global min to max of all data."""
-		if not self._data or self.nimg == 0:
+	def full_contrast(self, inspector_update=True):
+		"""Full contrast: use entire data range for contrast."""
+		if self._global_max == self._global_min:
 			return
-
-		valid = [img for img in self._data if img is not None]
-		if not valid:
-			return
-
-		n_sample = min(len(valid), 64)
-		stp = max(len(valid) // n_sample, 1)
-
-		global_min = float('inf')
-		global_max = float('-inf')
-
-		for i in range(0, len(valid), stp):
-			img = valid[i]
-			if img is None:
-				continue
-			global_min = min(global_min, float(np.min(img)))
-			global_max = max(global_max, float(np.max(img)))
-
-		self.minden = global_min
-		self.maxden = global_max
+		
+		# Reset contrast to full range
+		self.curmin = self.minden  # which equals _global_min
+		self.curmax = self.maxden  # which equals _global_max
 
 		self._clear_scene_groups()
 		self._dirty = True
@@ -846,9 +764,11 @@ class EMImageMXWidget(QtWidgets.QWidget):
 				self._ensure_active_set()
 				self._toggle_set_membership(img)
 
-		elif self.mmode == "Drag":
-			self._drag_start_pos = pos
-			self._drag_scroll_at_start = self.scroll_offset
+		elif self.mmode == "Del" and event.button() == Qt.LeftButton:
+			# Toggle deletion - adds/removes from "Deleted" set (always visible, always red)
+			img = self._hit_test_image(pos[0], pos[1])
+			if img is not None:
+				self._toggle_delete(img)
 
 		event.accept()
 
@@ -866,24 +786,12 @@ class EMImageMXWidget(QtWidgets.QWidget):
 			event.accept()
 			return
 
-		if self.mmode == "Drag" and self._drag_start_pos:
-			pos = (event.position().x(), event.position().y()) if hasattr(event, 'position') else (event.x(), event.y())
-			dy = pos[1] - self._drag_start_pos[1]
-			self.scroll_offset = self._drag_scroll_at_start + dy
-			min_sc, max_sc = self._compute_scroll_range()
-			self.scroll_offset = max(min_sc, min(max_sc, self.scroll_offset))
-			self._dirty = True
-			self._request_render()
-
 		event.accept()
 
 	def _on_mouse_release(self, event):
 		if event.button() == Qt.RightButton:
 			self._right_drag_active = False
 			self._right_drag_start = None
-
-		if self.mmode == "Drag":
-			self._drag_start_pos = None
 
 		event.accept()
 
@@ -962,6 +870,29 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		self._dirty = True
 		self._request_render()
 
+	def _toggle_delete(self, img_idx):
+		"""Toggle an image's membership in the special "Deleted" set.
+
+		The Deleted set is always visible and always colored bright red (index 0).
+		It is automatically created on first use and kept at the top of the list.
+		"""
+		deleted_set = self.get_set("Deleted")
+		if img_idx in deleted_set:
+			deleted_set.discard(img_idx)
+		else:
+			deleted_set.add(img_idx)
+
+		# Ensure Deleted set is always visible
+		self.sets_visible["Deleted"] = self.sets["Deleted"]
+
+		self._clear_scene_groups()
+		self._dirty = True
+		self._request_render()
+
+		# Refresh inspector set list to show Deleted set
+		if self.inspector:
+			self.inspector._refresh_set_list()
+
 	def remove_particle_image(self, idx):
 		"""Remove (exclude) a particle image from display."""
 		self._deleted_idxs.add(idx)
@@ -1008,22 +939,18 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._btn_app.setCheckable(True)
 		self._btn_del = QtWidgets.QPushButton("Del")
 		self._btn_del.setCheckable(True)
-		self._btn_drag = QtWidgets.QPushButton("Drag")
-		self._btn_drag.setCheckable(True)
 		self._btn_sets = QtWidgets.QPushButton("Sets")
 		self._btn_sets.setCheckable(True)
 
 		self._mode_group = QtWidgets.QButtonGroup(self)
 		self._mode_group.addButton(self._btn_app)
 		self._mode_group.addButton(self._btn_del)
-		self._mode_group.addButton(self._btn_drag)
 		self._mode_group.addButton(self._btn_sets)
 		self._mode_group.setExclusive(True)
 		self._btn_app.setChecked(True)
 
 		mode_layout.addWidget(self._btn_app)
 		mode_layout.addWidget(self._btn_del)
-		mode_layout.addWidget(self._btn_drag)
 		mode_layout.addWidget(self._btn_sets)
 		main_layout.addLayout(mode_layout)
 
@@ -1100,6 +1027,14 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._gamma.setToolTip("Gamma correction")
 		main_layout.addWidget(self._gamma)
 
+		# Values dropdown - toggle header keys to display on each image
+		self._btn_vals = QtWidgets.QPushButton("Values")
+		self._btn_vals.setToolTip("Select header fields to display on images")
+		self._vals_menu = QtWidgets.QMenu(self._btn_vals)
+		self._btn_vals.setMenu(self._vals_menu)
+		self._vals_actions = {}  # key -> QAction
+		main_layout.addWidget(self._btn_vals)
+
 		# Action buttons
 		btn_layout = QtWidgets.QHBoxLayout()
 		self._btn_snapshot = QtWidgets.QPushButton("Snapshot")
@@ -1140,6 +1075,49 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		self._btn_fullc.clicked.connect(self._on_full_contrast)
 		self._btn_invert.toggled.connect(self._on_invert_toggled)
 
+	def _refresh_vals_menu(self):
+		"""Populate the Values dropdown from available header keys."""
+		tgt = self._tgt()
+		if not tgt or not tgt._data_headers:
+			return
+
+		# Collect unique header keys from first valid header
+		keys = []
+		for h in tgt._data_headers:
+			if isinstance(h, dict) and h:
+				keys = sorted(h.keys())
+				break
+
+		self._vals_menu.clear()
+		self._vals_actions.clear()
+
+		# Always include "Img #"
+		img_action = self._vals_menu.addAction("Img #")
+		img_action.setCheckable(True)
+		img_action.setChecked("Img #" in tgt.valstodisp)
+		self._vals_actions["Img #"] = img_action
+		img_action.toggled.connect(lambda checked, k="Img #": self._on_val_toggle(k, checked))
+
+		for k in keys:
+			action = self._vals_menu.addAction(str(k))
+			action.setCheckable(True)
+			action.setChecked(k in tgt.valstodisp)
+			self._vals_actions[k] = action
+			action.toggled.connect(lambda checked, k=k: self._on_val_toggle(str(k), checked))
+
+	def _on_val_toggle(self, key, checked):
+		"""Toggle a header key in the display list."""
+		tgt = self._tgt()
+		if not tgt:
+			return
+		if checked and key not in tgt.valstodisp:
+			tgt.valstodisp.append(key)
+		elif not checked and key in tgt.valstodisp:
+			tgt.valstodisp.remove(key)
+		tgt._dirty = True
+		tgt._request_render()
+
+
 	def _sync_from_widget(self):
 		"""Pull current values from the widget into inspector controls."""
 		tgt = self._tgt()
@@ -1147,24 +1125,43 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 			return
 
 		self._scale.setValue(tgt.scale)
-		self._min.setValue(tgt.minden)
-		self._max.setValue(tgt.maxden)
+		
+		# Min/Max sliders show current contrast values (curmin/curmax)
+		self._min.setValue(tgt.curmin)
+		self._max.setValue(tgt.curmax)
 		self._gamma.setValue(tgt.gamma)
 
-		self._min.setRange(tgt.minden - 0.5, tgt.maxden + 0.5)
-		self._max.setRange(tgt.minden - 0.5, tgt.maxden + 0.5)
+		# Slider ranges bounded by full data range (minden/maxden)
+		self._min.setRange(tgt.minden, tgt.maxden)
+		self._max.setRange(tgt.minden, tgt.maxden)
 
 		self._btn_invert.setChecked(tgt.invert)
+
+		# Compute Brt/Cont back from curmin/curmax within global range (minden/maxden)
+		# Same formulas as EMImage2D inspector _update_brightness_contrast
+		range_diff = tgt.maxden - tgt.minden
+		if abs(range_diff) > 1e-12:
+			min_val = tgt.curmin
+			max_val = tgt.curmax
+
+			b = 0.5 * (min_val + max_val - (tgt.minden + tgt.maxden)) / range_diff
+			c = (min_val - max_val) / (2.0 * (tgt.minden - tgt.maxden))
+			brts = -b
+			conts = 1.0 - c
+
+			self._brt.setValue(max(-1.0, min(1.0, brts)), quiet=1)
+			self._cont.setValue(max(0.0, min(1.0, conts)), quiet=1)
 
 		mode = tgt.mmode
 		btn_map = {
 			"App": self._btn_app, "Del": self._btn_del,
-			"Drag": self._btn_drag, "Sets": self._btn_sets,
+			"Sets": self._btn_sets,
 		}
 		if mode in btn_map:
 			btn_map[mode].setChecked(True)
 
 		self._refresh_set_list()
+		self._refresh_vals_menu()
 
 	def _refresh_set_list(self):
 		tgt = self._tgt()
@@ -1175,15 +1172,27 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		keys = sorted(tgt.sets.keys())
 		vis_keys = set(tgt.sets_visible.keys())
 
-		item_flags = (Qt.ItemIsSelectable | Qt.ItemIsEnabled |
+		# Build color map: "Deleted" gets 0 (red), others shifted +1
+		base_item_flags = (Qt.ItemIsSelectable | Qt.ItemIsEnabled |
 		              Qt.ItemIsUserCheckable)
+		color_map = {}
+		nd_count = 0
+		for k in keys:
+			if k == "Deleted":
+				color_map[k] = 0
+			else:
+				color_map[k] = nd_count + 1
+				nd_count += 1
 
 		for i, k in enumerate(keys):
 			item = QtWidgets.QListWidgetItem(k)
-			item.setFlags(item_flags)
+			# Deleted set is always visible and can't be unchecked
+			if k == "Deleted":
+				item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+			else:
+				item.setFlags(base_item_flags)
 
-			color_i = i % len(SET_COLORS)
-			c = SET_COLORS[color_i]
+			c = SET_COLORS[color_map[k] % len(SET_COLORS)]
 			q_color = QtGui.QColor()
 			q_color.setRgbF(c[0], c[1], c[2], c[3])
 			item.setForeground(q_color)
@@ -1208,20 +1217,80 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 			tgt.set_scale(val)
 
 	def _on_min_changed(self, val):
+		"""Min slider changed - update curmin and Brt/Cont."""
 		tgt = self._tgt()
-		if tgt:
-			tgt.set_density_min(val)
+		if not tgt:
+			return
+		tgt.curmin = float(val)
+		tgt._clear_scene_groups()
+		tgt._dirty = True
+		tgt._request_render()
+		# Sync Brt/Cont back from curmin/curmax
+		range_diff = tgt.maxden - tgt.minden
+		if abs(range_diff) > 1e-12:
+			min_val = tgt.curmin
+			max_val = tgt.curmax
+			b = 0.5 * (min_val + max_val - (tgt.minden + tgt.maxden)) / range_diff
+			c = (min_val - max_val) / (2.0 * (tgt.minden - tgt.maxden))
+			self._brt.setValue(max(-1.0, min(1.0, -b)), quiet=1)
+			self._cont.setValue(max(0.0, min(1.0, 1.0 - c)), quiet=1)
 
 	def _on_max_changed(self, val):
+		"""Max slider changed - update curmax and Brt/Cont."""
 		tgt = self._tgt()
-		if tgt:
-			tgt.set_density_max(val)
+		if not tgt:
+			return
+		tgt.curmax = float(val)
+		tgt._clear_scene_groups()
+		tgt._dirty = True
+		tgt._request_render()
+		# Sync Brt/Cont back from curmin/curmax
+		range_diff = tgt.maxden - tgt.minden
+		if abs(range_diff) > 1e-12:
+			min_val = tgt.curmin
+			max_val = tgt.curmax
+			b = 0.5 * (min_val + max_val - (tgt.minden + tgt.maxden)) / range_diff
+			c = (min_val - max_val) / (2.0 * (tgt.minden - tgt.maxden))
+			self._brt.setValue(max(-1.0, min(1.0, -b)), quiet=1)
+			self._cont.setValue(max(0.0, min(1.0, 1.0 - c)), quiet=1)
 
 	def _on_brt_changed(self, val):
-		pass  # Brightness handled in render pipeline
+		"""Brightness changed - update curmin/curmax from Brt/Cont."""
+		tgt = self._tgt()
+		if not tgt:
+			return
+		self._update_curmin_max_from_slider(tgt)
 
 	def _on_cont_changed(self, val):
-		pass  # Contrast handled in render pipeline
+		"""Contrast changed - update curmin/curmax from Brt/Cont."""
+		tgt = self._tgt()
+		if not tgt:
+			return
+		self._update_curmin_max_from_slider(tgt)
+
+	def _update_curmin_max_from_slider(self, tgt):
+		"""Convert Brt/Cont slider values to curmin/curmax. Same as EMImage2D _update_min_max."""
+		range_diff = tgt.maxden - tgt.minden
+		if abs(range_diff) < 1e-12:
+			return
+
+		center = (tgt.minden + tgt.maxden) / 2.0
+		brt_val = self._brt.getValue()
+		cont_val = self._cont.getValue()
+
+		x0 = center - range_diff * (1.0 - cont_val) - brt_val * range_diff
+		x1 = center + range_diff * (1.0 - cont_val) - brt_val * range_diff
+
+		tgt.curmin = max(tgt.minden, min(tgt.maxden, x0))
+		tgt.curmax = max(tgt.minden, min(tgt.maxden, x1))
+
+		# Update Min/Max slider values without triggering their handlers
+		self._min.setValue(tgt.curmin, quiet=1)
+		self._max.setValue(tgt.curmax, quiet=1)
+
+		tgt._clear_scene_groups()
+		tgt._dirty = True
+		tgt._request_render()
 
 	def _on_gamma_changed(self, val):
 		tgt = self._tgt()
@@ -1260,13 +1329,31 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 
 	def _on_save_data(self):
 		tgt = self._tgt()
-		if tgt and tgt._data:
-			fsp, _ = QtWidgets.QFileDialog.getSaveFileName(
-				self, "Save Data", "", "Numpy files (*.npy)"
-			)
-			if fsp:
-				stacked = np.stack([np.asarray(d) for d in tgt._data if d is not None])
-				np.save(fsp, stacked)
+		if not tgt or not tgt._data:
+			return
+		fsp, _ = QtWidgets.QFileDialog.getSaveFileName(
+			self, "Save Data", "", "Numpy files (*.npy)"
+		)
+		if not fsp:
+			return
+
+		# Get deleted indices (exclude from save)
+		deleted_idxs = set()
+		if "Deleted" in tgt.sets:
+			deleted_idxs = tgt.sets["Deleted"]
+
+		# Collect non-deleted images
+		saved = []
+		for i, d in enumerate(tgt._data):
+			if d is not None and i not in deleted_idxs:
+				saved.append(np.asarray(d))
+
+		if saved:
+			stacked = np.stack(saved)
+			np.save(fsp, stacked)
+			n_deleted = len(deleted_idxs)
+			print(f"Saved {len(saved)} images to {fsp}" + 
+			      (f" ({n_deleted} excluded)" if n_deleted else ""))
 
 	def _on_open_2d(self):
 		tgt = self._tgt()
@@ -1274,7 +1361,7 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 			try:
 				from EMAN3.gui.emimage2d import EMImage2DWidget
 				viewer = EMImage2DWidget()
-				viewer.set_data(tgt._data[0])
+				viewer.set_data(tgt._data)
 				viewer.show()
 			except Exception as e:
 				print(f"Could not open 2D viewer: {e}")
@@ -1283,17 +1370,25 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		name, ok = QtWidgets.QInputDialog.getText(
 			self, "New Set", "Enter a name for the new set:"
 		)
-		if ok and name:
-			tgt = self._tgt()
-			if tgt and name not in tgt.sets:
-				tgt.enable_set(name, [], display=True)
-				self._refresh_set_list()
+		if not (ok and name):
+			return
+		if name == "Deleted":
+			print("Set name 'Deleted' is reserved - use Del mouse mode instead.")
+			return
+		tgt = self._tgt()
+		if tgt and name not in tgt.sets:
+			tgt.enable_set(name, [], display=True)
+			self._refresh_set_list()
 
 	def _on_delete_set(self):
 		selected = self._set_list.selectedItems()
 		names = [str(item.text()) for item in selected]
+		# Prevent deleting the "Deleted" set - it can be emptied via Del mode, not removed
+		names = [n for n in names if n != "Deleted"]
+		if not names:
+			return
 		tgt = self._tgt()
-		if tgt and names:
+		if tgt:
 			tgt.delete_set(names)
 			self._refresh_set_list()
 
@@ -1336,6 +1431,10 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 		if not tgt:
 			return
 		name = str(item.text())
+		# Prevent unchecking the "Deleted" set - it must always be visible
+		if name == "Deleted" and item.checkState() == Qt.Unchecked:
+			item.setCheckState(Qt.Checked)
+			return
 		if item.checkState() == Qt.Checked:
 			tgt.show_set(name)
 		else:
@@ -1355,27 +1454,62 @@ class EMImageInspectorMX(QtWidgets.QWidget):
 
 
 def main():
-	"""Test program for EMImageMXWidget."""
+	"""Test program for EMImageMXWidget.
+
+	Usage:
+	    python emimagemx.py [image_stack_file]
+
+	If no image file is provided, generates 50 random test images (64x64).
+	Otherwise loads the given image stack as a list of 2D slices.
+	"""
 	import sys
 
 	app = QtWidgets.QApplication(sys.argv)
 
 	widget = EMImageMXWidget()
 
-	# Generate test data: random 64x64 images
-	np.random.seed(42)
-	data = []
-	for i in range(50):
-		img = np.random.rand(64, 64).astype(np.float32)
-		data.append(img)
+	if len(sys.argv) >= 2:
+		image_path = sys.argv[1]
+		try:
+			from EMAN3.io.imageio import ImageIO
+			io = ImageIO(image_path, "r")
+			nimg = io.nimg
+			print(f"Loaded: {image_path} ({nimg} image(s))")
 
-	widget.set_data(data, filename="test_multiimage")
+			if nimg > 1:
+				data, headers = io.read_images()
+				stack_data = [data[i] for i in range(data.shape[0])]
+			else:
+				data, header = io.read_image(0)
+				print(f"Read image: {data.shape}, header keys: {list(header.keys())}")
+				# If 3D, take first z-slice or convert to list of slices
+				if data.ndim == 3:
+					stack_data = [data[i] for i in range(data.shape[0])]
+				else:
+					stack_data = [data]
+
+			widget.set_data(stack_data, filename=image_path)
+		except Exception as e:
+			import traceback
+			traceback.print_exc()
+			print(f"Error loading file: {e}")
+			return
+	else:
+		# Generate test data: random 64x64 images
+		np.random.seed(42)
+		data = []
+		for i in range(50):
+			img = np.random.rand(64, 64).astype(np.float32)
+			data.append(img)
+
+		widget.set_data(data, filename="test_multiimage")
+
 	widget.resize(800, 700)
 	widget.show()
 
 	print("Middle-click to show inspector.")
-	print("Scroll wheel to scroll through images.")
-	print("Drag mode: left-drag to scroll the grid.")
+	print("Scroll wheel to adjust tile scale.")
+	print("Right-drag to scroll the grid vertically.")
 	sys.exit(app.exec())
 
 
