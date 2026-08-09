@@ -1991,13 +1991,20 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			x_vals = np.arange(len(dl[y_idx]), dtype=np.float64)
 		else:
 			x_vals = np.asarray(dl[x_idx], dtype=np.float64)
-		y_vals = np.asarray(dl[y_idx], dtype=np.float64)
+		y_raw = np.asarray(dl[y_idx], dtype=np.float64)
 
 		n = len(x_vals)
-		if n < 2 or len(y_vals) != n:
+		if n < 2 or len(y_raw) != n:
 			return
 
-		# Simple linear regression: y = m*x + b
+		# Use log10(y) for regression when ylog is active
+		use_log = tgt.ylog and np.min(y_raw) > 0
+		if use_log:
+			y_vals = np.log10(y_raw)
+		else:
+			y_vals = y_raw
+
+		# Simple linear regression: y = m*x + b (or log10(y) = m*x + b)
 		x_mean = np.mean(x_vals)
 		y_mean = np.mean(y_vals)
 		sxy = np.sum((x_vals - x_mean) * (y_vals - y_mean))
@@ -2013,15 +2020,16 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		x_max = float(np.max(x_vals))
 		w = x_max - x_min
 
-		# 5 fit points: min-5%, min, mid, max, max+5%
-		fit_x = np.array([
-			x_min - w * 0.05,
-			x_min,
-			(x_min + x_max) / 2.0,
-			x_max,
-			x_max + w * 0.05,
-		], dtype=np.float64)
-		fit_y = m * fit_x + b
+		# Generate fit points: 100 for log regression (smooth curve), 5 for linear
+		n_fit = 100 if use_log else 5
+		fit_x = np.linspace(x_min - w * 0.05, x_max + w * 0.05, n_fit)
+		fit_y_log = m * fit_x + b
+
+		# Convert back from log if needed
+		if use_log:
+			fit_y = 10 ** fit_y_log
+		else:
+			fit_y = fit_y_log
 
 		# Build new dataset with same column count, zeros except x and y columns
 		n_cols = len(dl)
@@ -2034,9 +2042,13 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 			else:
 				new_data.append(np.zeros(5, dtype=np.float64))
 
-		# Generate name like "d_1 = 2.34 d_0 + -0.12"
-		reg_key = f"d_{y_idx} = {m:.5g} d_{x_idx if x_idx >= 0 else '?'} + {b:.5g}"
-		print(f"Regression: y = {m:.8g} * x + {b:.8g}")
+		xlabel = x_idx if x_idx >= 0 else '?'
+		if use_log:
+			reg_key = f"log d_{y_idx} = {m:.5g} d_{xlabel} + {b:.5g}"
+			print(f"Log Regression: log10(y) = {m:.8g} * x + {b:.8g}")
+		else:
+			reg_key = f"d_{y_idx} = {m:.5g} d_{xlabel} + {b:.5g}"
+			print(f"Regression: y = {m:.8g} * x + {b:.8g}")
 
 		tgt.set_data(new_data, key=reg_key)
 		tgt._dirty = True
@@ -2104,14 +2116,15 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		tgt._request_render()
 
 	def _on_column_change(self):
-		key = self._selected_key()
-		if key is None or not self.target():
+		keys = self._selected_keys()
+		if not keys or not self.target():
 			return
 		tgt = self.target()
 
 		x_idx = self.col_x_spin.value()
 		y_idx = self.col_y_spin.value()
-		tgt.axes[key] = (x_idx,y_idx)
+		for key in keys:
+			tgt.axes[key] = (x_idx, y_idx)
 
 		tgt.autoscale()
 		# Set dirty AFTER autoscale so limits are computed before rebuild starts
@@ -2164,10 +2177,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 				# Set both limits atomically to avoid camera depth issues
 				tgt.xlimits = (xmin, xmax)
 				tgt.ylimits = (ymin, ymax)
-				try:
-					tgt._camera.show_rect(xmin, xmax, ymax, ymin, depth=20)
-				except Exception:
-					pass  # show_rect can fail with degenerate limits
+				tgt._update_camera_limits()
 				tgt._dirty = True
 				tgt._request_render()
 			except (ValueError, TypeError):
