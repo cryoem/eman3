@@ -248,14 +248,27 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			return (float(world[0]), float(world[1]))
 
 	def _update_camera_limits(self):
-		"""Update camera to match xlimits/ylimits if set."""
+		"""Update camera so data limits land at the ruler corners, not widget edges."""
 		if self.xlimits is not None and self.ylimits is not None:
 			xmin, xmax = self.xlimits
 			ymin, ymax = self.ylimits
 			# Validate that limits span a real area before updating camera
 			if xmin < xmax and ymin < ymax:
 				try:
-					self._camera.show_rect(xmin, xmax, ymax, ymin, depth=20)
+					w, h = self._renderer.logical_size[0], self._renderer.logical_size[1]
+					margin_left = 65; margin_right = 20
+					margin_top = 20; margin_bottom = 50
+					# Use default aspect if renderer not yet sized
+					if w <= 0:
+						w, h = 800, 600
+					xfrac = (margin_left + margin_right) / w
+					yfrac = (margin_top + margin_bottom) / h
+					new_xspan = (xmax - xmin) / max(1.0 - xfrac, 1e-12)
+					new_xmin = xmin - (margin_left / w) * new_xspan
+					new_ysspan = (ymax - ymin) / max(1.0 - yfrac, 1e-12)
+					new_ymin = ymin - (margin_bottom / h) * new_ysspan
+					self._camera.show_rect(new_xmin, new_xmin + new_xspan,
+					                       new_ymin + new_ysspan, new_ymin, depth=20)
 				except Exception:
 					pass  # show_rect failed - leave limits as-is
 
@@ -358,6 +371,10 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			print(f"Scene init error: {e}")
 			import traceback
 			traceback.print_exc()
+
+		# Re-apply camera limits now that renderer has real size
+		if self.xlimits and self.ylimits:
+			self._update_camera_limits()
 
 		# Trigger final render after full scene initialization
 		self._dirty = True
@@ -689,12 +706,13 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		margin_top = 20
 		margin_right = 20
 
-		# Compute current visible world bounds from stored limits
-		# (frustum Y is inverted by scale_y=-1 so read directly)
-		if self.xlimits and self.ylimits:
-			xleft, xright = self.xlimits
-			ybottom, ytop = self.ylimits
-		else:
+		# Read actual visible world bounds from camera frustum
+		try:
+			f = camera.frustum
+			near = f[0]
+			xleft, xright = float(near[:, 0].min()), float(near[:, 0].max())
+			ybottom, ytop = float(near[:, 1].min()), float(near[:, 1].max())
+		except Exception:
 			xleft, xright = 0, 1
 			ybottom, ytop = 0, 1
 		xspan = xright - xleft
@@ -1346,6 +1364,14 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		if self.inspector:
 			self.inspector.close()
 		super().closeEvent(event)
+
+	def resizeEvent(self, event):
+		super().resizeEvent(event)
+		# After resize, re-apply camera limits so margins are correct
+		if self.xlimits and self.ylimits:
+			self._update_camera_limits()
+			self._redraw = True
+			self._request_render()
 
 
 
