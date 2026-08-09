@@ -136,7 +136,7 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		self._rebuilding = False
 		self._pending_rebuild = False
 		self._data_groups = {}
-		self._contour_group = None  # holds contour line objects
+		self._contour_group = None
 
 		self._setup_gfx()
 
@@ -344,12 +344,6 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 				ylbl.local.rotation = la.quat_from_euler((0, 0, np.radians(90)))  # Rotate 90° CCW
 				self._scene.add(ylbl)
 				self._axis_labels.append(ylbl)
-
-			# Cache initial label values for change detection
-			self._prev_xlabel = self.xaxis_label
-			self._prev_ylabel = self.yaxis_label
-			self._prev_xlog = self.xlog
-			self._prev_ylog = self.ylog
 
 			# Border box outline
 			box_pts = np.zeros((5, 3), dtype=np.float32)
@@ -775,21 +769,6 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 			gfx.LineMaterial(thickness=1.5, color=(0, 0, 0, 1.0)))
 		self._scene.add(self._border_box)
 
-		# Position axis labels in world coords so they stay fixed on screen
-		# Check if label text has changed and needs recreating
-		# labels_need_update = (len(self._axis_labels) < 2) or (self.xaxis_label != self._prev_xlabel) or (self.yaxis_label != self._prev_ylabel) or (getattr(self, "_prev_xlog", False) != self.xlog) or (getattr(self, "_prev_ylog", False) != self.ylog) or 
-
-		# if labels_need_update:
-			# Remove old axis labels
-		for lbl in self._axis_labels:
-			try:
-				self._scene.remove(lbl)
-			except Exception:
-				pass
-		self._axis_labels = []
-
-		label_color = (0, 0, 0, 1.0)
-
 		# Compute display labels with log suffix if active
 		x_lbl = self.xaxis_label
 		if self.xlog and x_lbl:
@@ -802,34 +781,53 @@ class EMPlot2DWidget(QtWidgets.QWidget):
 		elif not y_lbl and self.ylog:
 			y_lbl = "Y (log10)"
 
-		if x_lbl:
-			xlbl = gfx.Text(x_lbl, font_size=18,
-								screen_space=True)
-			xlbl.material.color = label_color
+		label_color = (0, 0, 0, 1.0)
+
+		# Update axis labels in-place; create only on first pass
+		if len(self._axis_labels) < 2:
+			for lbl in self._axis_labels:
+				try:
+					self._scene.remove(lbl)
+				except Exception:
+					pass
+			self._axis_labels = []
+
+			if x_lbl:
+				xlbl = gfx.Text(x_lbl, font_size=18, screen_space=True)
+				xlbl.material.color = label_color
+				sx_lbl = margin_left + (w - margin_left - margin_right) / 2
+				sy_lbl = h - margin_bottom + 25
+				xlbl._screen_pos = (sx_lbl, sy_lbl)
+				xlbl.local.position = (*self._screen_to_world(sx_lbl, sy_lbl), 0)
+				self._scene.add(xlbl)
+				self._axis_labels.append(xlbl)
+
+			if y_lbl:
+				ylbl = gfx.Text(y_lbl, font_size=18, screen_space=True)
+				ylbl.material.color = label_color
+				sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
+				ylbl._screen_pos = (10, sy_lbl)
+				ylbl.local.position = (*self._screen_to_world(10, sy_lbl), 0)
+				ylbl.local.rotation = la.quat_from_euler((0, 0, np.radians(90)))
+				self._scene.add(ylbl)
+				self._axis_labels.append(ylbl)
+		else:
+			# Update existing labels in-place (no scene graph changes)
 			sx_lbl = margin_left + (w - margin_left - margin_right) / 2
 			sy_lbl = h - margin_bottom + 25
-			xlbl._screen_pos = (sx_lbl, sy_lbl)
-			xlbl.local.position = (*self._screen_to_world(sx_lbl, sy_lbl), 0)
-			self._scene.add(xlbl)
-			self._axis_labels.append(xlbl)
+			if x_lbl and len(self._axis_labels) > 0:
+				xlbl = self._axis_labels[0]
+				xlbl.text = x_lbl
+				xlbl._screen_pos = (sx_lbl, sy_lbl)
+				xlbl.local.position = (*self._screen_to_world(sx_lbl, sy_lbl), 0)
+			if y_lbl and len(self._axis_labels) > 1:
+				ylbl = self._axis_labels[1]
+				ylbl.text = y_lbl
+				sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
+				ylbl._screen_pos = (10, sy_lbl)
+				ylbl.local.position = (*self._screen_to_world(10, sy_lbl), 0)
 
-		if y_lbl:
-			ylbl = gfx.Text(y_lbl, font_size=18,
-								screen_space=True)
-			ylbl.material.color = label_color
-			sy_lbl = margin_top + (h - margin_top - margin_bottom) / 2 - 10
-			ylbl._screen_pos = (10, sy_lbl)
-			ylbl.local.position = (*self._screen_to_world(10, sy_lbl), 0)
-			ylbl.local.rotation = la.quat_from_euler((0, 0, np.radians(90)))  # Rotate 90° CCW
-			self._scene.add(ylbl)
-			self._axis_labels.append(ylbl)
-
-			# Cache values for next comparison
-			self._prev_xlabel = self.xaxis_label
-			self._prev_ylabel = self.yaxis_label
-			self._prev_xlog = self.xlog
-			self._prev_ylog = self.ylog
-
+		# Per-frame repositioning for zoom/pan changes
 		for lbl in self._axis_labels:
 			sx_lbl, sy_lbl = lbl._screen_pos  # stored screen coords
 			wx_lbl, wy_lbl = self._screen_to_world(sx_lbl, sy_lbl)
