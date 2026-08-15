@@ -631,15 +631,39 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		self._sync_camera_to_inspector()
 		self._request_render()
 
+	def _get_camera_distance(self):
+		"""Get camera distance from orbit target."""
+		import numpy as np
+		oc = getattr(self, '_orbit_controller', None)
+		if not oc:
+			return 3.0
+		target = np.array(oc.target)
+		pos = np.array(self._camera.world.position[:3])
+		return float(np.linalg.norm(pos - target))
+
+	def _set_camera_distance(self, dist):
+		"""Set camera distance from orbit target by moving along look direction."""
+		import numpy as np
+		oc = getattr(self, '_orbit_controller', None)
+		if not oc:
+			return
+		target = np.array(oc.target)
+		pos = np.array(self._camera.world.position[:3])
+		direction = pos - target
+		norm = float(np.linalg.norm(direction))
+		if norm < 1e-6:
+			norm = 1.0
+		direction = direction / norm * max(dist, 0.01)
+		self._camera.world.position = tuple(direction + target)
+		self._request_render()
+
 	def _sync_camera_to_inspector(self):
 		"""Sync inspector camera sliders from current orbit controller state."""
 		if self._inspector:
-			oc = getattr(self, '_orbit_controller', None)
-			if oc:
-				try:
-					self._inspector.dist_slider.setValue(oc.spherical_radius, quiet=1)
-				except AttributeError:
-					pass
+			try:
+				self._inspector.dist_slider.setValue(self._get_camera_distance(), quiet=1)
+			except AttributeError:
+				pass
 			cam = getattr(self, '_camera', None)
 			if cam:
 				try:
@@ -1015,26 +1039,19 @@ class EMScene3DInspector(QtWidgets.QWidget):
 			return
 		old_fov = getattr(tgt._camera, 'fov', 50)
 		new_fov = float(value)
-		# Preserve apparent framing: new_dist = old_dist * new_fov / old_fov
-		try:
-			oc = tgt._orbit_controller
-			if oc:
-				old_dist = oc.spherical_radius
-				new_dist = old_dist * new_fov / max(old_fov, 0.1)
-				tgt._camera.fov = new_fov
-				oc.spherical_radius = new_dist
-				self.dist_slider.setValue(new_dist, quiet=1)
-		except AttributeError:
-			tgt._camera.fov = new_fov
-		tgt._request_render()
+		# Preserve apparent framing: new_dist = old_dist * old_fov / new_fov
+		old_dist = tgt._get_camera_distance()
+		new_dist = old_dist * old_fov / max(new_fov, 0.1)
+		tgt._camera.fov = new_fov
+		tgt._set_camera_distance(new_dist)
+		self.dist_slider.setValue(new_dist, quiet=1)
 
 	def _on_distance_changed(self, value):
 		"""Distance changed - move camera along its current look direction."""
 		tgt = self._get_tgt()
-		if not tgt or not hasattr(tgt, '_orbit_controller'):
+		if not tgt:
 			return
-		tgt._orbit_controller.spherical_radius = float(value)
-		tgt._request_render()
+		tgt._set_camera_distance(float(value))
 
 	def _on_near_changed(self, value):
 		tgt = self._get_tgt()
