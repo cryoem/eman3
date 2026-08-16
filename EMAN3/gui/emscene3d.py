@@ -470,6 +470,268 @@ class TextNode(ShapeNode):
 			tgt._request_render()
 
 
+class DataNode(SceneNode):
+	"""Data node holding 3D volume array with optional bounding box."""
+	def __init__(self, *args, data=None, header=None, **kwargs):
+		self._data = np.asarray(data) if data is not None else None
+		self._header = dict(header) if header else {}
+		self._show_bbox = True
+		self._filename = kwargs.pop('filename', '')
+		self._volume_index = 0
+		self._full_stack = None
+		super().__init__(*args, **kwargs)
+
+	@staticmethod
+	def next_name(prefix="Data"):
+		SceneNode.name_counter += 1
+		return "%s_%d" % (prefix, SceneNode.name_counter)
+
+	@property
+	def data(self):
+		return self._data
+
+	@property
+	def header(self):
+		return self._header
+
+	def _rebuild_bbox(self):
+		if self._data is None or not self._gfx_node:
+			return
+		d, h, w = self._data.shape
+		for child in list(self._gfx_node.children):
+			if getattr(child, '_is_bbox', False):
+				self._gfx_node.remove(child)
+		if not self._show_bbox:
+			return
+		geo = gfx.box_geometry(float(w), float(h), float(d))
+		mat = gfx.MeshStandardMaterial(color=(0.3, 0.6, 1.0), roughness=0.8,
+			metalness=0.0, wireframe=True)
+		bbox = gfx.Mesh(geo, mat)
+		bbox._is_bbox = True
+		self._gfx_node.add(bbox)
+
+	def set_show_bbox(self, val):
+		self._show_bbox = bool(val)
+		self._rebuild_bbox()
+		if self._gfx_node:
+			for child in self._gfx_node.children:
+				if getattr(child, '_is_bbox', False):
+					child.visible = self._show_bbox
+
+	def inspector_controls(self, parent):
+		controls = []
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		info = QtWidgets.QLabel(parent)
+		if self._data is not None:
+			if self._full_stack is not None:
+				info.setText("Shape: %s | dtype: %s | nimg: %d" % (
+					str(self._data.shape), self._data.dtype.name, len(self._full_stack)))
+			else:
+				info.setText("Shape: %s | dtype: %s" % (str(self._data.shape),
+					self._data.dtype.name))
+		else:
+			info.setText("No data loaded.")
+		info.setWordWrap(True)
+		info.setStyleSheet("QLabel { color: gray; font-size: 9px; }")
+		controls.append(("Info", info))
+		# Filename display and file browser button
+		filename_widget = QtWidgets.QWidget()
+		filename_layout = QtWidgets.QHBoxLayout(filename_widget)
+		filename_layout.setContentsMargins(0, 0, 0, 0)
+		self._filename_box = StringBox(filename_widget, "File", value=self._filename)
+		filename_layout.addWidget(self._filename_box)
+		file_btn = QtWidgets.QPushButton("Browse...")
+		file_btn.clicked.connect(lambda: self._on_browse_file(tgt))
+		filename_layout.addWidget(file_btn)
+		controls.append(("File", filename_widget))
+		# Volume index selector
+		if self._full_stack is not None:
+			idx_widget = QtWidgets.QWidget()
+			idx_layout = QtWidgets.QHBoxLayout(idx_widget)
+			idx_layout.setContentsMargins(0, 0, 0, 0)
+			self._index_spin = QtWidgets.QSpinBox()
+			self._index_spin.setRange(0, len(self._full_stack) - 1)
+			self._index_spin.setValue(self._volume_index)
+			label = QtWidgets.QLabel("N:")
+			idx_layout.addWidget(label)
+			idx_layout.addWidget(self._index_spin)
+			self._index_spin.valueChanged.connect(lambda v: self._on_index_changed(v, tgt))
+			controls.append(("Volume", idx_widget))
+		cb = QtWidgets.QCheckBox("Show Bounding Box")
+		cb.setChecked(self._show_bbox)
+		cb.toggled.connect(lambda v: self._on_bbox_toggled(v, tgt))
+		controls.append(("BBox", cb))
+		return controls
+
+	def _on_bbox_toggled(self, val, tgt):
+		self.set_show_bbox(val)
+		if tgt:
+			tgt._request_render()
+
+	def load_from_file(self, filepath):
+		"""Load 3D volume data from an image file using ImageIO."""
+		try:
+			from EMAN3.io.imageio import ImageIO
+			io = ImageIO(filepath, 'r')
+			if io.nimg > 1:
+				data, headers = io.read_images()
+				# Store full stack for volume selection
+				self._full_stack = data.astype(np.float32)
+				self._volume_index = 0
+				# Headers is a list of dicts
+				if isinstance(headers, (list, tuple)) and len(headers) > 0:
+					self._header = dict(headers[0])
+				else:
+					self._header = {}
+			else:
+				data, header = io.read_image(0)
+				if data.ndim == 3:
+					self._data = data.astype(np.float32)
+				elif data.ndim == 2:
+					self._data = data[np.newaxis, :, :].astype(np.float32)
+				else:
+					print("Cannot load data from file: unsupported dimensionality")
+					return
+				if isinstance(header, dict):
+					self._header = dict(header)
+			io.close()
+			self._filename = filepath
+			# Extract current volume index
+			self._extract_volume(self._volume_index)
+			self._rebuild_bbox()
+		except Exception as e:
+			import traceback
+			traceback.print_exc()
+			print("Error loading file %s: %s" % (filepath, e))
+
+	def _extract_volume(self, idx):
+		"""Extract volume at given index from stack, clamping to valid range."""
+		if self._full_stack is not None:
+			n = len(self._full_stack)
+			idx = max(0, min(idx, n - 1))
+			self._volume_index = idx
+			self._data = self._full_stack[idx].astype(np.float32)
+		else:
+			# Single volume case
+			self._volume_index = 0
+
+	def _on_index_changed(self, idx, tgt):
+		"""Handle volume index change from spin box."""
+		self._extract_volume(idx)
+		self._rebuild_bbox()
+		for child in self._children:
+			if isinstance(child, IsoSurfaceNode):
+				child._rebuild_volume()
+		if tgt:
+			tgt._request_render()
+
+	def _on_browse_file(self, tgt):
+		"""Open file dialog to load volume data."""
+		filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+			None, "Load Volume Data", "",
+			"Image Files (*.hed *.spi *.em *.mrc *.st *.stk);;All Files (*)")
+		if filepath:
+			self.load_from_file(filepath)
+			# Update the filename box
+			self._filename_box.setValue(self._filename, quiet=1)
+			# Notify any isosurface children to rebuild
+			for child in self._children:
+				if isinstance(child, IsoSurfaceNode):
+					child._rebuild_volume()
+			if tgt:
+				tgt._request_render()
+
+
+class IsoSurfaceNode(ShapeNode):
+	"""Isosurface rendered from parent DataNode using VolumeIsoMaterial."""
+	def __init__(self, *args, threshold=0.5, color=(1.0, 0.4, 0.2), opacity=1.0,
+		**kwargs):
+		self._threshold = float(threshold)
+		self._color = color
+		self._opacity = float(opacity)
+		super().__init__(*args, **kwargs)
+
+	def _get_data(self):
+		node = self._parent
+		while node is not None:
+			if isinstance(node, DataNode) and node._data is not None:
+				return node._data
+			node = node._parent
+		return None
+
+	def _make_color_map(self):
+		"""Create a 1D color map texture from stored RGB color."""
+		c = gfx.Color((self._color[0], self._color[1], self._color[2]))
+		color_data = np.array([[c.r, c.g, c.b, c.a]], dtype=np.float32)
+		return gfx.Texture(color_data, dim=1)
+
+	def _rebuild_volume(self):
+		data = self._get_data()
+		if data is None or not self._gfx_node:
+			return
+		for child in list(self._gfx_node.children):
+			if isinstance(child, gfx.Volume):
+				self._gfx_node.remove(child)
+		clim = (float(data.min()), float(data.max()))
+		mat = gfx.VolumeIsoMaterial(
+			threshold=self._threshold,
+			clim=clim,
+			map=self._make_color_map()
+		)
+		geo = gfx.Geometry(grid=gfx.Texture(data[..., np.newaxis], dim=3))
+		vol = gfx.Volume(geo, mat)
+		# Offset volume so its center aligns with the group origin.
+		# pygfx 3D texture maps as (z, y, x) in world space.
+		# data.shape is (d, h, w); texture adds channel dim -> (d, h, w, 1)
+		d, h, w = data.shape
+		vol.local.position = (-w / 2.0, -h / 2.0, -d / 2.0)
+		self._gfx_node.add(vol)
+
+	def set_threshold(self, v):
+		self._threshold = float(v)
+		for child in self._gfx_node.children if self._gfx_node else []:
+			if isinstance(child, gfx.Volume) and hasattr(child.material,
+				'threshold'):
+				child.material.threshold = self._threshold
+				break
+
+	def inspector_controls(self, parent):
+		controls = []
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		data = self._get_data()
+		hr_min = float(data.min()) if data is not None else 0.0
+		hr_max = float(data.max()) if data is not None else 1.0
+		sr = ValSlider(parent, (hr_min, hr_max), "Threshold",
+			value=self._threshold)
+		sr.valueChanged.connect(lambda v: self._on_threshold_changed(v, tgt))
+		controls.append(("Threshold", sr))
+		well = QtWidgets.QPushButton()
+		well.setFixedSize(40, 30)
+		r, g, b = int(self._color[0]*255), int(self._color[1]*255), int(self._color[2]*255)
+		well.setStyleSheet("background-color: rgb(%d,%d,%d); border: 1px solid #555;" % (r, g, b))
+		well.clicked.connect(lambda: self._on_color_pick(parent))
+		controls.append(("Color", well))
+		return controls
+
+	def _on_threshold_changed(self, v, tgt):
+		self.set_threshold(v)
+		if tgt:
+			tgt._request_render()
+
+	def _on_color_pick(self, parent):
+		qcolor = QtGui.QColor(*[int(c * 255) for c in self._color[:3]])
+		new_color = QtWidgets.QColorDialog.getColor(qcolor, parent)
+		if new_color.isValid():
+			self._color = (
+				new_color.red() / 255.0,
+				new_color.green() / 255.0,
+				new_color.blue() / 255.0)
+			self._rebuild_volume()
+			tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+			if tgt:
+				tgt._request_render()
+
+
 # ---------------------------------------------------------------------------
 # Shape helper methods (shared across types)  
 # ---------------------------------------------------------------------------
@@ -848,6 +1110,37 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		q = la.quat_from_rotvec((-math.pi / 2, 0, 0))
 		z_arrow._gfx_node.local.matrix = la.mat_from_quat(q)
 		return x_arrow, y_arrow, z_arrow
+
+	def add_data(self, name=None, data=None, header=None, filename='', parent=None):
+		"""Add a DataNode holding 3D volume array."""
+		if parent is None:
+			parent = self._selected_node
+		label = name or DataNode.next_name()
+		node = DataNode(name=label, data=data, header=header,
+			filename=filename, parent=parent)
+		node._color = (0.3, 0.6, 1.0, 1.0)
+		group = gfx.Group()
+		node._gfx_node = group
+		if node._data is not None:
+			node._rebuild_bbox()
+		self._root_group.add(group)
+		self._request_render()
+		return node
+
+	def add_isosurface(self, name=None, threshold=0.5, color=(1.0, 0.4, 0.2),
+		parent=None):
+		"""Add an IsoSurfaceNode that renders isosurface from parent DataNode."""
+		if parent is None:
+			parent = self._selected_node
+		label = name or SceneNode.next_name("IsoSurface")
+		node = IsoSurfaceNode(name=label, threshold=threshold,
+			color=color, parent=parent)
+		group = gfx.Group()
+		node._gfx_node = group
+		node._rebuild_volume()
+		self._root_group.add(group)
+		self._request_render()
+		return node
 
 	# -- Node management --
 
@@ -1435,7 +1728,7 @@ class EMScene3DInspector(QtWidgets.QWidget):
 		self.scl_slider.setValue(float(scl), quiet=1)
 
 		# Update object-specific tab
-		if isinstance(node, ShapeNode):
+		if isinstance(node, (ShapeNode, DataNode)):
 			info_lines = ["Type: %s" % node.__class__.__name__, "Label: %s" % node.label]
 			self.object_info_label.setText("\n".join(info_lines))
 			self.object_info_label.setStyleSheet("")
