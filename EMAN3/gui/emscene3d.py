@@ -9,12 +9,14 @@ import pygfx as gfx
 from rendercanvas.qt import QRenderWidget
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from EMAN3.gui.valslider import ValSlider
+from EMAN3.gui.valslider import ValSlider, StringBox
 
 
 # ---------------------------------------------------------------------------
 # Scene node hierarchy (simplified, no EMAN2 deps)
 # ---------------------------------------------------------------------------
+
+from EMAN3.transform import Transform as EMANTransform
 
 class SceneNode:
 	"""Base class for scene graph nodes."""
@@ -31,6 +33,7 @@ class SceneNode:
 		self._color = (0.8, 0.8, 0.8, 1.0)
 		self._position = (0.0, 0.0, 0.0)
 		self._scale = (1.0, 1.0, 1.0)
+		self._rotation = (0.0, 0.0, 0.0)  # EMAN convention: az, alt, phi (degrees)
 		if parent:
 			parent.add_child(self)
 
@@ -115,7 +118,34 @@ class SceneNode:
 	def set_position(self, x, y, z):
 		self._position = (float(x), float(y), float(z))
 		if self._gfx_node:
-			self._gfx_node.world.position = self._position
+			self._apply_transform()
+
+	def get_rotation(self):
+		return self._rotation
+
+	def set_rotation(self, az, alt, phi):
+		"""Set rotation using EMAN convention euler angles (degrees)."""
+		self._rotation = (float(az), float(alt), float(phi))
+		if self._gfx_node:
+			self._apply_transform()
+
+	def _apply_transform(self):
+		"""Apply stored position and rotation to gfx_node via local.matrix."""
+		if not self._gfx_node:
+			return
+		pos = np.array(self._position)
+		az, alt, phi = self._rotation
+		# Build rotation matrix from EMAN euler angles using Transform
+		t = EMANTransform()
+		t.set_rotation({'type': 'eman', 'az': az, 'alt': alt, 'phi': phi})
+		# get_matrix returns 3x4 affine; we only want the 3x3 rotation part
+		rot_mat = t.get_matrix()[:3, :3]
+		# Embed position + rotation + scale into 4x4 transform matrix
+		scale = self._scale[0]
+		matrix = np.eye(4)
+		matrix[:3, :3] = rot_mat * scale
+		matrix[0, 3], matrix[1, 3], matrix[2, 3] = pos
+		self._gfx_node.local.matrix = matrix
 
 	def get_position(self):
 		return self._position
@@ -123,7 +153,7 @@ class SceneNode:
 	def set_scale(self, s):
 		self._scale = (float(s), float(s), float(s))
 		if self._gfx_node:
-			self._gfx_node.world.scale = self._scale
+			self._apply_transform()
 
 	def get_scale(self):
 		return self._scale[0]
@@ -144,7 +174,319 @@ class ShapeNode(SceneNode):
 
 
 # ---------------------------------------------------------------------------
-# Canvas for event forwarding
+# Shape-specific nodes with type parameters
+# ---------------------------------------------------------------------------
+
+class SphereNode(ShapeNode):
+	"""Sphere node with radius parameter."""
+	def __init__(self, *args, **kwargs):
+		radius = kwargs.pop('radius', 0.5)
+		super().__init__(*args, **kwargs)
+		self._radius = radius
+
+	def set_radius(self, r):
+		"""Set sphere radius and rebuild geometry."""
+		self._radius = float(r)
+		self._rebuild_geometry()
+
+	def _rebuild_geometry(self):
+		geo = gfx.sphere_geometry(self._radius, width_segments=32, height_segments=24)
+		self._replace_mesh(geo)
+
+	def inspector_controls(self, parent):
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		controls = []
+		slider = ValSlider(parent, (0.01, 50.0), "Radius", value=self._radius)
+		slider.valueChanged.connect(lambda v: self._on_radius_changed(v, tgt))
+		controls.append(("Radius", slider))
+		return controls
+
+	def _on_radius_changed(self, v, tgt):
+		self.set_radius(v)
+		if tgt:
+			tgt._request_render()
+
+
+class CubeNode(ShapeNode):
+	"""Cube node with independent width/height/depth."""
+	def __init__(self, *args, **kwargs):
+		width = kwargs.pop('width', 1.0)
+		height = kwargs.pop('height', 1.0)
+		depth = kwargs.pop('depth', 1.0)
+		super().__init__(*args, **kwargs)
+		self._width = width
+		self._height = height
+		self._depth = depth
+
+	def set_dimensions(self, w, h, d):
+		"""Set cube dimensions and rebuild geometry."""
+		self._width, self._height, self._depth = float(w), float(h), float(d)
+		self._rebuild_geometry()
+
+	def _rebuild_geometry(self):
+		geo = gfx.box_geometry(self._width, self._height, self._depth)
+		self._replace_mesh(geo)
+
+	def inspector_controls(self, parent):
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		controls = []
+		sw = ValSlider(parent, (0.01, 50.0), "Width", value=self._width)
+		sw.valueChanged.connect(lambda v: self._on_dim_changed(v, self._height, self._depth, tgt))
+		controls.append(("Width", sw))
+		sht = ValSlider(parent, (0.01, 50.0), "Height", value=self._height)
+		sht.valueChanged.connect(lambda v: self._on_dim_changed(self._width, v, self._depth, tgt))
+		controls.append(("Height", sht))
+		sd = ValSlider(parent, (0.01, 50.0), "Depth", value=self._depth)
+		sd.valueChanged.connect(lambda v: self._on_dim_changed(self._width, self._height, v, tgt))
+		controls.append(("Depth", sd))
+		return controls
+
+	def _on_dim_changed(self, w, h, d, tgt):
+		self.set_dimensions(w, h, d)
+		if tgt:
+			tgt._request_render()
+
+
+class CylinderNode(ShapeNode):
+	"""Cylinder node with radius and height."""
+	def __init__(self, *args, **kwargs):
+		radius = kwargs.pop('radius', 0.5)
+		height = kwargs.pop('height', 1.0)
+		super().__init__(*args, **kwargs)
+		self._radius = radius
+		self._height = height
+
+	def set_parameters(self, r, h):
+		"""Set cylinder radius and height."""
+		self._radius, self._height = float(r), float(h)
+		self._rebuild_geometry()
+
+	def _rebuild_geometry(self):
+		geo = gfx.cylinder_geometry(radius_bottom=self._radius, radius_top=self._radius,
+			height=self._height, radial_segments=32, height_segments=1)
+		self._replace_mesh(geo)
+
+	def inspector_controls(self, parent):
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		controls = []
+		sr = ValSlider(parent, (0.01, 50.0), "Radius", value=self._radius)
+		sr.valueChanged.connect(lambda v: self._on_param_changed(v, self._height, tgt))
+		controls.append(("Radius", sr))
+		sht = ValSlider(parent, (0.01, 50.0), "Height", value=self._height)
+		sht.valueChanged.connect(lambda v: self._on_param_changed(self._radius, v, tgt))
+		controls.append(("Height", sht))
+		return controls
+
+	def _on_param_changed(self, r, h, tgt):
+		self.set_parameters(r, h)
+		if tgt:
+			tgt._request_render()
+
+
+class ConeNode(ShapeNode):
+	"""Cone node with radius and height."""
+	def __init__(self, *args, **kwargs):
+		radius = kwargs.pop('radius', 0.5)
+		height = kwargs.pop('height', 1.0)
+		super().__init__(*args, **kwargs)
+		self._radius = radius
+		self._height = height
+
+	def set_parameters(self, r, h):
+		"""Set cone radius and height."""
+		self._radius, self._height = float(r), float(h)
+		self._rebuild_geometry()
+
+	def _rebuild_geometry(self):
+		geo = gfx.cone_geometry(radius=self._radius, height=self._height,
+			radial_segments=32, open_ended=False)
+		self._replace_mesh(geo)
+
+	def inspector_controls(self, parent):
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		controls = []
+		sr = ValSlider(parent, (0.01, 50.0), "Radius", value=self._radius)
+		sr.valueChanged.connect(lambda v: self._on_param_changed(v, self._height, tgt))
+		controls.append(("Radius", sr))
+		sht = ValSlider(parent, (0.01, 50.0), "Height", value=self._height)
+		sht.valueChanged.connect(lambda v: self._on_param_changed(self._radius, v, tgt))
+		controls.append(("Height", sht))
+		return controls
+
+	def _on_param_changed(self, r, h, tgt):
+		self.set_parameters(r, h)
+		if tgt:
+			tgt._request_render()
+
+
+class LineNode(ShapeNode):
+	"""Line node with start and end points."""
+	def __init__(self, *args, **kwargs):
+		start = kwargs.pop('start', (0.0, 0.0, 0.0))
+		end = kwargs.pop('end', (1.0, 1.0, 1.0))
+		super().__init__(*args, **kwargs)
+		self._start = np.array(start, dtype=np.float32)
+		self._end = np.array(end, dtype=np.float32)
+
+	def set_endpoints(self, start, end):
+		"""Set line endpoints."""
+		self._start = np.array(start, dtype=np.float32)
+		self._end = np.array(end, dtype=np.float32)
+		self._rebuild_geometry()
+
+	def _rebuild_geometry(self):
+		points = np.vstack([self._start, self._end])
+		if hasattr(self, '_line') and self._line:
+			self._line.geometry.positions.data = points
+
+	def inspector_controls(self, parent):
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		controls = []
+		for i, ax in enumerate(['X', 'Y', 'Z']):
+			sl = ValSlider(parent, (-50.0, 50.0), "Start"+ax, value=float(self._start[i]))
+			sl.valueChanged.connect(lambda v, idx=i: self._on_start_changed(idx, v, tgt))
+			controls.append(("Start"+ax, sl))
+		for i, ax in enumerate(['X', 'Y', 'Z']):
+			e = ValSlider(parent, (-50.0, 50.0), "End"+ax, value=float(self._end[i]))
+			e.valueChanged.connect(lambda v, idx=i: self._on_end_changed(idx, v, tgt))
+			controls.append(("End"+ax, e))
+		return controls
+
+	def _on_start_changed(self, idx, value, tgt):
+		self._start[idx] = float(value)
+		self._rebuild_geometry()
+		if tgt:
+			tgt._request_render()
+
+	def _on_end_changed(self, idx, value, tgt):
+		self._end[idx] = float(value)
+		self._rebuild_geometry()
+		if tgt:
+			tgt._request_render()
+
+
+class ArrowNode(ShapeNode):
+	"""Arrow node with shaft/head parameters."""
+	def __init__(self, *args, **kwargs):
+		shaft_radius = kwargs.pop('shaft_radius', 0.08)
+		shaft_length = kwargs.pop('shaft_length', 0.7)
+		head_radius = kwargs.pop('head_radius', 0.2)
+		head_height = kwargs.pop('head_height', 0.3)
+		super().__init__(*args, **kwargs)
+		self._shaft_radius = shaft_radius
+		self._shaft_length = shaft_length
+		self._head_radius = head_radius
+		self._head_height = head_height
+
+	def set_parameters(self, sr, sl, hr, hh):
+		"""Set arrow parameters."""
+		self._shaft_radius = float(sr)
+		self._shaft_length = float(sl)
+		self._head_radius = float(hr)
+		self._head_height = float(hh)
+		self._rebuild_geometry()
+
+	def _rebuild_geometry(self):
+		head_geo = gfx.cone_geometry(radius=self._head_radius, height=self._head_height,
+			radial_segments=16, open_ended=True)
+		body_geo = gfx.cylinder_geometry(radius_bottom=self._shaft_radius,
+			radius_top=self._shaft_radius, height=self._shaft_length,
+			radial_segments=12, height_segments=1)
+		vs = np.vstack([head_geo.positions.data, body_geo.positions.data])
+		is_combined = np.concatenate([head_geo.indices.data,
+			body_geo.indices.data + len(head_geo.positions.data)])
+		geo = gfx.Geometry(positions=vs, indices=is_combined)
+		self._replace_mesh(geo)
+
+	def inspector_controls(self, parent):
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		controls = []
+		sr = ValSlider(parent, (0.01, 10.0), "ShaftR", value=self._shaft_radius)
+		sr.valueChanged.connect(lambda v: self._on_param_changed(v, self._shaft_length,
+			self._head_radius, self._head_height, tgt))
+		controls.append(("ShaftRadius", sr))
+		sl = ValSlider(parent, (0.01, 50.0), "ShaftL", value=self._shaft_length)
+		sl.valueChanged.connect(lambda v: self._on_param_changed(self._shaft_radius, v,
+			self._head_radius, self._head_height, tgt))
+		controls.append(("ShaftLength", sl))
+		hr = ValSlider(parent, (0.01, 10.0), "HeadR", value=self._head_radius)
+		hr.valueChanged.connect(lambda v: self._on_param_changed(self._shaft_radius,
+			self._shaft_length, v, self._head_height, tgt))
+		controls.append(("HeadRadius", hr))
+		hh = ValSlider(parent, (0.01, 10.0), "HeadH", value=self._head_height)
+		hh.valueChanged.connect(lambda v: self._on_param_changed(self._shaft_radius,
+			self._shaft_length, self._head_radius, v, tgt))
+		controls.append(("HeadHeight", hh))
+		return controls
+
+	def _on_param_changed(self, sr, sl, hr, hh, tgt):
+		self.set_parameters(sr, sl, hr, hh)
+		if tgt:
+			tgt._request_render()
+
+
+class TextNode(ShapeNode):
+	"""Text node with string and font size."""
+	def __init__(self, *args, **kwargs):
+		text_content = kwargs.pop('text', 'Hello')
+		font_size = kwargs.pop('font_size', 20)
+		super().__init__(*args, **kwargs)
+		self._text_content = text_content
+		self._font_size = font_size
+
+	def set_text(self, text):
+		"""Set text content."""
+		self._text_content = text
+		if hasattr(self, '_text_obj') and self._text_obj:
+			self._text_obj.set_text(text)
+
+	def set_font_size(self, fs):
+		"""Set font size."""
+		self._font_size = int(max(4, min(fs, 200)))
+		if hasattr(self, '_text_obj') and self._text_obj:
+			self._text_obj.font_size = self._font_size
+
+	def inspector_controls(self, parent):
+		controls = []
+		sb = StringBox(parent, "Text", value=self._text_content)
+		sb.valueChanged.connect(lambda v, p=parent: self._on_text_changed(v, p))
+		controls.append(("Text", sb))
+		fs = ValSlider(parent, (4.0, 200.0), "FontSize", value=float(self._font_size))
+		fs.setIntonly(True)
+		fs.valueChanged.connect(lambda v, p=parent: self._on_font_changed(int(v), p))
+		controls.append(("FontSize", fs))
+		return controls
+
+	def _on_text_changed(self, v, parent):
+		self.set_text(v)
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		if tgt:
+			tgt._request_render()
+
+	def _on_font_changed(self, v, parent):
+		self.set_font_size(int(v))
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		if tgt:
+			tgt._request_render()
+
+
+# ---------------------------------------------------------------------------
+# Shape helper methods (shared across types)  
+# ---------------------------------------------------------------------------
+
+def _replace_mesh(self, new_geo):
+	"""Replace mesh geometry while preserving material."""
+	if not self._gfx_node:
+		return
+	for child in self._gfx_node.children:
+		if isinstance(child, gfx.Mesh):
+			child.geometry = new_geo
+			break
+
+ShapeNode._replace_mesh = _replace_mesh
+
+# ---------------------------------------------------------------------------
+# Canvas for event forwarding  
 # ---------------------------------------------------------------------------
 
 class _EMCanvas(QRenderWidget):
@@ -316,25 +658,22 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			parent = self._selected_node
 		label = name or SceneNode.next_name("Cube")
 
-		node = ShapeNode(name=label, parent=parent)
+		node = CubeNode(name=label, parent=parent)
 		node.set_color(*color[:3])
 		node._color = color
+		node.set_dimensions(scale, scale, scale)
 
-		# Unit cube: 1x1x1 centered at origin (box_geometry creates -0.5..+0.5)
-		geo = gfx.box_geometry(1.0, 1.0, 1.0)
 		material = gfx.MeshStandardMaterial(color=(color[0], color[1], color[2]), roughness=0.6, metalness=0.1)
+		geo = gfx.box_geometry(node._width, node._height, node._depth)
 		mesh = gfx.Mesh(geo, material)
-
 		group = gfx.Group()
 		group.add(mesh)
-		group.world.position = position
-		group.world.scale = (scale, scale, scale)
 		node._gfx_node = group
+		node._rebuild_geometry()
 		node.set_position(*position)
 		node.set_scale(scale)
 
 		self._root_group.add(group)
-		node.label = label
 		self._request_render()
 		return node
 
@@ -344,25 +683,22 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			parent = self._selected_node
 		label = name or SceneNode.next_name("Sphere")
 
-		node = ShapeNode(name=label, parent=parent)
+		node = SphereNode(name=label, parent=parent)
 		node.set_color(*color[:3])
 		node._color = color
+		node.set_radius(0.5 * scale)
 
-		# Unit sphere (radius 0.5 to fit in -1..+1 box)
-		geo = gfx.sphere_geometry(0.5, width_segments=32, height_segments=24)
 		material = gfx.MeshStandardMaterial(color=(color[0], color[1], color[2]), roughness=0.6, metalness=0.1)
+		geo = gfx.sphere_geometry(node._radius, width_segments=32, height_segments=24)
 		mesh = gfx.Mesh(geo, material)
-
 		group = gfx.Group()
 		group.add(mesh)
-		group.world.position = position
-		group.world.scale = (scale, scale, scale)
 		node._gfx_node = group
+		node._rebuild_geometry()
 		node.set_position(*position)
 		node.set_scale(scale)
 
 		self._root_group.add(group)
-		node.label = label
 		self._request_render()
 		return node
 
@@ -372,25 +708,23 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			parent = self._selected_node
 		label = name or SceneNode.next_name("Cylinder")
 
-		node = ShapeNode(name=label, parent=parent)
+		node = CylinderNode(name=label, parent=parent)
 		node.set_color(*color[:3])
 		node._color = color
+		node.set_parameters(0.5 * scale, 1.0 * scale)
 
-		# Cylinder: radius=0.5, height=1 (top/bottom at +/-0.5)
-		geo = gfx.cylinder_geometry(radius_bottom=0.5, radius_top=0.5, height=1.0, radial_segments=32, height_segments=1)
 		material = gfx.MeshStandardMaterial(color=(color[0], color[1], color[2]), roughness=0.6, metalness=0.1)
+		geo = gfx.cylinder_geometry(radius_bottom=node._radius, radius_top=node._radius,
+			height=node._height, radial_segments=32, height_segments=1)
 		mesh = gfx.Mesh(geo, material)
-
 		group = gfx.Group()
 		group.add(mesh)
-		group.world.position = position
-		group.world.scale = (scale, scale, scale)
 		node._gfx_node = group
+		node._rebuild_geometry()
 		node.set_position(*position)
 		node.set_scale(scale)
 
 		self._root_group.add(group)
-		node.label = label
 		self._request_render()
 		return node
 
@@ -400,25 +734,23 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			parent = self._selected_node
 		label = name or SceneNode.next_name("Cone")
 
-		node = ShapeNode(name=label, parent=parent)
+		node = ConeNode(name=label, parent=parent)
 		node.set_color(*color[:3])
 		node._color = color
+		node.set_parameters(0.5 * scale, 1.0 * scale)
 
-		# Cone: radius=0.5, height=1 (centered)
-		geo = gfx.cone_geometry(radius=0.5, height=1.0, radial_segments=32, open_ended=False)
 		material = gfx.MeshStandardMaterial(color=(color[0], color[1], color[2]), roughness=0.6, metalness=0.1)
+		geo = gfx.cone_geometry(radius=node._radius, height=node._height,
+			radial_segments=32, open_ended=False)
 		mesh = gfx.Mesh(geo, material)
-
 		group = gfx.Group()
 		group.add(mesh)
-		group.world.position = position
-		group.world.scale = (scale, scale, scale)
 		node._gfx_node = group
+		node._rebuild_geometry()
 		node.set_position(*position)
 		node.set_scale(scale)
 
 		self._root_group.add(group)
-		node.label = label
 		self._request_render()
 		return node
 
@@ -428,22 +760,21 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			parent = self._selected_node
 		label = name or SceneNode.next_name("Line")
 
-		node = ShapeNode(name=label, parent=parent)
+		node = LineNode(name=label, start=start, end=end, parent=parent)
 		node.set_color(*color[:3])
 		node._color = color
 
 		points = np.array([start, end], dtype=np.float32)
 		geo = gfx.Geometry(positions=points)
 		material = gfx.LineMaterial(color=(color[0], color[1], color[2]), thickness=2.0)
-		line = gfx.Line(geo, material)
-
+		line_obj = gfx.Line(geo, material)
+		node._line = line_obj
 		group = gfx.Group()
-		group.add(line)
+		group.add(line_obj)
 		node._gfx_node = group
 		node.set_position(*start)
 
 		self._root_group.add(group)
-		node.label = label
 		self._request_render()
 		return node
 
@@ -453,31 +784,29 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			parent = self._selected_node
 		label = name or SceneNode.next_name("Arrow")
 
-		node = ShapeNode(name=label, parent=parent)
+		node = ArrowNode(name=label, parent=parent)
 		node.set_color(*color[:3])
 		node._color = color
 
-		# Arrow: use cone as head + cylinder as body merged
-		head_geo = gfx.cone_geometry(radius=0.2, height=0.3, radial_segments=16, open_ended=True)
-		body_geo = gfx.cylinder_geometry(radius_bottom=0.08, radius_top=0.08, height=0.7, radial_segments=12, height_segments=1)
-		# Combine geometries by creating a merged Geometry
-		import pygfx.utils as gfx_utils
-		vs = np.vstack([head_geo.positions.data, body_geo.positions.data])
-		is_combined = np.concatenate([head_geo.indices.data, body_geo.indices.data + len(head_geo.positions.data)])
-		geo = gfx.Geometry(positions=vs, indices=is_combined)
 		material = gfx.MeshStandardMaterial(color=(color[0], color[1], color[2]), roughness=0.6, metalness=0.1)
+		head_geo = gfx.cone_geometry(radius=node._head_radius, height=node._head_height,
+			radial_segments=16, open_ended=True)
+		body_geo = gfx.cylinder_geometry(radius_bottom=node._shaft_radius,
+			radius_top=node._shaft_radius, height=node._shaft_length,
+			radial_segments=12, height_segments=1)
+		vs = np.vstack([head_geo.positions.data, body_geo.positions.data])
+		is_combined = np.concatenate([head_geo.indices.data,
+			body_geo.indices.data + len(head_geo.positions.data)])
+		geo = gfx.Geometry(positions=vs, indices=is_combined)
 		mesh = gfx.Mesh(geo, material)
 
 		group = gfx.Group()
 		group.add(mesh)
-		group.world.position = position
-		group.world.scale = (scale, scale, scale)
 		node._gfx_node = group
 		node.set_position(*position)
 		node.set_scale(scale)
 
 		self._root_group.add(group)
-		node.label = label
 		self._request_render()
 		return node
 
@@ -487,21 +816,20 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			parent = self._selected_node
 		label = name or SceneNode.next_name("Text")
 
-		node = ShapeNode(name=label, parent=parent)
+		node = TextNode(name=label, text=text, font_size=20, parent=parent)
 		node.set_color(*color[:3])
 		node._color = color
-		node._text_content = text
 
-		text_obj = gfx.Text(text=text, font_size=0.15, render_order=999)
+		text_obj = gfx.Text(text=text, font_size=20, render_order=999)
 		text_obj.material.color = (color[0], color[1], color[2])
-		text_obj.local.position = position
+		node._text_obj = text_obj
 		group = gfx.Group()
 		group.add(text_obj)
 		node._gfx_node = group
 		node.set_position(*position)
+		node.set_scale(scale)
 
 		self._root_group.add(group)
-		node.label = label
 		self._request_render()
 		return node
 
@@ -751,14 +1079,18 @@ class EMScene3DInspector(QtWidgets.QWidget):
 
 	def _build_tree_tab(self):
 		widget = QtWidgets.QWidget()
-		layout = QtWidgets.QVBoxLayout(widget)
+		main_layout = QtWidgets.QHBoxLayout(widget)
+
+		# Left side: tree + buttons in a column
+		left_widget = QtWidgets.QWidget()
+		left_layout = QtWidgets.QVBoxLayout(left_widget)
 
 		# Tree widget showing scene hierarchy
 		self.tree = QtWidgets.QTreeWidget()
 		self.tree.setHeaderLabel("Scene Hierarchy")
 		self.tree.setColumnCount(2)
 		self.tree.setHeaderLabels(["Name", "Visible"])
-		layout.addWidget(self.tree)
+		left_layout.addWidget(self.tree)
 
 		# Buttons row
 		btn_layout = QtWidgets.QHBoxLayout()
@@ -766,14 +1098,104 @@ class EMScene3DInspector(QtWidgets.QWidget):
 		self.remove_btn = QtWidgets.QPushButton("Remove Object")
 		btn_layout.addWidget(self.add_btn)
 		btn_layout.addWidget(self.remove_btn)
-		layout.addLayout(btn_layout)
+		left_layout.addLayout(btn_layout)
 
 		# Mouse mode info (OrbitController handles rotation/panning natively)
 		info_label = QtWidgets.QLabel("Left-drag: Rotate | Right-drag: Pan | Scroll: Zoom")
 		info_label.setStyleSheet("QLabel { color: gray; font-size: 9px; }")
-		layout.addWidget(info_label)
+		left_layout.addWidget(info_label)
 
+		# Right side: properties panel
+		right_widget = self._build_properties_panel()
+
+		# Split left/right with a splitter
+		splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+		splitter.addWidget(left_widget)
+		splitter.addWidget(right_widget)
+		splitter.setStretchFactor(0, 1)
+		splitter.setStretchFactor(1, 1)
+
+		main_layout.addWidget(splitter)
 		return widget
+
+	def _build_properties_panel(self):
+		"""Build the properties panel shown when a node is selected."""
+		self.prop_widget = QtWidgets.QTabWidget()
+
+		# Common tab: position, rotation, scale, color
+		common_page = self._build_common_tab()
+		self.prop_widget.addTab(common_page, "Common")
+
+		# Object-specific tab
+		object_page = self._build_object_tab()
+		self.prop_widget.addTab(object_page, "Object")
+
+		return self.prop_widget
+
+	def _build_common_tab(self):
+		"""Build common properties: position, rotation, scale, color."""
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+
+		# Position groupbox
+		pos_frame = QtWidgets.QGroupBox("Position")
+		pos_layout = QtWidgets.QGridLayout(pos_frame)
+		self.pos_x_slider = ValSlider(page, (-10.0, 10.0), "X", value=0.0)
+		self.pos_y_slider = ValSlider(page, (-10.0, 10.0), "Y", value=0.0)
+		self.pos_z_slider = ValSlider(page, (-10.0, 10.0), "Z", value=0.0)
+		pos_layout.addWidget(self.pos_x_slider, 0, 0)
+		pos_layout.addWidget(self.pos_y_slider, 1, 0)
+		pos_layout.addWidget(self.pos_z_slider, 2, 0)
+		layout.addWidget(pos_frame)
+
+		# Rotation groupbox (EMAN convention: azimuth, altitude, phi)
+		rot_frame = QtWidgets.QGroupBox("Rotation EMAN (deg)")
+		rot_layout = QtWidgets.QGridLayout(rot_frame)
+		self.rot_az_slider = ValSlider(page, (-180.0, 180.0), "Az", value=0.0)
+		self.rot_alt_slider = ValSlider(page, (-90.0, 90.0), "Alt", value=0.0)
+		self.rot_phi_slider = ValSlider(page, (-180.0, 180.0), "Phi", value=0.0)
+		rot_layout.addWidget(self.rot_az_slider, 0, 0)
+		rot_layout.addWidget(self.rot_alt_slider, 1, 0)
+		rot_layout.addWidget(self.rot_phi_slider, 2, 0)
+		layout.addWidget(rot_frame)
+
+		# Scale groupbox
+		scl_frame = QtWidgets.QGroupBox("Scale")
+		scl_layout = QtWidgets.QVBoxLayout(scl_frame)
+		self.scl_slider = ValSlider(page, (0.1, 20.0), "Scale", value=1.0)
+		scl_layout.addWidget(self.scl_slider)
+		layout.addWidget(scl_frame)
+
+		# Color well that visually shows the current color
+		col_frame = QtWidgets.QGroupBox("Color")
+		col_layout = QtWidgets.QHBoxLayout(col_frame)
+		self.color_well = QtWidgets.QPushButton()
+		self.color_well.setFixedSize(40, 30)
+		self.color_well.setStyleSheet("background-color: rgb(128, 128, 128); border: 1px solid #555;")
+		col_layout.addWidget(self.color_well)
+		layout.addWidget(col_frame)
+
+		layout.addStretch()
+		return page
+
+	def _build_object_tab(self):
+		"""Build object-specific properties tab."""
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+
+		# Placeholder label, populated when a shape is selected
+		self.object_info_label = QtWidgets.QLabel("Select an object to see properties.")
+		self.object_info_label.setWordWrap(True)
+		self.object_info_label.setStyleSheet("QLabel { color: gray; }")
+		layout.addWidget(self.object_info_label)
+
+		# Object-specific sliders (dynamically wired)
+		self.object_controls = QtWidgets.QGroupBox("Parameters")
+		self.object_controls_layout = QtWidgets.QVBoxLayout(self.object_controls)
+		layout.addWidget(self.object_controls)
+
+		layout.addStretch()
+		return page
 
 
 	def _build_lights_tab(self):
@@ -882,6 +1304,16 @@ class EMScene3DInspector(QtWidgets.QWidget):
 		self.tree.itemClicked.connect(self._on_tree_click)
 		self.tree.itemChanged.connect(self._on_item_changed)
 
+		# Property panel sliders update selected node
+		self.pos_x_slider.valueChanged.connect(self._on_pos_x_changed)
+		self.pos_y_slider.valueChanged.connect(self._on_pos_y_changed)
+		self.pos_z_slider.valueChanged.connect(self._on_pos_z_changed)
+		self.rot_az_slider.valueChanged.connect(self._on_rot_az_changed)
+		self.rot_alt_slider.valueChanged.connect(self._on_rot_alt_changed)
+		self.rot_phi_slider.valueChanged.connect(self._on_rot_phi_changed)
+		self.scl_slider.valueChanged.connect(self._on_scale_changed)
+		self.color_well.clicked.connect(self._on_color_pick)
+
 		# Ambient light
 		self.ambient_slider.valueChanged.connect(self._on_ambient_changed)
 
@@ -975,6 +1407,150 @@ class EMScene3DInspector(QtWidgets.QWidget):
 				for child in tgt.get_scene_root().get_all_nodes():
 					if child is not node:
 						child.selected = False
+				# Update properties panel
+				self._update_properties()
+
+	def _update_properties(self):
+		"""Update properties panel to reflect currently selected node."""
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		node = tgt.get_selected_node()
+		if not node:
+			return
+
+		# Update common properties from node state
+		pos = node.get_position()
+		self.pos_x_slider.setValue(float(pos[0]), quiet=1)
+		self.pos_y_slider.setValue(float(pos[1]), quiet=1)
+		self.pos_z_slider.setValue(float(pos[2]), quiet=1)
+
+		# Update rotation sliders from stored EMAN euler angles
+		rot = node.get_rotation()
+		self.rot_az_slider.setValue(float(rot[0]), quiet=1)
+		self.rot_alt_slider.setValue(float(rot[1]), quiet=1)
+		self.rot_phi_slider.setValue(float(rot[2]), quiet=1)
+
+		scl = node.get_scale()
+		self.scl_slider.setValue(float(scl), quiet=1)
+
+		# Update object-specific tab
+		if isinstance(node, ShapeNode):
+			info_lines = ["Type: %s" % node.__class__.__name__, "Label: %s" % node.label]
+			self.object_info_label.setText("\n".join(info_lines))
+			self.object_info_label.setStyleSheet("")
+
+			# Clear existing shape-specific controls
+			while self.object_controls_layout.count():
+				item = self.object_controls_layout.takeAt(0)
+				if item.widget():
+					item.widget().deleteLater()
+
+			# Build new controls from the node's inspector_controls method
+			if hasattr(node, 'inspector_controls'):
+				for label_text, ctrl in node.inspector_controls(self):
+					self.object_controls_layout.addWidget(ctrl)
+		else:
+			self.object_info_label.setText("Scene root - no specific properties.")
+			self.object_info_label.setStyleSheet("QLabel { color: gray; }")
+
+		# Update color well visual
+		self._update_color_well(node)
+
+	def _on_pos_x_changed(self, value):
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		node = tgt.get_selected_node()
+		if node:
+			pos = list(node.get_position())
+			pos[0] = float(value)
+			node.set_position(*pos)
+			tgt._request_render()
+
+	def _on_pos_y_changed(self, value):
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		node = tgt.get_selected_node()
+		if node:
+			pos = list(node.get_position())
+			pos[1] = float(value)
+			node.set_position(*pos)
+			tgt._request_render()
+
+	def _on_pos_z_changed(self, value):
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		node = tgt.get_selected_node()
+		if node:
+			pos = list(node.get_position())
+			pos[2] = float(value)
+			node.set_position(*pos)
+			tgt._request_render()
+
+	def _on_rot_az_changed(self, value):
+		self._apply_rotation()
+
+	def _on_rot_alt_changed(self, value):
+		self._apply_rotation()
+
+	def _on_rot_phi_changed(self, value):
+		self._apply_rotation()
+
+	def _apply_rotation(self):
+		"""Apply EMAN convention euler angles from sliders to selected node."""
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		node = tgt.get_selected_node()
+		if not node:
+			return
+		az = self.rot_az_slider.getValue()
+		alt = self.rot_alt_slider.getValue()
+		phi = self.rot_phi_slider.getValue()
+		node.set_rotation(az, alt, phi)
+		tgt._request_render()
+
+	def _on_scale_changed(self, value):
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		node = tgt.get_selected_node()
+		if node:
+			node.set_scale(float(value))
+			tgt._request_render()
+
+	def _on_color_pick(self):
+		"""Open color dialog and set selected node color."""
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		node = tgt.get_selected_node()
+		if not node:
+			return
+		current_color = node._color
+		qcolor = QtGui.QColor(*[int(c * 255) for c in current_color[:3]])
+		new_color = QtWidgets.QColorDialog.getColor(qcolor, self)
+		if new_color.isValid():
+			r = new_color.red() / 255.0
+			g = new_color.green() / 255.0
+			b = new_color.blue() / 255.0
+			node.set_color(r, g, b)
+			if hasattr(node, '_gfx_node') and node._gfx_node:
+				for child in node._gfx_node.children:
+					if hasattr(child, 'material') and hasattr(child.material, 'color'):
+						child.material.color = (r, g, b)
+			self._update_color_well(node)
+			tgt._request_render()
+
+	def _update_color_well(self, node):
+		"""Update the color well visual to match node color."""
+		color = node._color
+		r, g, b = int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
+		self.color_well.setStyleSheet(
+			"background-color: rgb(%d, %d, %d); border: 1px solid #555;" % (r, g, b))
 
 	def _on_dir_h_changed(self, value):
 		"""Directional light horizontal angle changed."""
