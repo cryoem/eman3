@@ -701,10 +701,18 @@ class IsoSurfaceNode(ShapeNode):
 		data = self._get_data()
 		hr_min = float(data.min()) if data is not None else 0.0
 		hr_max = float(data.max()) if data is not None else 1.0
-		sr = ValSlider(parent, (hr_min, hr_max), "Threshold",
-			value=self._threshold)
-		sr.valueChanged.connect(lambda v: self._on_threshold_changed(v, tgt))
-		controls.append(("Threshold", sr))
+		# Histogram with draggable threshold bar
+		self._hist_widget = IsoHistogram(parent)
+		if data is not None:
+			bins = np.histogram(data, bins=256, range=(hr_min, hr_max))
+			self._hist_widget.set_histogram(bins[0], hr_min, hr_max, self._threshold)
+		controls.append(("Histogram", self._hist_widget))
+		# Threshold slider
+		self._thr_slider = ValSlider(parent, (hr_min, hr_max), "Thr:", value=self._threshold)
+		self._hist_widget.thresholdChanged.connect(
+			lambda v: self._on_threshold_changed(v, tgt))
+		self._thr_slider.valueChanged.connect(lambda v: self._on_threshold_changed(v, tgt))
+		controls.append(("Threshold", self._thr_slider))
 		well = QtWidgets.QPushButton()
 		well.setFixedSize(40, 30)
 		r, g, b = int(self._color[0]*255), int(self._color[1]*255), int(self._color[2]*255)
@@ -715,6 +723,13 @@ class IsoSurfaceNode(ShapeNode):
 
 	def _on_threshold_changed(self, v, tgt):
 		self.set_threshold(v)
+		# Sync histogram bar position
+		if hasattr(self, '_hist_widget') and self._hist_widget:
+			self._hist_widget._threshold = v
+			self._hist_widget.update()
+		# Sync slider value
+		if hasattr(self, '_thr_slider') and self._thr_slider:
+			self._thr_slider.setValue(v, quiet=1)
 		if tgt:
 			tgt._request_render()
 
@@ -730,6 +745,78 @@ class IsoSurfaceNode(ShapeNode):
 			tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
 			if tgt:
 				tgt._request_render()
+
+
+class IsoHistogram(QtWidgets.QWidget):
+	"""Simple histogram widget with draggable threshold bar."""
+	thresholdChanged = QtCore.Signal(float)
+
+	def __init__(self, parent):
+		super().__init__(parent)
+		self.setMinimumSize(260, 130)
+		self._hist_data = None
+		self._min_val = 0.0
+		self._max_val = 1.0
+		self._threshold = 0.5
+		self._dragging = False
+		self.setMouseTracking(True)
+
+	def set_histogram(self, data, min_val, max_val, threshold):
+		"""Set histogram bin counts and value range."""
+		self._hist_data = np.array(data).astype(np.float32)
+		self._min_val = float(min_val)
+		self._max_val = float(max_val)
+		self._threshold = float(threshold)
+		self.update()
+
+	def paintEvent(self, event):
+		if self._hist_data is None:
+			return
+		painter = QtGui.QPainter(self)
+		painter.fillRect(0, 0, self.width(), self.height(), QtGui.QColor(20, 20, 20))
+		w = self.width()
+		h = self.height() - 20
+		norm = float(np.max(self._hist_data)) if np.max(self._hist_data) > 0 else 1.0
+		# Draw histogram bars
+		painter.setPen(QtGui.QColor(180, 180, 180))
+		bins = len(self._hist_data)
+		bar_w = w / max(bins, 1)
+		for i in range(bins):
+			bar_h = int(self._hist_data[i] / norm * h)
+			painter.drawLine(i * bar_w, h, i * bar_w, h - bar_h)
+		# Draw threshold line
+		if self._max_val != self._min_val:
+			x_pos = int((self._threshold - self._min_val) / (self._max_val - self._min_val) * w)
+		else:
+			x_pos = w // 2
+		x_pos = max(0, min(x_pos, w))
+		painter.setPen(QtGui.QColor(255, 80, 80))
+		painter.drawLine(x_pos, 0, x_pos, h)
+		# Draw threshold value text
+		painter.end()
+
+	def mousePressEvent(self, event):
+		if event.button() == QtCore.Qt.MouseButton.LeftButton:
+			self._dragging = True
+			self._update_threshold_from_event(event)
+			event.accept()
+
+	def mouseMoveEvent(self, event):
+		if self._dragging:
+			self._update_threshold_from_event(event)
+			event.accept()
+
+	def mouseReleaseEvent(self, event):
+		self._dragging = False
+		event.accept()
+
+	def _update_threshold_from_event(self, event):
+		x = event.position().x()
+		w = self.width()
+		t_frac = max(0.0, min(1.0, x / w))
+		self._threshold = self._min_val + t_frac * (self._max_val - self._min_val)
+		self.update()
+		self.thresholdChanged.emit(self._threshold)
 
 
 # ---------------------------------------------------------------------------
