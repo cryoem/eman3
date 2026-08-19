@@ -620,8 +620,8 @@ class DataNode(SceneNode):
 		self._extract_volume(idx)
 		self._rebuild_bbox()
 		for child in self._children:
-			if isinstance(child, (IsoSurfaceNode, VolumeSliceNode)):
-				if isinstance(child, IsoSurfaceNode):
+			if isinstance(child, (IsoSurfaceNode, VolumeSliceNode, VolumeRenderNode)):
+				if isinstance(child, IsoSurfaceNode) or isinstance(child, VolumeRenderNode):
 					child._rebuild_volume()
 				else:
 					child._rebuild_slice()
@@ -637,10 +637,10 @@ class DataNode(SceneNode):
 			self.load_from_file(filepath)
 			# Update the filename box
 			self._filename_box.setValue(self._filename, quiet=1)
-			# Notify any isosurface children to rebuild
+			# Notify any volume children to rebuild
 			for child in self._children:
-				if isinstance(child, (IsoSurfaceNode, VolumeSliceNode)):
-					if isinstance(child, IsoSurfaceNode):
+				if isinstance(child, (IsoSurfaceNode, VolumeSliceNode, VolumeRenderNode)):
+					if isinstance(child, IsoSurfaceNode) or isinstance(child, VolumeRenderNode):
 						child._rebuild_volume()
 					else:
 						child._rebuild_slice()
@@ -751,6 +751,101 @@ class IsoSurfaceNode(ShapeNode):
 			tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
 			if tgt:
 				tgt._request_render()
+
+
+class VolumeRenderNode(ShapeNode):
+	"""Direct volume rendering from parent DataNode using VolumeRayMaterial."""
+	def __init__(self, *args, opacity=0.5, clim=None, **kwargs):
+		self._opacity = float(opacity)
+		self._clim = tuple(clim) if clim is not None else None
+		super().__init__(*args, **kwargs)
+
+	def _get_data(self):
+		node = self._parent
+		while node is not None:
+			if isinstance(node, DataNode) and node._data is not None:
+				return node._data
+			node = node._parent
+		return None
+
+	def _make_color_map(self):
+		"""Create a grayscale 1D colormap for volume rendering."""
+		stops = np.linspace(0, 1, 256)
+		ramp = np.column_stack([stops, stops, stops, np.ones_like(stops)])
+		return gfx.Texture(ramp.astype(np.float32), dim=1)
+
+	def _rebuild_volume(self):
+		data = self._get_data()
+		if data is None or not self._gfx_node:
+			return
+		for child in list(self._gfx_node.children):
+			if isinstance(child, gfx.Volume):
+				self._gfx_node.remove(child)
+		d, h, w = data.shape
+		# Initialize clim from data range if not already set
+		if self._clim is None:
+			self._clim = (float(data.min()), float(data.max()))
+		mat = gfx.VolumeRayMaterial(
+			opacity=self._opacity,
+			clim=self._clim,
+			map=self._make_color_map()
+		)
+		geo = gfx.Geometry(grid=gfx.Texture(data[..., np.newaxis], dim=3))
+		vol = gfx.Volume(geo, mat)
+		vol.local.position = (-w / 2.0, -h / 2.0, -d / 2.0)
+		self._gfx_node.add(vol)
+
+	def set_opacity(self, v):
+		self._opacity = float(v)
+		for child in self._gfx_node.children if self._gfx_node else []:
+			if isinstance(child, gfx.Volume) and hasattr(child.material, 'opacity'):
+				child.material.opacity = self._opacity
+				break
+
+	def set_clim(self, low, high):
+		self._clim = (float(low), float(high))
+		for child in self._gfx_node.children if self._gfx_node else []:
+			if isinstance(child, gfx.Volume) and hasattr(child.material, 'clim'):
+				child.material.clim = self._clim
+				break
+
+	def inspector_controls(self, parent):
+		controls = []
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		data = self._get_data()
+		if data is not None:
+			hr_min, hr_max = float(data.min()), float(data.max())
+		else:
+			hr_min, hr_max = 0.0, 1.0
+		op_sl = ValSlider(parent, (0.0, 1.0), "Opacity:", value=self._opacity)
+		op_sl.valueChanged.connect(lambda v: self._on_prop_changed('opacity', v, tgt))
+		controls.append(("Opacity", op_sl))
+		cl_low = self._clim[0] if self._clim is not None else hr_min
+		cl_high = self._clim[1] if self._clim is not None else hr_max
+		lo_sl = ValSlider(parent, (hr_min, hr_max), "ClimMin:", value=cl_low)
+		lo_sl.valueChanged.connect(lambda v: self._on_clim_changed('min', v, tgt))
+		controls.append(("Clim Min", lo_sl))
+		hi_sl = ValSlider(parent, (hr_min, hr_max), "ClimMax:", value=cl_high)
+		hi_sl.valueChanged.connect(lambda v: self._on_clim_changed('max', v, tgt))
+		controls.append(("Clim Max", hi_sl))
+		return controls
+
+	def _on_prop_changed(self, prop, v, tgt):
+		if prop == 'opacity':
+			self.set_opacity(v)
+		if tgt:
+			tgt._request_render()
+
+	def _on_clim_changed(self, which, v, tgt):
+		if which == 'min':
+			new_low = float(v)
+			new_high = self._clim[1] if self._clim is not None else 1.0
+		else:
+			new_low = self._clim[0] if self._clim is not None else 0.0
+			new_high = float(v)
+		self.set_clim(new_low, new_high)
+		if tgt:
+			tgt._request_render()
 
 
 class VolumeSliceNode(ShapeNode):
@@ -1365,6 +1460,19 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		self._request_render()
 		return node
 
+	def add_volume_render(self, name=None, opacity=0.5, parent=None):
+		"""Add a VolumeRenderNode for direct volume rendering from parent DataNode."""
+		if parent is None:
+			parent = self._selected_node
+		label = name or SceneNode.next_name("VolRender")
+		node = VolumeRenderNode(name=label, opacity=opacity, parent=parent)
+		group = gfx.Group()
+		node._gfx_node = group
+		node._rebuild_volume()
+		self._root_group.add(group)
+		self._request_render()
+		return node
+
 	# -- Node management --
 
 	def get_scene_root(self):
@@ -1877,6 +1985,14 @@ class EMScene3DInspector(QtWidgets.QWidget):
 					node = tgt.add_cone(name=node_name, position=pos, scale=scl, color=col, parent=parent_node)
 				elif shape_type == "Arrow":
 					node = tgt.add_arrow(name=node_name, position=pos, scale=scl, color=col, parent=parent_node)
+				elif shape_type == "Data":
+					node = tgt.add_data(name=node_name, parent=parent_node)
+				elif shape_type == "IsoSurface":
+					node = tgt.add_isosurface(name=node_name, parent=parent_node)
+				elif shape_type == "Slice":
+					node = tgt.add_slice(name=node_name, parent=parent_node)
+				elif shape_type == "VolumeRender":
+					node = tgt.add_volume_render(name=node_name, parent=parent_node)
 
 				if node:
 					self.update_tree()
@@ -2245,7 +2361,7 @@ class AddNodeDialog(QtWidgets.QDialog):
 		fvbox.addWidget(label)
 
 		self.type_combo = QtWidgets.QComboBox()
-		self.type_combo.addItems(["Cube", "Sphere", "Cylinder", "Cone", "Arrow"])
+		self.type_combo.addItems(["Cube", "Sphere", "Cylinder", "Cone", "Arrow", "Data", "IsoSurface", "Slice", "VolumeRender"])
 		fvbox.addWidget(self.type_combo)
 
 		name_label = QtWidgets.QLabel("Name:")
