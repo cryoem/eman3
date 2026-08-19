@@ -620,8 +620,11 @@ class DataNode(SceneNode):
 		self._extract_volume(idx)
 		self._rebuild_bbox()
 		for child in self._children:
-			if isinstance(child, IsoSurfaceNode):
-				child._rebuild_volume()
+			if isinstance(child, (IsoSurfaceNode, VolumeSliceNode)):
+				if isinstance(child, IsoSurfaceNode):
+					child._rebuild_volume()
+				else:
+					child._rebuild_slice()
 		if tgt:
 			tgt._request_render()
 
@@ -636,8 +639,11 @@ class DataNode(SceneNode):
 			self._filename_box.setValue(self._filename, quiet=1)
 			# Notify any isosurface children to rebuild
 			for child in self._children:
-				if isinstance(child, IsoSurfaceNode):
-					child._rebuild_volume()
+				if isinstance(child, (IsoSurfaceNode, VolumeSliceNode)):
+					if isinstance(child, IsoSurfaceNode):
+						child._rebuild_volume()
+					else:
+						child._rebuild_slice()
 			if tgt:
 				tgt._request_render()
 
@@ -742,6 +748,122 @@ class IsoSurfaceNode(ShapeNode):
 				new_color.green() / 255.0,
 				new_color.blue() / 255.0)
 			self._rebuild_volume()
+			tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+			if tgt:
+				tgt._request_render()
+
+
+class VolumeSliceNode(ShapeNode):
+	"""Volume slice rendered from parent DataNode using VolumeSliceMaterial."""
+	def __init__(self, *args, offset=0.0, color=(1.0, 1.0, 1.0), **kwargs):
+		self._offset = float(offset)
+		self._color = color
+		super().__init__(*args, **kwargs)
+
+	def _get_data(self):
+		node = self._parent
+		while node is not None:
+			if isinstance(node, DataNode) and node._data is not None:
+				return node._data
+			node = node._parent
+		return None
+
+	def _make_color_map(self):
+		c = gfx.Color((self._color[0], self._color[1], self._color[2]))
+		color_data = np.array([[c.r, c.g, c.b, c.a]], dtype=np.float32)
+		return gfx.Texture(color_data, dim=1)
+
+	def _compute_plane_normal(self):
+		"""Compute the slice plane normal from Euler angles in data/grid space."""
+		az, alt, phi = self._rotation
+		t = EMANTransform()
+		t.set_rotation({'type': 'eman', 'az': az, 'alt': alt, 'phi': phi})
+		rot_mat = t.get_matrix()[:3, :3]
+		normal = rot_mat @ np.array([0, 0, 1], dtype=np.float32)
+		norm = float(np.linalg.norm(normal))
+		if norm < 1e-6:
+			normal = np.array([0, 0, 1], dtype=np.float32)
+		else:
+			normal /= norm
+		return normal
+
+	def _rebuild_slice(self):
+		data = self._get_data()
+		if data is None or not self._gfx_node:
+			return
+		for child in list(self._gfx_node.children):
+			if isinstance(child, gfx.Volume):
+				self._gfx_node.remove(child)
+		d, h, w = data.shape
+		clim = (float(data.min()), float(data.max()))
+		normal = self._compute_plane_normal()
+		a, b, c = normal[0], normal[1], normal[2]
+		dd = -self._offset
+		mat = gfx.VolumeSliceMaterial(
+			clim=clim,
+			plane=(a, b, c, dd),
+			map=gfx.Texture(np.array([[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]], dtype=np.float32), dim=1)
+		)
+		geo = gfx.Geometry(grid=gfx.Texture(data[..., np.newaxis], dim=3))
+		vol = gfx.Volume(geo, mat)
+		vol.local.position = (-w / 2.0, -h / 2.0, -d / 2.0)
+		self._gfx_node.add(vol)
+
+	def _apply_transform(self):
+		"""For slices, only apply position+scale to gfx node; rotation drives plane."""
+		if not self._gfx_node:
+			return
+		pos = np.array(self._position)
+		scale = self._scale[0]
+		matrix = np.eye(4) * scale
+		matrix[3, 3] = 1.0
+		matrix[0, 3], matrix[1, 3], matrix[2, 3] = pos
+		self._gfx_node.local.matrix = matrix
+		self._rebuild_slice()
+
+	def set_offset(self, v):
+		"""Set slice offset along the plane normal."""
+		self._offset = float(v)
+		for child in self._gfx_node.children if self._gfx_node else []:
+			if isinstance(child, gfx.Volume) and hasattr(child.material,
+				'plane'):
+				normal = self._compute_plane_normal()
+				a, b, cc = normal[0], normal[1], normal[2]
+				child.material.plane = (a, b, cc, -self._offset)
+
+	def inspector_controls(self, parent):
+		controls = []
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		data = self._get_data()
+		if data is not None:
+			hr_min, hr_max = float(data.min()), float(data.max())
+		else:
+			hr_min, hr_max = 0.0, 1.0
+		sr = ValSlider(parent, (hr_min, hr_max), "Offset", value=self._offset)
+		sr.valueChanged.connect(lambda v: self._on_offset_changed(v, tgt))
+		controls.append(("Offset", sr))
+		well = QtWidgets.QPushButton()
+		well.setFixedSize(40, 30)
+		r, g, b = int(self._color[0]*255), int(self._color[1]*255), int(self._color[2]*255)
+		well.setStyleSheet("background-color: rgb(%d,%d,%d); border: 1px solid #555;" % (r, g, b))
+		well.clicked.connect(lambda: self._on_color_pick(parent))
+		controls.append(("Color", well))
+		return controls
+
+	def _on_offset_changed(self, v, tgt):
+		self.set_offset(v)
+		if tgt:
+			tgt._request_render()
+
+	def _on_color_pick(self, parent):
+		qcolor = QtGui.QColor(*[int(c * 255) for c in self._color[:3]])
+		new_color = QtWidgets.QColorDialog.getColor(qcolor, parent)
+		if new_color.isValid():
+			self._color = (
+				new_color.red() / 255.0,
+				new_color.green() / 255.0,
+				new_color.blue() / 255.0)
+			self._rebuild_slice()
 			tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
 			if tgt:
 				tgt._request_render()
@@ -1225,6 +1347,20 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		group = gfx.Group()
 		node._gfx_node = group
 		node._rebuild_volume()
+		self._root_group.add(group)
+		self._request_render()
+		return node
+
+	def add_slice(self, name=None, offset=0.0, color=(1.0, 1.0, 1.0), parent=None):
+		"""Add a VolumeSliceNode that renders a slice through parent DataNode."""
+		if parent is None:
+			parent = self._selected_node
+		label = name or SceneNode.next_name("Slice")
+		node = VolumeSliceNode(name=label, offset=offset,
+			color=color, parent=parent)
+		group = gfx.Group()
+		node._gfx_node = group
+		node._rebuild_slice()
 		self._root_group.add(group)
 		self._request_render()
 		return node

@@ -57,6 +57,10 @@ def main():
 	widget.add_isosurface(name="Iso_Low", threshold=0.2,
 		color=(0.2, 0.6, 1.0), parent=data_node)
 
+	# Add a volume slice through the data
+	widget.add_slice(name="Center_Slice", offset=0.0,
+		color=(0.8, 0.9, 0.4), parent=data_node)
+
 	widget.show()
 	print("Middle-click to show inspector.")
 	print("Left-drag to orbit, scroll to zoom, right-drag to pan.")
