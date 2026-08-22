@@ -503,10 +503,21 @@ class DataNode(SceneNode):
 				self._gfx_node.remove(child)
 		if not self._show_bbox:
 			return
-		geo = gfx.box_geometry(float(w), float(h), float(d))
-		mat = gfx.MeshStandardMaterial(color=(0.3, 0.6, 1.0), roughness=0.8,
-			metalness=0.0, wireframe=True)
-		bbox = gfx.Mesh(geo, mat)
+		# Build wireframe from 12 edges only (no face diagonals)
+		hw, hh, hd = float(w)/2, float(h)/2, float(d)/2
+		verts = [
+			(-hw,-hh,-hd), ( hw,-hh,-hd), ( hw, hh,-hd), (-hw, hh,-hd),
+			(-hw,-hh, hd), ( hw,-hh, hd), ( hw, hh, hd), (-hw, hh, hd),
+		]
+		edges = [
+			(0,1),(1,2),(2,3),(3,0),  # back face
+			(4,5),(5,6),(6,7),(7,4),  # front face
+			(0,4),(1,5),(2,6),(3,7),  # connecting edges
+		]
+		pos = np.array([verts[i] for e in edges for i in e], dtype=np.float32)
+		geo = gfx.Geometry(positions=pos)
+		mat = gfx.LineMaterial(color=(0.3, 0.6, 1.0))
+		bbox = gfx.Lines(geo, mat)
 		bbox._is_bbox = True
 		self._gfx_node.add(bbox)
 
@@ -751,6 +762,101 @@ class IsoSurfaceNode(ShapeNode):
 			tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
 			if tgt:
 				tgt._request_render()
+
+
+class ScatterPlotNode(ShapeNode):
+	"""3D scatter plot rendered as spheres from N×4 data (x,y,z,amplitude)."""
+	def __init__(self, *args, point_size=0.1, color_map="viridis", **kwargs):
+		self._data = None  # N×4 array
+		self._point_size = float(point_size)
+		self._color_map_name = color_map
+		super().__init__(*args, **kwargs)
+
+	def set_data(self, data):
+		"""Set scatter plot data. data should be Nx4 (x,y,z,amplitude)."""
+		if data is not None:
+			data = np.asarray(data, dtype=np.float32)
+			if data.ndim != 2 or data.shape[1] < 3:
+				raise ValueError("Scatter plot data must be Nx3 or Nx4")
+			if data.shape[1] == 3:
+				# Add unit amplitude column
+				data = np.column_stack([data, np.ones(len(data), dtype=np.float32)])
+			self._data = data
+		else:
+			self._data = None
+		self._rebuild()
+
+	def _amplitude_to_colors(self):
+		"""Map amplitude column to RGBA colors using a colormap."""
+		if self._data is None or len(self._data) == 0:
+			return np.zeros((0, 4), dtype=np.float32)
+		a = self._data[:, 3]
+		amin, amax = float(a.min()), float(a.max())
+		if amax - amin < 1e-9:
+			norm = np.zeros_like(a)
+		else:
+			norm = (a - amin) / (amax - amin)
+		# Try matplotlib colormap, fall back to viridis-like gradient
+		try:
+			from matplotlib import cm as mpl_cm
+			cmap_func = mpl_cm.get_cmap(self._color_map_name if self._color_map_name != "viridis" else "viridis")
+			colors = cmap_func(norm).astype(np.float32)
+		except Exception:
+			# Simple fallback: blue→cyan→yellow gradient
+			c1, c2, c3 = np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 1.0]), np.array([1.0, 1.0, 0.0])
+			colors_rgb = np.zeros((len(norm), 3), dtype=np.float32)
+			for i, v in enumerate(norm):
+				if v < 0.5:
+					t = v * 2.0
+					colors_rgb[i] = c1 + t * (c2 - c1)
+			else:
+				t = (v - 0.5) * 2.0
+				colors_rgb[i] = c2 + t * (c3 - c2)
+			colors = np.column_stack([colors_rgb, np.ones(len(norm), dtype=np.float32)])
+		if colors.shape[1] < 4:
+			colors = np.column_stack([colors, np.ones(len(colors), dtype=np.float32)])
+		return colors.astype(np.float32)
+
+	def _rebuild(self):
+		"""Rebuild the Points object."""
+		if not self._gfx_node:
+			return
+		for child in list(self._gfx_node.children):
+			self._gfx_node.remove(child)
+		if self._data is None or len(self._data) == 0:
+			return
+		pos = self._data[:, :3]
+		colors = self._amplitude_to_colors()
+		geo = gfx.Geometry(
+			positions=pos,
+			colors=colors
+		)
+		mat = gfx.PointsMaterial(size=self._point_size)
+		points = gfx.Points(geo, mat)
+		self._gfx_node.add(points)
+
+	def set_point_size(self, v):
+		self._point_size = float(v)
+		for child in self._gfx_node.children if self._gfx_node else []:
+			if isinstance(child, gfx.Points):
+				child.material.size = self._point_size
+				break
+
+	def inspector_controls(self, parent):
+		controls = []
+		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
+		ps = ValSlider(parent, (0.01, 2.0), "Point Size:", value=self._point_size)
+		ps.valueChanged.connect(lambda v: self._on_size_changed(v, tgt))
+		controls.append(("Point Size", ps))
+		# File info display
+		info = QtWidgets.QLabel("Points: %d" % len(self._data) if self._data is not None else "No data")
+		controls.append(("Info", info))
+		return controls
+
+	def _on_size_changed(self, v, tgt):
+		self.set_point_size(v)
+		if tgt:
+			tgt._request_render()
 
 
 class VolumeRenderNode(ShapeNode):
@@ -1473,6 +1579,20 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		self._request_render()
 		return node
 
+	def add_scatter_plot(self, name=None, data=None, point_size=0.1, parent=None):
+		"""Add a ScatterPlotNode for 3D scatter plot rendering."""
+		if parent is None:
+			parent = self._selected_node
+		label = name or SceneNode.next_name("Scatter")
+		node = ScatterPlotNode(name=label, point_size=point_size, parent=parent)
+		group = gfx.Group()
+		node._gfx_node = group
+		if data is not None:
+			node.set_data(data)
+		self._root_group.add(group)
+		self._request_render()
+		return node
+
 	# -- Node management --
 
 	def get_scene_root(self):
@@ -1993,6 +2113,8 @@ class EMScene3DInspector(QtWidgets.QWidget):
 					node = tgt.add_slice(name=node_name, parent=parent_node)
 				elif shape_type == "VolumeRender":
 					node = tgt.add_volume_render(name=node_name, parent=parent_node)
+				elif shape_type == "ScatterPlot":
+					node = tgt.add_scatter_plot(name=node_name, data=data.get("scatter_data"), parent=parent_node)
 
 				if node:
 					self.update_tree()
@@ -2361,7 +2483,7 @@ class AddNodeDialog(QtWidgets.QDialog):
 		fvbox.addWidget(label)
 
 		self.type_combo = QtWidgets.QComboBox()
-		self.type_combo.addItems(["Cube", "Sphere", "Cylinder", "Cone", "Arrow", "Data", "IsoSurface", "Slice", "VolumeRender"])
+		self.type_combo.addItems(["Cube", "Sphere", "Cylinder", "Cone", "Arrow", "Data", "IsoSurface", "Slice", "VolumeRender", "ScatterPlot"])
 		fvbox.addWidget(self.type_combo)
 
 		name_label = QtWidgets.QLabel("Name:")
@@ -2396,6 +2518,20 @@ class AddNodeDialog(QtWidgets.QDialog):
 		frame.setLayout(fvbox)
 		vbox.addWidget(frame)
 
+		# Scatter plot data file loader (shown only for ScatterPlot type)
+		self.scatter_frame = QtWidgets.QFrame()
+		self.scatter_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+		sf_layout = QtWidgets.QHBoxLayout(self.scatter_frame)
+		self.scatter_file_label = QtWidgets.QLabel("Data File:")
+		sf_layout.addWidget(self.scatter_file_label)
+		self.scatter_file_edit = QtWidgets.QLineEdit()
+		sf_layout.addWidget(self.scatter_file_edit)
+		self.scatter_file_btn = QtWidgets.QPushButton("...")
+		self.scatter_file_btn.setFixedWidth(30)
+		sf_layout.addWidget(self.scatter_file_btn)
+		self.scatter_frame.setVisible(False)
+		vbox.addWidget(self.scatter_frame)
+
 		btn_layout = QtWidgets.QHBoxLayout()
 		ok_btn = QtWidgets.QPushButton("Add")
 		cancel_btn = QtWidgets.QPushButton("Cancel")
@@ -2405,15 +2541,42 @@ class AddNodeDialog(QtWidgets.QDialog):
 
 		ok_btn.clicked.connect(self.accept)
 		cancel_btn.clicked.connect(self.reject)
+		self.type_combo.currentIndexChanged.connect(self._on_type_changed)
+
+		self.scatter_file_btn.clicked.connect(self._on_scatter_browse)
+
+	def _on_type_changed(self, idx):
+		"""Show/hide scatter file controls based on selected type."""
+		stype = self.type_combo.currentText()
+		self.scatter_frame.setVisible(stype == "ScatterPlot")
+
+	def _on_scatter_browse(self):
+		"""Open dialog to load scatter plot data file."""
+		filepath, _ = QtWidgets.QFileDialog.getOpenFileName(
+			None, "Load Scatter Data", "",
+			"Text Files (*.txt *.csv *.dat);;All Files (*)")
+		if filepath:
+			self.scatter_file_edit.setText(filepath)
 
 	def get_data(self):
-		return {
+		result = {
 			"type": self.type_combo.currentText(),
 			"name": self.name_edit.text() or None,
 			"position": (self.pos_x.value(), self.pos_y.value(), self.pos_z.value()),
 			"scale": self.scale_spin.value(),
 			"color": (0.8, 0.4, 0.2, 1.0),
 		}
+		# Load scatter data from file if ScatterPlot and file specified
+		if result["type"] == "ScatterPlot":
+			filepath = self.scatter_file_edit.text().strip()
+			result["scatter_data"] = None
+			if filepath:
+				try:
+					data = np.loadtxt(filepath)
+					result["scatter_data"] = data.astype(np.float32)
+				except Exception as e:
+					print(f"Error loading scatter file: {e}")
+		return result
 
 
 # ---------------------------------------------------------------------------
