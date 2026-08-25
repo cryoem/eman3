@@ -13,6 +13,218 @@ from EMAN3.gui.valslider import ValSlider, StringBox
 
 
 # ---------------------------------------------------------------------------
+# Custom Controller: EMAN-style Euler angle camera control
+# ---------------------------------------------------------------------------
+
+class EMANController(gfx.Controller):
+	"""Camera controller using EMAN-style Euler angles (az, alt, phi).
+
+	Recomputes camera position and orientation from scratch each frame to
+	avoid numerical instability (gimbal lock, up-vector divergence) that
+	affects spherical-coordinate-based controllers like OrbitController.
+
+	Controls:
+	    Left-drag  (top 90%): rotate Az (left/right) and Alt (up/down)
+	    Left-drag  (bottom 10%): rotate Phi (left/right)
+	    Right-drag: pan
+	    Wheel: zoom (adjust distance)
+	"""
+
+	def __init__(self, **kwargs):
+		super().__init__(**kwargs)
+		# Camera orientation in EMAN convention (degrees)
+		self._azimuth = 0.0     # rotation around world Z (compass direction)
+		self._altitude = 0.0    # elevation from XY plane
+		self._phi = 0.0         # roll around view axis
+		self._distance = 10.0   # camera-to-target distance
+		# Pan offset in local coordinates (fraction of viewport)
+		self._pan_x = 0.0
+		self._pan_y = 0.0
+		self._target = np.array([0.0, 0.0, 0.0])
+
+	@property
+	def target(self):
+		return self._target
+
+	@target.setter
+	def target(self, value):
+		self._target = np.asarray(value, dtype=np.float64)
+
+	def add_camera(self, camera, **kwargs):
+		super().add_camera(camera, **kwargs)
+		# Initialize angles from current camera position
+		pos = np.array(camera.world.position[:3], dtype=np.float64)
+		diff = pos - self._target
+		self._distance = max(np.linalg.norm(diff), 0.1)
+
+	def register_events(self, renderer, canvas=None):
+		self._renderer = renderer
+		# Use canvas events directly if provided, else try renderer
+		if canvas is not None:
+			canvas.add_event_handler(
+				self._on_mouse_down, "pointer_down"
+			)
+			canvas.add_event_handler(
+				self._on_mouse_move, "pointer_move"
+			)
+			canvas.add_event_handler(
+				self._on_mouse_up, "pointer_up"
+			)
+			canvas.add_event_handler(
+				self._on_wheel, "wheel"
+			)
+
+	# -- Mouse state --
+	def _on_mouse_down(self, event):
+		if isinstance(event, dict):
+			button = event.get("button", 0)
+		else:
+			button = getattr(event, "button", 0)
+		if button == 1:  # Left button (rendercanvas uses 1=left, 2=right)
+			self._drag_start = self._get_xy(event)
+			self._drag_mode = "rotate"
+		elif button == 2:  # Right button
+			self._drag_start = self._get_xy(event)
+			self._drag_mode = "pan"
+
+	def _on_mouse_move(self, event):
+		if not hasattr(self, '_drag_start'):
+			return
+		x, y = self._get_xy(event)
+		dx = x - self._drag_start[0]
+		dy = y - self._drag_start[1]
+
+		w, h = self._renderer.logical_size
+		if w == 0 or h == 0:
+			return
+
+		if self._drag_mode == "pan":
+			scale = self._distance * 0.002
+			self._pan_x -= dx * scale
+			self._pan_y += dy * scale
+		else:
+			if self._drag_start[1] > 0.9 * h:  # Bottom 10% = Phi
+				self._phi -= dx * 0.5
+			else:  # Top 90% = Az / Alt (pygfx uses +Y as UP)
+				# Horizontal drag → azimuth, vertical drag → altitude
+				self._azimuth -= dx * 0.4
+				self._altitude += dy * 0.4
+				self._altitude = max(-89.0, min(89.0, self._altitude))
+
+		self._drag_start = (x, y)
+		self._update_camera()
+
+	def _on_mouse_up(self, event):
+		if hasattr(self, '_drag_start'):
+			del self._drag_start
+
+	@staticmethod
+	def _get_xy(event):
+		"""Extract x,y coords from either dict or object events."""
+		if isinstance(event, dict):
+			return (event.get("x", 0), event.get("y", 0))
+		else:
+			return (getattr(event, "x", 0), getattr(event, "y", 0))
+
+	# -- Wheel zoom --
+	def _on_wheel(self, event):
+		if isinstance(event, dict):
+			delta = event.get("dy", 0)
+		else:
+			delta = getattr(event, "delta", None)
+			if delta is not None:
+				delta = delta[1]
+			else:
+				return
+		if delta > 0:
+			self._distance *= 1.05
+		else:
+			self._distance *= 0.95
+		self._distance = max(0.1, min(self._distance, 1000.0))
+		self._update_camera()
+
+	# -- Core: recompute camera from Euler angles + distance + pan --
+	def _update_camera(self):
+		for camera in self.cameras:
+			az_rad = math.radians(self._azimuth)
+			alt_rad = math.radians(self._altitude)
+			phi_rad = math.radians(self._phi)
+
+			# Standard OpenGL: camera at +Z looking along -Z
+			# Azimuth in XZ plane, Altitude elevation from XZ plane
+			x = math.sin(az_rad) * math.cos(alt_rad)
+			y = math.sin(alt_rad)
+			z = math.cos(az_rad) * math.cos(alt_rad)
+
+			target = self._target
+			pos = np.array([
+				target[0] + self._distance * x,
+				target[1] + self._distance * y,
+				target[2] + self._distance * z
+			])
+
+			# look_dir points from origin to camera; forward points from camera to target
+			look_dir = np.array([x, y, z])
+			forward = -look_dir / max(np.linalg.norm(look_dir), 1e-10)
+			# _compute_up_vector returns camera RIGHT at phi=0, which is what we want here
+			cam_right = self._compute_up_vector(az_rad, alt_rad, phi_rad)
+			norm_r = np.linalg.norm(cam_right)
+			if norm_r > 1e-10:
+				cam_right = cam_right / norm_r
+			# Recompute actual up to guarantee orthogonality: up = right × forward
+			cam_up = np.cross(cam_right, forward)
+
+			cam_matrix = np.eye(4)
+			cam_matrix[0:3, 0] = cam_right   # Camera X axis
+			cam_matrix[0:3, 1] = cam_up     # Camera Y axis
+			cam_matrix[0:3, 2] = -forward   # Camera Z (looking direction)
+			cam_matrix[0:3, 3] = pos
+
+			camera.world.matrix = cam_matrix
+
+
+	def _compute_up_vector(self, az_rad, alt_rad, phi_rad):
+		"""Compute the camera up vector from Euler angles including phi roll."""
+		# Look direction (same convention as _update_camera, camera at +Z)
+		look = np.array([
+			math.sin(az_rad) * math.cos(alt_rad),
+			math.sin(alt_rad),
+			math.cos(az_rad) * math.cos(alt_rad)
+		])
+
+		# Compute orthogonal right vector by crossing world-up (0,1,0) with look.
+		world_up = np.array([0.0, 1.0, 0.0])
+		cross_result = np.cross(world_up, look)
+		norm_cross = np.linalg.norm(cross_result)
+		# If look is nearly vertical (close to ±Y axis), use X axis instead
+		if norm_cross < 1e-4:
+			world_up = np.array([1.0, 0.0, 0.0])
+			cross_result = np.cross(look, world_up)
+			norm_cross = np.linalg.norm(cross_result)
+
+		up_before_phi = cross_result / max(norm_cross, 1e-10)
+
+		# Apply phi roll around look direction using Rodrigues formula
+		up = self._rodrigues(up_before_phi, look, phi_rad)
+		return up
+
+	@staticmethod
+	def _rodrigues(v, k, theta):
+		"""Rotate vector v around axis k by angle theta (Rodrigues formula)."""
+		k = k / max(np.linalg.norm(k), 1e-10)
+		c = math.cos(theta)
+		s = math.sin(theta)
+		return v * c + np.cross(k, v) * s + k * np.dot(k, v) * (1 - c)
+
+	def update(self):
+		"""Called each animation frame; not needed since we update on events."""
+		pass
+
+	def unregister_events(self, renderer):
+		super().unregister_events(renderer)
+
+
+# ---------------------------------------------------------------------------
 # Scene node hierarchy (simplified, no EMAN2 deps)
 # ---------------------------------------------------------------------------
 
@@ -514,12 +726,14 @@ class DataNode(SceneNode):
 			(4,5),(5,6),(6,7),(7,4),  # front face
 			(0,4),(1,5),(2,6),(3,7),  # connecting edges
 		]
-		pos = np.array([verts[i] for e in edges for i in e], dtype=np.float32)
-		geo = gfx.Geometry(positions=pos)
-		mat = gfx.LineMaterial(color=(0.3, 0.6, 1.0))
-		bbox = gfx.Lines(geo, mat)
-		bbox._is_bbox = True
-		self._gfx_node.add(bbox)
+		# Create one Line per edge to avoid inter-segment connections
+		for e in edges:
+			pos = np.array([verts[e[0]], verts[e[1]]], dtype=np.float32)
+			geo = gfx.Geometry(positions=pos)
+			mat = gfx.LineMaterial(color=(0.3, 0.6, 1.0))
+			edge_line = gfx.Line(geo, mat)
+			edge_line._is_bbox = True
+			self._gfx_node.add(edge_line)
 
 	def set_show_bbox(self, val):
 		self._show_bbox = bool(val)
@@ -1213,7 +1427,7 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		self._bg_color = (0.0, 0.0, 0.0, 1.0)
 		self._mouse_mode = "rotate"
 
-		self._orbit_controller = None
+		self._controller = None
 		self._camera = None
 		self._renderer = None
 		self._scene = None
@@ -1255,11 +1469,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			if w == 0:
 				w, h = 800, 600
 
-			# Camera
+			# Camera at (0, 0, +distance) looking along -Z toward origin
 			import numpy as np
 			self._camera = gfx.PerspectiveCamera(20)
-			self._camera.world.position = (0,0,10.0)
-			self._camera.look_at(np.array([0, 0, 0]))
+			self._camera.world.position = (0, 0, 10.0)
 
 			# Lighting for MeshStandardMaterial
 			self._ambient = 0.3
@@ -1275,10 +1488,12 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			# Camera-following directional light (headlight) for consistent viewer-direction illumination
 			self._dir_light = gfx.DirectionalLight(color=(1, 1, 1), intensity=0.6)
 
-			self._orbit_controller = gfx.OrbitController()
-			self._orbit_controller.target = (0, 0, 0)
-			self._orbit_controller.add_camera(self._camera)
-			self._orbit_controller.register_events(self._renderer)
+			self._controller = EMANController()
+			self._controller.target = np.array([0.0, 0.0, 0.0])
+			self._controller.add_camera(self._camera)
+			# Set initial camera from controller state (az=0, alt=0, phi=0) for consistency
+			self._controller._update_camera()
+			self._controller.register_events(self._renderer, self._canvas)
 
 			# Add camera to scene so renderer traverses it (required for parented lights)
 			self._scene.add(self._camera)
@@ -1704,9 +1919,9 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		self._request_render()
 
 	def _get_camera_distance(self):
-		"""Get camera distance from orbit target."""
+		"""Get camera distance from EMANController target."""
 		import numpy as np
-		oc = getattr(self, '_orbit_controller', None)
+		oc = getattr(self, '_controller', None)
 		if not oc:
 			return 3.0
 		target = np.array(oc.target)
@@ -1714,9 +1929,9 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		return float(np.linalg.norm(pos - target))
 
 	def _set_camera_distance(self, dist):
-		"""Set camera distance from orbit target by moving along look direction."""
+		"""Set camera distance from EMANController target by moving along look direction."""
 		import numpy as np
-		oc = getattr(self, '_orbit_controller', None)
+		oc = getattr(self, '_controller', None)
 		if not oc:
 			return
 		target = np.array(oc.target)
@@ -1730,7 +1945,7 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		self._request_render()
 
 	def _sync_camera_to_inspector(self):
-		"""Sync inspector camera sliders from current orbit controller state."""
+		"""Sync inspector camera sliders from current controller state."""
 		if self._inspector:
 			try:
 				self._inspector.dist_slider.setValue(self._get_camera_distance(), quiet=1)
@@ -1767,14 +1982,6 @@ class EMScene3DWidget(QtWidgets.QWidget):
 
 	def set_mouse_mode(self, mode):
 		self._mouse_mode = mode
-		# Configure orbit controller based on mode
-		if self._orbit_controller:
-			if mode == "rotate":
-				self._orbit_controller.rot_scale = 1.0
-			elif mode == "translate":
-				self._orbit_controller.pan_speed = 5.0
-			elif mode == "scale":
-				pass
 
 	def get_mouse_mode(self):
 		return self._mouse_mode
@@ -1844,8 +2051,8 @@ class EMScene3DInspector(QtWidgets.QWidget):
 		btn_layout.addWidget(self.remove_btn)
 		left_layout.addLayout(btn_layout)
 
-		# Mouse mode info (OrbitController handles rotation/panning natively)
-		info_label = QtWidgets.QLabel("Left-drag: Rotate | Right-drag: Pan | Scroll: Zoom")
+		# Mouse mode info (EMANController: Euler-angle based, no gimbal lock)
+		info_label = QtWidgets.QLabel("Left-drag: Rotate Az/Alt | Bottom 10%: Phi | Right-drag: Pan | Scroll: Zoom")
 		info_label.setStyleSheet("QLabel { color: gray; font-size: 9px; }")
 		left_layout.addWidget(info_label)
 
@@ -2600,8 +2807,8 @@ def main():
 
 	widget.show()
 	print("Middle-click to show inspector.")
-	print("Left-drag to orbit, scroll to zoom, right-drag to pan.")
-	print("Keys: R=Rotate, T=Translate, S=Scale, Esc=Select, Del=Delete selected")
+	print("Left-drag: Rotate Az/Alt | Bottom 10%: Phi | Right-drag: Pan | Scroll: Zoom")
+	print("Keys: Del=Delete selected")
 	sys.exit(app.exec())
 
 
