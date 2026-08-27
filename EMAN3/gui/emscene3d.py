@@ -1032,37 +1032,64 @@ class ScatterPlotNode(ShapeNode):
 		return colors.astype(np.float32)
 
 	def _rebuild(self):
-		"""Rebuild the Points object."""
+		"""Rebuild as instanced spheres."""
 		if not self._gfx_node:
 			return
 		for child in list(self._gfx_node.children):
 			self._gfx_node.remove(child)
 		if self._data is None or len(self._data) == 0:
 			return
+
+		n = len(self._data)
 		pos = self._data[:, :3]
-		colors = self._amplitude_to_colors()
-		geo = gfx.Geometry(
-			positions=pos,
-			colors=colors
-		)
-		mat = gfx.PointsMaterial(size=self._point_size)
-		points = gfx.Points(geo, mat)
-		self._gfx_node.add(points)
+
+		# Low-poly sphere geometry shared across instances
+		geo = gfx.sphere_geometry(1.0, width_segments=8, height_segments=6)
+
+		# Per-instance: Nx4x4 matrices with scale + translation
+		s = self._point_size
+		inst_matrices = np.tile(np.eye(4, dtype=np.float32), (n, 1, 1))
+		inst_matrices[:, 0, 0] = s
+		inst_matrices[:, 1, 1] = s
+		inst_matrices[:, 2, 2] = s
+		inst_matrices[:, :3, 3] = pos.astype(np.float32)
+
+		mat = gfx.MeshStandardMaterial(color=(0.7, 0.7, 0.85))
+		mesh = gfx.InstancedMesh(geo, mat, n)
+		mesh.instance_matrix = inst_matrices.reshape(-1, 4, 4)
+		self._gfx_node.add(mesh)
+		self._scatter_mesh = mesh  # Keep reference for updates
 
 	def set_point_size(self, v):
 		self._point_size = float(v)
-		for child in self._gfx_node.children if self._gfx_node else []:
-			if isinstance(child, gfx.Points):
-				child.material.size = self._point_size
-				break
+		# Update existing mesh instead of rebuilding
+		if hasattr(self, '_scatter_mesh') and self._scatter_mesh:
+			self._update_instance_scale()
+		else:
+			self._rebuild()
+
+	def _update_instance_scale(self):
+		"""Update the scale in the existing instance matrices."""
+		if self._data is None or len(self._data) == 0:
+			return
+		n = len(self._data)
+		pos = self._data[:, :3]
+		s = self._point_size
+		# Update each instance matrix
+		for i in range(n):
+			mat = np.eye(4, dtype=np.float32)
+			mat[0, 0] = s
+			mat[1, 1] = s
+			mat[2, 2] = s
+			mat[:3, 3] = pos[i]
+			self._scatter_mesh.set_matrix_at(i, mat)
 
 	def inspector_controls(self, parent):
 		controls = []
 		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
-		ps = ValSlider(parent, (0.01, 2.0), "Point Size:", value=self._point_size)
+		ps = ValSlider(parent, (0.01, 2.0), "Radius:", value=self._point_size)
 		ps.valueChanged.connect(lambda v: self._on_size_changed(v, tgt))
-		controls.append(("Point Size", ps))
-		# File info display
+		controls.append(("Radius", ps))
 		info = QtWidgets.QLabel("Points: %d" % len(self._data) if self._data is not None else "No data")
 		controls.append(("Info", info))
 		return controls
