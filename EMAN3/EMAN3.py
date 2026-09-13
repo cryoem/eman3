@@ -42,7 +42,7 @@ import pickle
 import zlib
 import socket
 import subprocess
-import EMAN3.EMAN3jsondb
+import EMAN3.EMAN3jsondb as EMAN3jsondb
 from EMAN3.EMAN3jsondb import JSDict,js_open_dict,js_close_dict,js_remove_dict,js_list_dicts,js_check_dict,js_one_key
 from EMAN3.transform import Transform
 import argparse, copy
@@ -607,7 +607,12 @@ class EMArgumentParser(argparse.ArgumentParser):
 
 #	# FIXME - this function is no longer necessary since I overwrite the Symmetry3D::get function (on the c side). d.woolford
 def parsesym(optstr):
-	return Symmetries.get(optstr)
+	"""Parse a symmetry string (c<n>, d<n>, h<n>, tet, oct, icos, icos2) and return the corresponding Symmetry3D object"""
+	from EMAN3.transform import get_symmetry
+	s=optstr.lower().strip()
+	if s[0] in "cdh":
+		return get_symmetry(s[0], nsym=int(s[1:]))
+	return get_symmetry(s)
 
 parseparmobj1=re.compile(r"([^\(]*)\(([^\)]*)\)")	# This parses test(n=v,n2=v2) into ("test","n=v,n2=v2")
 parseparmobj2=re.compile(r"([^=,]*)=([^,]*)")		# This parses "n=v,n2=v2" into [("n","v"),("n2","v2")]
@@ -1111,10 +1116,10 @@ def memory_stats():
 			a = f.readlines()
 			mt = a[0].split()
 			if mt[0] == "MemTotal:":
-				mem_total = old_div(float(mt[1]),1000000.0)
+				mem_total = float(mt[1])/1000000.0
 			ma = a[1].split()
 			if ma[0] == "MemFree:":
-				mem_avail = old_div(float(ma[1]),1000000.0)
+				mem_avail = float(ma[1])/1000000.0
 		except:
 			pass
 
@@ -1127,7 +1132,7 @@ def memory_stats():
 			total_len = len("hw.memsize")
 			if total_strings[0][:total_len] == "hw.memsize":
 				try:
-					mem_total = old_div(float(total_strings[1]),1000000000.0) # on Mac the output value is in bytes, not kilobytes (as in Linux)
+					mem_total = float(total_strings[1])/1000000000.0 # on Mac the output value is in bytes, not kilobytes (as in Linux)
 				except:pass # mem_total is just -1
 
 		used_strings = output_used.split()
@@ -1136,7 +1141,7 @@ def memory_stats():
 			used_len = len("hw.usermem")
 			if used_strings[0][:used_len] == "hw.usermem":
 				try:
-					mem_used = old_div(float(used_strings[1]),1000000000.0) # on Mac the output value is in bytes, not kilobytes (as in Linux)
+					mem_used = float(used_strings[1])/1000000000.0 # on Mac the output value is in bytes, not kilobytes (as in Linux)
 				except:pass # mem_used is just -1
 
 		if mem_used != -1 and mem_total != -1:
@@ -1152,6 +1157,13 @@ def free_space(p=os.getcwd()):
 	'''
 	s = os.statvfs(p)
 	return s.f_bsize*s.f_bavail
+
+def get_platform():
+	'''
+	Platform-independent name of the OS, one of "Linux", "Windows" or "Darwin"
+	'''
+	import platform
+	return platform.system()
 
 def num_cpus():
 	'''
@@ -1222,11 +1234,11 @@ def timestamp_diff(t1,t2):
 def difftime(secs):
 	"""Returns a string representation of a time difference in seconds as a Dd hh:mm:ss style string"""
 
-	d=int(floor(old_div(secs,86400)))
+	d=int(secs/86400)
 	secs-=d*86400
-	h=int(floor(old_div(secs,3600)))
+	h=int(secs/3600)
 	secs-=h*3600
-	m=int(floor(old_div(secs,60)))
+	m=int(secs/60)
 	secs=int(secs-m*60)
 
 	if d>0 : return "%dd %2d:%02d:%02d"%(d,h,m,secs)
@@ -1393,11 +1405,8 @@ if the lst file does not exist. If set, parent specifies the name of another .ls
 differing only in metadata. This permits sharing cache files. Do not specify both comments and parent, or parent will be lost"""
 
 		self.path=path
-		if len(comments)==0:
-			if len(parent)==0:
-				comments="# This file is in fast LST format. All lines after the next line have exactly the number of characters shown on the next line. This MUST be preserved if editing."
-			else:
-				comments=f"# parent={parent} # This file is in fast LST format. All lines after the next line must have identical character count."
+		if comments is None or len(comments)==0: comments="# This file is in fast LST format. All lines after the next line must have identical character count."
+		if len(parent)!=0: comments=f"# parent={parent} {comments}"
 
 		self.ptr=None
 		if os.path.isfile(path):
@@ -1408,7 +1417,7 @@ differing only in metadata. This permits sharing cache files. Do not specify bot
 			try: os.makedirs(os.path.dirname(path))
 			except: pass
 			self.ptr=open(path,"w+")	# file doesn't exist
-			self.ptr.write("#LSX\n{}\n# 20\n".format(comments))
+			self.ptr.write(f"#LSX\n{comments}\n# 20\n")
 			self.ptr.flush()
 
 		self.ptr.seek(0)
@@ -1453,7 +1462,7 @@ differing only in metadata. This permits sharing cache files. Do not specify bot
 
 			else: raise Exception("ERROR: The file {} is not in #LSX format".format(self.path))
 		self.filecomment=self.ptr.readline().strip()
-		if "parent=" in self.filecomment: self.parent=self.filecomment.split("parent=")[1].split("#")[0]
+		if "parent=" in self.filecomment: self.parent=self.filecomment.split("parent=")[1].split("#")[0].strip()
 		else: self.parent=None
 
 		try: self.linelen=int(self.ptr.readline()[1:])

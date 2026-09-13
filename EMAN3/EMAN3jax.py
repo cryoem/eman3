@@ -62,7 +62,8 @@ np.fromfunction(lambda x,y: np.hypot(x,y),(nx,ny)) - for example
 from EMAN3.transform import Transform
 from EMAN3.ctf import EMAN2Ctf
 from EMAN3.io.imageio import ImageIO
-from EMAN3.EMAN3 import LSXFile
+from EMAN3.EMAN3 import LSXFile, cache_path, print_progress, error_exit, parsesym, good_size
+from math import pi, sin, cos, asin, ceil
 import os
 import numpy as np
 import jax
@@ -134,9 +135,13 @@ class StackCache():
 			else: io+=(nx//2+1)*nx*nx*8*len(lsx)
 
 		# exists but out of date, so recreate
-		if (os.path.exists(self.cachefname) and os.stat(self.cachefname).st_ctime < os.stat(self.source).st_ctime) or not os.path.exists(self.cachefname) :
+		cache_final=self.cachefname
+		if (os.path.exists(cache_final) and os.stat(cache_final).st_ctime < os.stat(self.datasource).st_ctime) or not os.path.exists(cache_final) :
 			mode="w+"
 			needswrite=True
+			# build into a temp file and rename atomically on completion, so a failed
+			# build never leaves a partial file behind that looks like a valid cache
+			self.cachefname=cache_final+".tmp"
 		else:
 			mode="r+"
 			needswrite=False
@@ -147,6 +152,7 @@ class StackCache():
 
 		# actual caching. This may take some time
 		if needswrite:
+			print(f"Cache not found. Creating: {self.cachefname}")
 			chunk=1000000000//(hdr["nx"]*hdr["ny"]*hdr["nz"]*4)		# read data in 1GB chunks
 			tlast=0
 			for i in range(0,len(lsx),chunk):
@@ -170,6 +176,8 @@ class StackCache():
 					self._images[size][i:end,:,:]=stkfds
 			for s in self._images: self._images[s].flush()		# close() may not work. This ensures write to disk
 			self._meta.flush()
+			os.replace(self.cachefname,cache_final)
+			self.cachefname=cache_final
 
 		# read selected metadata at init. Not stored in the cache
 		self._meta=self._meta.copy()	# we copy the memory mapped file to RAM, then overwrite specific values
@@ -217,7 +225,7 @@ class StackCache():
 			data=EMStack2D(self._images[size][nlist,:,:].copy())
 			meta=self._meta[nlist,:]
 		else:
-			data=EMStack3d(self._images[size][nlist,:,:,:].copy())
+			data=EMStack3D(self._images[size][nlist,:,:,:].copy())
 			meta=self._meta[nlist,:]
 
 		data.set_cache(meta,self.apix*self.sizeorig/size,self.voltage,self.cs)
@@ -233,7 +241,7 @@ class EMStack():
 	Individual images in the stack may be accessed using [n]
 	"""
 
-	def __init__(self,imgs=None,parent=None):
+	def __init__(self,imgs=None,parent=None,headers=None):
 		"""	imgs - one of:
 		None
 		filename (reads all images via ImageIO)
@@ -247,7 +255,7 @@ class EMStack():
 		self.cs=None
 		self.is_phase_flipped=None
 
-		self.set_data(imgs, parent=parent)
+		self.set_data(imgs,parent=parent,headers=headers) if headers is not None else self.set_data(imgs,parent=parent)
 
 	def set_data(self, imgs, parent=None):
 		raise Exception("EMStack should not be used directly, please use EMStack3D or EMStack2D")
@@ -821,7 +829,7 @@ class EMAN3Ctf():
 	def get_phase(self):
 		"""Returns the phase shift based on the percent amplitude contrast"""
 		if self.ampcont>-100.0 and self.ampcont<=100.0: return asin(self.ampcont/100)
-		elif ampcont>100: return pi-asin(2-self.ampcont/100)
+		elif self.ampcont>100: return pi-asin(2-self.ampcont/100)
 		else: return -pi-asin(-2-self.ampcont/100)
 
 	def set_phase(self, phase):
@@ -967,8 +975,8 @@ class Orientations():
 
 	def init_symmetry(self,sym="c1"):
 		"""Replaces current orientations with those necessary to symmetrize a volume or set of points. No translation,
-	so will not work for helical symmetries"""
-		s=Symmetries.get(sym)
+		so will not work for helical symmetries"""
+		s=parsesym(sym)
 		self._data=np.zeros((s.get_nsym(),3))
 		for i in range(s.get_nsym()):
 			r=s.get_sym(i).get_rotation("spinvec")

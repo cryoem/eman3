@@ -430,6 +430,29 @@ class Transform:
                     alt = 180.0 - alt
                 phi = np.arctan2(x_mirror_scale * self.matrix[0, 2], self.matrix[1, 2]) * 180.0 / np.pi
             result['az'], result['alt'], result['phi'] = float(az), float(alt), float(phi)
+        elif euler_type == 'spinvec':
+            # Inverse of _set_rotation_spinvec (verified: Transform from the extracted
+            # spinvec reproduces the same rotation matrix as the original)
+            R = self.matrix[:, :3] / scale
+            ctheta = float(np.clip((R[0, 0] + R[1, 1] + R[2, 2] - 1.0) / 2.0, -1.0, 1.0))
+            theta = float(np.arccos(ctheta))
+            if theta < 1e-6:
+                v1 = v2 = v3 = 0.0
+            elif abs(ctheta + 1.0) < 1e-6:
+                # 180 degree rotation: axis from the symmetric (diagonal) part
+                n = np.zeros(3)
+                i = int(np.argmax(np.diag(R) + 1.0))
+                n[i] = np.sqrt((R[i, i] + 1.0) / 2.0)
+                for j in range(3):
+                    if j != i: n[j] = R[i, j] / (2.0 * n[i])
+                v1, v2, v3 = n * theta / (2.0 * np.pi)
+            else:
+                A = np.array([
+                    (R[1, 2] - R[2, 1]) / 2.0,
+                    (R[2, 0] - R[0, 2]) / 2.0,
+                    (R[0, 1] - R[1, 0]) / 2.0])
+                v1, v2, v3 = (A / np.sin(theta)) * theta / (2.0 * np.pi)
+            result['v1'], result['v2'], result['v3'] = float(v1), float(v2), float(v3)
         elif euler_type == 'spider':
             az = np.arctan2(scale * self.matrix[2, 0], -scale * self.matrix[2, 1]) * 180.0 / np.pi
             alt = np.arctan2(np.sqrt(self.matrix[2, 0]**2 + self.matrix[2, 1]**2), abs(self.matrix[2, 2])) * 180.0 / np.pi
@@ -450,6 +473,24 @@ class Transform:
             n3 = A2 / sinomega if sinomega > 1e-10 else 0
             result['e0'], result['e1'], result['e2'], result['e3'] = float(cosOover2), float(sinOover2 * n1), float(sinOover2 * n2), float(sinOover2 * n3)
         return result
+
+    def get_params(self, euler_type: str = 'eman') -> Dict:
+        """Get the full transform parameters in the given rotation convention.
+        Returns a dictionary of rotation parameters, plus translations, scale and
+        mirror when non-identity. Inverse of set_params()."""
+        params = self.get_rotation(euler_type)
+        trans = self.get_trans()
+        if abs(float(trans[0])) > self.ERR_LIMIT: params['tx'] = float(trans[0])
+        if abs(float(trans[1])) > self.ERR_LIMIT: params['ty'] = float(trans[1])
+        if abs(float(trans[2])) > self.ERR_LIMIT: params['tz'] = float(trans[2])
+        scale = self.get_scale()
+        if abs(scale - 1.0) > self.ERR_LIMIT: params['scale'] = scale
+        if self.get_mirror(): params['mirror'] = True
+        return params
+
+    def to_jsondict(self) -> Dict:
+        """JSON-serializable representation, reconstructed by EMAN3jsondb.transform_from_jsondict"""
+        return {"__class__": "Transform", "matrix": self.get_matrix().ravel().tolist()}
     
     @staticmethod
     def icos_5_to_2() -> 'Transform':
@@ -516,6 +557,10 @@ class Symmetry3D:
     
     def get_sym(self, n: int) -> Transform:
         raise NotImplementedError
+    
+    def get_syms(self) -> List[Transform]:
+        """Return a list of all the symmetry Transforms"""
+        return [self.get_sym(i) for i in range(self.get_nsym())]
     
     def get_delimiters(self, inc_mirror: bool = False) -> Dict:
         raise NotImplementedError

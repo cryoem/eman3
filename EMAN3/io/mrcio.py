@@ -994,6 +994,9 @@ class MrcIO:
 		self._h["mode"] = mode
 		self.mode_size = _get_mode_size(mode)
 
+		# remember user header fields (apix, origins, ...) for the (re)build in write_data
+		self._user_meta = dict(meta)
+
 		if index == -1:
 			if self.is_stack:
 				if self._is_new_file:
@@ -1008,7 +1011,7 @@ class MrcIO:
 
 		# For non-stack MRCs, build placeholder header now (will be updated with stats in write_data)
 		if self._is_new_file and not self.is_stack:
-			self._build_and_write_header_with_data({
+			self._build_and_write_header_with_data({**self._user_meta,
 				"minimum": 0.0, "maximum": 0.0,
 				"mean": 0.0, "sigma": 0.0,
 			})
@@ -1109,6 +1112,7 @@ class MrcIO:
 		# Build header on first write; rewrite for stacks to keep nz in sync
 		if self._is_new_file or self.is_stack:
 			stats_meta = {
+				**getattr(self, "_user_meta", {}),
 				"minimum": float(out_data.min()),
 				"maximum": float(out_data.max()),
 				"mean": float(out_data.mean()),

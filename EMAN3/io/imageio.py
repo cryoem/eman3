@@ -118,6 +118,7 @@ def _get_io_class_map():
 		".pif":	   ("pifio", "PifIO"),
 		".eer":	   ("eerio", "EerIO"),
 		".spi":	   ("spiderio", "SpiderIO"),
+		".lst":	   ("lstio", "LstIO"),
 	}
 
 
@@ -140,6 +141,7 @@ def _get_all_io_classes():
 	detection fails.  More distinctive magic bytes come first.
 	"""
 	return [
+		("lstio", "LstIO"),		# LSX: #LSX magic text header
 		("hdfio2", "HdfIO2"),		# HDF5 magic: \x89HDF\r\n\x1a\n (very distinctive)
 		("jpegio", "JpegIO"),		# JPEG SOI: ff d8 ff
 		("pngio", "PngIO"),			# PNG signature: 89 50 4e 47 ...

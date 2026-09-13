@@ -815,12 +815,15 @@ performance than many individual changes."""
 			ret=self.data[key]
 			return ret
 
+		self.sync()
+		if key in self.delkeys and key not in self.changes and key not in self.data : raise KeyError(key)
+		if key in self.changes :
+			ret=self.changes[key]
+			return ret
+		if key in self.data :
+			ret=self.data[key]
+			return ret
 
-			self.sync()
-			if key in self.data : 
-				ret=self.data[key]
-				return ret
-			
 		raise KeyError(key)
 
 
