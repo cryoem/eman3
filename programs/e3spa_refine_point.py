@@ -388,7 +388,7 @@ def main():
 				point._data = optax.apply_updates(point._data, update)
 
 				if dbugvol is not None:
-					nyd=dbugvol.shape[0]
+					nyd=dbugvol.shape[1] # EMStack3D is shape N, Z, Y, X so need not to use shape[0]
 					if options.sym not in ("c1","C1","I","i"):
 						vol=EMStack3D(apply_symmetry(point.volume(nyd,zmax).numpy[0],sym)).do_fft().jax
 					else: vol=point.volume(nyd,zmax).do_fft().jax
@@ -648,7 +648,7 @@ def main():
 	nhdr={"apix_x":apix*nxraw/outsz,"apix_y":apix*nxraw/outsz,"apix_z":apix*nxraw/outsz}
 	if options.ptcl3d_id is not None : nhdr["ptcl3d_id"]=options.ptcl3d_id
 	write_volume(f"{options.path}/threed_{sn:02d}_unfilt.hdf",vol,nhdr)
-	if options.volfiltlp>0: vol=lowpass_gauss(vol,1.0/options.volfiltlp)
+	if options.volfiltlp>0: vol=lowpass_gauss(vol,(1.0/options.volfiltlp)*(apix*nxraw/outsz))
 	vol=normalize_edgemean(vol)
 	times.append(time.time())
 	write_volume(f"{options.path}/threed_{sn:02d}.hdf",vol,nhdr)

@@ -45,9 +45,12 @@ EMANVERSION="e3make3d_point (EMAN3)"
 def lowpass_gauss(vol,fc):
 	"""Gaussian lowpass filter in Fourier space. fc is the half-amplitude cutoff in cycles/pixel"""
 	nz,ny,nx=vol.shape
-	kz=np.fft.fftfreq(nz)*nz
-	ky=np.fft.fftfreq(ny)*ny
-	kx=np.fft.fftfreq(nx)*nx
+	# kz=np.fft.fftfreq(nz)*nz
+	kz=np.fft.fftfreq(nz)
+	# ky=np.fft.fftfreq(ny)*ny
+	ky=np.fft.fftfreq(ny)
+	# kx=np.fft.fftfreq(nx)*nx
+	kx=np.fft.fftfreq(nx)
 	KZ,KY,KX=np.meshgrid(kz,ky,kx,indexing="ij")
 	R=np.sqrt(KZ*KZ+KY*KY+KX*KX)
 	mult=np.exp(-2.0*np.log(2.0)*(R/fc)**2)
@@ -632,7 +635,7 @@ def main():
 	nhdr={"apix_x":apix*nxraw/outsz,"apix_y":apix*nxraw/outsz,"apix_z":apix*nxraw/outsz,"sym":options.sym}
 	if options.ptcl3d_id is not None : nhdr["ptcl3d_id"]=options.ptcl3d_id
 	write_volume(options.volout.replace(".hdf","_unfilt.hdf"),vol,nhdr)
-	if options.volfiltlp>0: vol=lowpass_gauss(vol,1.0/options.volfiltlp)
+	if options.volfiltlp>0: vol=lowpass_gauss(vol,(1.0/options.volfiltlp)*(apix*nxraw/outsz))
 	vol=normalize_edgemean(vol)
 	times.append(time.time())
 	write_volume(options.volout,vol,nhdr)
