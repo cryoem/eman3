@@ -596,7 +596,7 @@ class EMStack2D(EMStack):
 		"""returns an Orientations object and (normalized by ny) tytx array for the current images if available or None if not. If postxf is a Transform
 		object, it will be applied to each Transform before generating the Orientations object"""
 		orts=Orientations(self._meta[:,2:5])
-		return orts,self._meta[:,0:1].copy()
+		return orts,self._meta[:,0:2].copy()
 
 	@property
 	def ctf(self):
@@ -1134,6 +1134,8 @@ x,y,z are ~-0.5 to ~0.5 (typ) and amp is 0 to ~1. A scaling factor (value -> pix
 		"""Save the current points as a 4 column text file"""
 		np.savetxt(outname,self.numpy,delimiter="\t")
 
+	# TODO--Anya's note: this is not my code but looks from the diff like it'll fail if attempted given the current vol and removal of EMData objects
+	# eg emd["apix_x"] line, emd.process line
 	def init_from_map(self,vol,res,minratio=0.1,apix=None):
 		"""Replace the current set of Points with a set of Points generated from a 3-D map by progressive Gaussian decomposition.
 		The map is filtered to res, then the highest amplitude peak is assigned to the first Gaussian. After subtracting that Gaussian from the
@@ -1637,7 +1639,6 @@ def point_project_layered_ctf_sym_fn(pointary, ortary, ctf_info, dfstep, apix, n
 def point_volume_fn(pointary,boxsize,zsize):
 	"""This exists as a function separate from the Point class to better support JAX optimization. It is called by the corresponding Point method."""
 
-#		xfpoint=tf.reverse((pointary[:,:3]+(0.5,0.5,zaspect))*boxsize,[-1])		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->jax issue
 	zaspect=zsize/(2.0*boxsize)
 	xfpoint=jnp.flip((pointary[:,:3]+jnp.array((0.5,0.5,zaspect)))*boxsize,-1)		# shift and scale both x and y the same, reverse handles the XYZ -> ZYX EMData->jax issue
 	pos_mask = jnp.all(jnp.logical_and(xfpoint>0.0, xfpoint<boxsize-1.0001),axis=1).astype(float)
@@ -1776,6 +1777,7 @@ def jax_set_device(dev=0,maxmem=4096):
 		# tf.config.set_logical_device_configuration(pdevice,[tf.config.LogicalDeviceConfiguration(memory_limit=maxmem)])
 		# return tf.device(f'/GPU:{dev}')
 
+# TODO: Anya's note: Are we sure we want to keep the "stack" option because it should be just converting between jax and numpy.?
 def from_jax(jaxtensor, stack=False):
 	"""Convert a JAX tensor to NumPy array(s).
 	If stack is set, the first axis will be unpacked into a list of arrays."""
