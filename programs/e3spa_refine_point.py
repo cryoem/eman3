@@ -264,6 +264,7 @@ def main():
 	weights=[None for i in range(len(stages))]		# saved, but not used at present
 	thresholds=[None for i in range(len(stages))]	# saved, but not used at present
 	for sn,stage in enumerate(stages):
+		all_frcs=[]
 		if options.verbose: print(f"Stage {sn} - {local_datetime()}:")
 
 		if stage[7]==0: # Refining Points
@@ -400,6 +401,7 @@ def main():
 					print(f"{dbfsc:0.5f}\t",end="")
 
 				print(f"{i}\t{qual:1.5f}\t{shift*1000:1.6f}\t\t{sca*1000:1.6f}\t{imshift*1000:1.6f}  # /1000")
+				all_frcs.append((i,qual))
 
 				if qual>0.99: break
 
@@ -550,6 +552,7 @@ def main():
 				tytx=optax.apply_updates(tytx, tytx_update)
 
 				print(f"{i}: {qual*1000:1.8f}\t{ortstd:1.4f}\t\t{dydxstd:1.4f}")
+				all_frcs.append((i, qual))
 
 			# Save the changes we've made to the np array so it goes to all levels of downsampling
 			cache._meta[:,:2]=np.array(tytx)
@@ -624,6 +627,8 @@ def main():
 
 		# Point locations
 		np.savetxt(f"{options.path}/threed_{sn:02d}.txt",point.numpy,fmt="%0.4f",delimiter="\t")
+
+		np.savetxt(f"{options.path}/epoch_frcs_{sn:02d}.txt",np.array(all_frcs),fmt="%0.4f",delimiter="\t")
 
 	times.append(time.time())
 
