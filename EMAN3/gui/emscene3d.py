@@ -994,7 +994,9 @@ class ScatterPlotNode(ShapeNode):
 		super().__init__(*args, **kwargs)
 
 	def set_data(self, data):
-		"""Set scatter plot data. data should be Nx4 (x,y,z,amplitude)."""
+		"""Set scatter plot data. data should be Nx4 (x,y,z,amplitude).
+		When data is set, the sphere radius is initialized to 0.005 of the
+		data's (max - min) coordinate span; change it later with set_point_size."""
 		if data is not None:
 			data = np.asarray(data, dtype=np.float32)
 			if data.ndim != 2 or data.shape[1] < 3:
@@ -1003,6 +1005,9 @@ class ScatterPlotNode(ShapeNode):
 				# Add unit amplitude column
 				data = np.column_stack([data, np.ones(len(data), dtype=np.float32)])
 			self._data = data
+			span = float(data[:, :3].max() - data[:, :3].min())
+			if span > 0:
+				self._point_size = 0.005 * span
 		else:
 			self._data = None
 		self._rebuild()
@@ -1063,9 +1068,17 @@ class ScatterPlotNode(ShapeNode):
 
 		mat = gfx.MeshStandardMaterial(color=(0.7, 0.7, 0.85))
 		mesh = gfx.InstancedMesh(geo, mat, n)
-		mesh.instance_matrix = inst_matrices.reshape(-1, 4, 4)
+		self._set_instance_matrices(mesh, inst_matrices, n)
 		self._gfx_node.add(mesh)
 		self._scatter_mesh = mesh  # Keep reference for updates
+
+	def _set_instance_matrices(self, mesh, inst, n):
+		"""Bulk-write the per-instance matrices. pygfx 0.17 InstancedMesh has no
+		instance_matrix property; the matrices live in the structured
+		instance_buffer (stored transposed) and must be flagged for upload."""
+		buf = mesh.instance_buffer
+		buf.data["matrix"][:] = inst.reshape(n, 4, 4).transpose(0, 2, 1).astype(np.float32)
+		buf.update_range(0, n)
 
 	def set_point_size(self, v):
 		self._point_size = float(v)
@@ -1082,19 +1095,22 @@ class ScatterPlotNode(ShapeNode):
 		n = len(self._data)
 		pos = self._data[:, :3]
 		s = self._point_size
-		# Update each instance matrix
-		for i in range(n):
-			mat = np.eye(4, dtype=np.float32)
-			mat[0, 0] = s
-			mat[1, 1] = s
-			mat[2, 2] = s
-			mat[:3, 3] = pos[i]
-			self._scatter_mesh.set_matrix_at(i, mat)
+		if not getattr(self, "_scatter_mesh", None):
+			self._rebuild()
+			return
+		inst = np.tile(np.eye(4, dtype=np.float32), (n, 1, 1))
+		inst[:, 0, 0] = s
+		inst[:, 1, 1] = s
+		inst[:, 2, 2] = s
+		inst[:, :3, 3] = pos.astype(np.float32)
+		self._set_instance_matrices(self._scatter_mesh, inst, n)
 
 	def inspector_controls(self, parent):
 		controls = []
 		tgt = parent._get_tgt() if hasattr(parent, '_get_tgt') else None
-		ps = ValSlider(parent, (0.01, 2.0), "Radius:", value=self._point_size)
+		size = self._point_size if self._point_size > 0 else 0.1
+		# keep the slider band centered on the current (data-relative) radius
+		ps = ValSlider(parent, (max(size * 0.01, 1e-4), max(size * 10.0, 2.0)), "Radius:", value=size)
 		ps.valueChanged.connect(lambda v: self._on_size_changed(v, tgt))
 		controls.append(("Radius", ps))
 		info = QtWidgets.QLabel("Points: %d" % len(self._data) if self._data is not None else "No data")
@@ -2091,29 +2107,22 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		self._request_render()
 
 	def _get_camera_distance(self):
-		"""Get camera distance from EMANController target."""
-		import numpy as np
+		"""Get camera distance from the EMANController (source of view state)."""
 		oc = getattr(self, '_controller', None)
 		if not oc:
 			return 3.0
-		target = np.array(oc.target)
-		pos = np.array(self._camera.world.position[:3])
-		return float(np.linalg.norm(pos - target))
+		return float(oc._distance)
 
 	def _set_camera_distance(self, dist):
-		"""Set camera distance from EMANController target by moving along look direction."""
-		import numpy as np
+		"""Set camera distance via the controller. The controller owns the view
+		state and recomputes the camera position from it on every update (e.g.
+		a mouse rotation), so writing the camera position directly would be
+		reverted on the first rotation."""
 		oc = getattr(self, '_controller', None)
 		if not oc:
 			return
-		target = np.array(oc.target)
-		pos = np.array(self._camera.world.position[:3])
-		direction = pos - target
-		norm = float(np.linalg.norm(direction))
-		if norm < 1e-6:
-			norm = 1.0
-		direction = direction / norm * max(dist, 0.01)
-		self._camera.world.position = tuple(direction + target)
+		oc._distance = max(0.1, min(float(dist), EMANController.MAX_DISTANCE))
+		oc._update_camera()
 		self._request_render()
 
 	def _sync_camera_to_inspector(self):

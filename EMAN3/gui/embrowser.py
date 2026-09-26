@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+import random
 import shutil
 import subprocess
 import traceback
@@ -121,6 +122,303 @@ def _load_folder_meta(root):
 		return ts, cur[1]
 	_folder_meta_memo[key] = (ts, entries)
 	return ts, entries
+
+
+# ---------------------------------------------------------------------------
+# Restricted orthogonal (XYZ) projections for the Rng XYZ / All XYZ actions
+# (EMAN2 embrowser.py makeOrthoProj equivalent, in pure numpy).
+# ---------------------------------------------------------------------------
+
+def _gauss_filter_2d(img, apix, lowpass, highpass):
+	"""Gaussian low- and/or high-pass filtering of a 2-D image in the
+	frequency domain; cutoffs are in Angstroms, <= 0 disables. Uses
+	H_lp(f) = exp(-(f/fo)^2) and H_hp(f) = 1 - exp(-(f/fo)^2), where
+	fo = 1/cutoff (f in cycles/A, cutoffs in A)."""
+	if lowpass <= 0 and highpass <= 0:
+		return img
+	ny, nx = img.shape
+	fx = np.fft.fftfreq(nx, d=apix)
+	fy = np.fft.fftfreq(ny, d=apix)
+	F = np.sqrt(fx[np.newaxis, :] ** 2 + fy[:, np.newaxis] ** 2)
+	H = None
+	if lowpass > 0:
+		H = np.exp(-(F * lowpass) ** 2)
+	if highpass > 0:
+		Ph = 1.0 - np.exp(-(F * highpass) ** 2)
+		H = Ph if H is None else H * Ph
+	return np.fft.ifft2(np.fft.fft2(img) * H).real
+
+
+def _normalize_2d(img):
+	"""Scale to zero mean and unit std (unchanged when std is 0)."""
+	img = img - img.mean()
+	std = img.std()
+	if std > 0:
+		img = img / std
+	return img
+
+
+def make_ortho_proj(vol, layers=-1, center=0, lowpass=-1, highpass=-1,
+	apix=1.0, stack_out=False):
+	"""Restricted orthogonal projections of a 3-D volume (nz, ny, nx).
+
+	Sums slices along each axis over the range center±layers (layers < 0
+	means the full axis), optionally Gaussian-filters (cutoffs in A), and
+	normalizes each projection (zero mean, unit std) to balance the three
+	directions, as in EMAN2. With stack_out=False the three projections are
+	packed side by side into one 2-D image in (x, y, z) order; otherwise a
+	list of the three separate images is returned.
+	"""
+	vol = np.asarray(vol, dtype=np.float32)
+	if vol.ndim == 2:
+		vol = vol[np.newaxis, :, :]
+	_nz, _ny, nx = vol.shape
+
+	def proj(axis, size):
+		if layers >= 0:
+			first = size // 2 + center - layers
+			last = size // 2 + center + layers + 1
+			first = max(0, min(first, size))
+			last = max(first, min(last, size))
+			img = np.sum(np.take(vol, range(first, last), axis=axis), axis=axis)
+		else:
+			img = np.sum(vol, axis=axis)
+		img = _gauss_filter_2d(img, apix, lowpass, highpass)
+		return _normalize_2d(img).astype(np.float32)
+
+	# numpy axes: 2 = x, 1 = y, 0 = z
+	px = proj(2, nx)
+	py = proj(1, _ny)
+	pz = proj(0, _nz)
+	if stack_out:
+		return [px, py, pz]
+	# pack side by side (x, y, z); pad to the max height for non-cubic boxes
+	height = max(px.shape[0], py.shape[0], pz.shape[0])
+	width = px.shape[1] + py.shape[1] + pz.shape[1]
+	packed = np.zeros((height, width), dtype=np.float32)
+	c = 0
+	for p in (px, py, pz):
+		packed[:p.shape[0], c:c + p.shape[1]] = p
+		c += p.shape[1]
+	return packed
+
+
+class EMSliceParamDialog(QtWidgets.QDialog):
+	"""Modal parameters dialog for restricted XYZ projections (Rng XYZ /
+	All XYZ actions), as in EMAN2's EMSliceParamDialog. Recent values are
+	remembered between invocations."""
+	dlayers = -1
+	dcenter = 0
+	dlp = "-1"
+	dhp = "-1"
+	dmask = ""
+	dstkout = 0
+	doldwin = 0
+
+	def __init__(self, parent=None, nimg=1):
+		QtWidgets.QDialog.__init__(self, parent)
+		self.nimg = int(nimg)
+		self.setWindowTitle("Slice Parameters")
+
+		self.vbl = QtWidgets.QVBoxLayout(self)
+		self.fol = QtWidgets.QFormLayout()
+		self.vbl.addLayout(self.fol)
+
+		if self.nimg > 1:
+			self.wspinmin = QtWidgets.QSpinBox()
+			self.wspinmin.setRange(-1, self.nimg - 1)
+			self.wspinmin.setValue(-1)
+			self.wspinmin.setToolTip("Start of range of volumes to display, -1 for all")
+			self.fol.addRow("First Image #:", self.wspinmin)
+
+			self.wspinmax = QtWidgets.QSpinBox()
+			self.wspinmax.setRange(-1, self.nimg)
+			self.wspinmax.setValue(-1)
+			self.wspinmax.setToolTip("End (exclusive) of range of volumes to display, -1 for all")
+			self.fol.addRow("Last Image #:", self.wspinmax)
+
+			self.wspinstep = QtWidgets.QSpinBox()
+			self.wspinstep.setRange(1, max(self.nimg // 2, 1))
+			self.wspinstep.setValue(1)
+			self.wspinstep.setToolTip("Step for range of volumes to display (partial display of file)")
+			self.fol.addRow("Step:", self.wspinstep)
+
+		self.wspinlayers = QtWidgets.QSpinBox()
+		self.wspinlayers.setRange(-1, 1024)
+		self.wspinlayers.setValue(self.dlayers)
+		self.wspinlayers.setToolTip("Sum about center over +- selected number of layers, eg 0 -> central section only, -1 full projection")
+		self.fol.addRow("Sum Layers (0->1, 1->3, 2->5, ...):", self.wspinlayers)
+
+		self.wspincenter = QtWidgets.QSpinBox()
+		self.wspincenter.setRange(-1024, 1024)
+		self.wspincenter.setValue(self.dcenter)
+		self.wspincenter.setToolTip("Center about which sum is generated, 0 = center of volume")
+		self.fol.addRow("Center for sum:", self.wspincenter)
+
+		self.wlelp = QtWidgets.QLineEdit(self.dlp)
+		self.wlelp.setToolTip("If >0 applies a 2-D Gaussian low-pass filter. Specify in A.")
+		self.fol.addRow("Lowpass (A):", self.wlelp)
+
+		self.wlehp = QtWidgets.QLineEdit(self.dhp)
+		self.wlehp.setToolTip("If >0 applies a 2-D Gaussian high-pass filter. Specify in A.")
+		self.fol.addRow("Highpass (A):", self.wlehp)
+
+		self.wlemask = QtWidgets.QLineEdit(self.dmask)
+		self.wlemask.setToolTip("Optional filename of a mask volume (same dimensions as the volumes)")
+		self.fol.addRow("Mask volume:", self.wlemask)
+
+		self.wleref = QtWidgets.QLineEdit("")
+		self.wleref.setToolTip("Optional filename of a reference volume (same dimensions); its projections are appended last")
+		self.fol.addRow("Reference volume:", self.wleref)
+
+		self.wcheckstk = QtWidgets.QCheckBox("enable")
+		self.wcheckstk.setChecked(bool(self.dstkout))
+		self.wcheckstk.setToolTip("If set, makes 3 separate images instead of a single rectangular image. Good for FFTs.")
+		self.fol.addRow("Stack output:", self.wcheckstk)
+
+		self.wcheckoldwin = QtWidgets.QCheckBox("enable")
+		self.wcheckoldwin.setChecked(bool(self.doldwin))
+		self.wcheckoldwin.setToolTip("If set, uses the last existing 2-D image window (replacing its contents)")
+		self.fol.addRow("Same window:", self.wcheckoldwin)
+
+		self.bhb = QtWidgets.QHBoxLayout()
+		self.vbl.addLayout(self.bhb)
+		self.wbutok = QtWidgets.QPushButton("OK")
+		self.bhb.addWidget(self.wbutok)
+		self.wbutcancel = QtWidgets.QPushButton("Cancel")
+		self.bhb.addWidget(self.wbutcancel)
+
+		self.wbutok.clicked.connect(self.okpress)
+		self.wbutcancel.clicked.connect(self.reject)
+		self.wbutok.setDefault(True)
+
+	def okpress(self, state=None):
+		EMSliceParamDialog.dlayers = self.wspinlayers.value()
+		EMSliceParamDialog.dcenter = self.wspincenter.value()
+		EMSliceParamDialog.dlp = self.wlelp.text()
+		EMSliceParamDialog.dhp = self.wlehp.text()
+		EMSliceParamDialog.dmask = self.wlemask.text()
+		EMSliceParamDialog.dstkout = int(self.wcheckstk.isChecked())
+		EMSliceParamDialog.doldwin = int(self.wcheckoldwin.isChecked())
+		self.accept()
+
+	def parameters(self):
+		"""The dialog values as a dict (call after a successful exec())."""
+		return {
+			"first": self.wspinmin.value() if self.nimg > 1 else 0,
+			"last": self.wspinmax.value() if self.nimg > 1 else 1,
+			"step": self.wspinstep.value() if self.nimg > 1 else 1,
+			"layers": self.wspinlayers.value(),
+			"center": self.wspincenter.value(),
+			"lowpass": float(self.wlelp.text() or -1),
+			"highpass": float(self.wlehp.text() or -1),
+			"mask": self.wlemask.text().strip(),
+			"reference": self.wleref.text().strip(),
+			"stack_out": self.wcheckstk.isChecked(),
+			"same_window": self.wcheckoldwin.isChecked(),
+		}
+
+
+def _reduce_bits(data, bits):
+	"""Reduce image data to at most 'bits' bits (8/16/32), rescaling to the
+	full range of the target depth. Data already at or below the requested
+	depth is returned unchanged (no expansion); bits <= 0 means no reduction."""
+	if bits is None or bits <= 0:
+		return data
+	a = np.asarray(data)
+	cur = 64
+	if a.dtype == np.uint8:
+		cur = 8
+	elif a.dtype == np.uint16:
+		cur = 16
+	elif a.dtype in (np.int32, np.float32):
+		cur = 32
+	if cur <= bits:
+		return a
+	if bits < 16:
+		top, outdt = 255.0, np.uint8
+	elif bits < 32:
+		top, outdt = 65535.0, np.uint16
+	else:
+		if a.dtype == np.float64:
+			return a.astype(np.float32)
+		return a
+	lo, hi = float(a.min()), float(a.max())
+	if hi <= lo:
+		return np.zeros(a.shape, dtype=outdt)
+	return np.clip((a - lo) / (hi - lo) * top, 0, top).astype(outdt)
+
+
+class EMSaveAsDialog(QtWidgets.QDialog):
+	"""'Save As' dialog: output filename, an explicit format (otherwise the
+	format is determined by the output extension), and a First/Last image
+	range for input files with more than one image."""
+
+	def __init__(self, parent=None, default_name="", nimg=1):
+		QtWidgets.QDialog.__init__(self, parent)
+		self.setWindowTitle("Save As")
+		self.nimg = int(nimg)
+
+		self.vbl = QtWidgets.QVBoxLayout(self)
+		self.fol = QtWidgets.QFormLayout()
+		self.vbl.addLayout(self.fol)
+
+		self.wlefile = QtWidgets.QLineEdit(default_name)
+		self.fol.addRow("Output file:", self.wlefile)
+
+		self.wcombo = QtWidgets.QComboBox()
+		self.wcombo.addItem("(determined by output extension)", None)
+		for label, ext in [
+			("JPEG (.jpg)", ".jpg"),
+			("PGM (.pgm)", ".pgm"),
+			("PNG (.png)", ".png"),
+			("MRC (.mrc)", ".mrc"),
+			("MRC stack (.mrcs)", ".mrcs"),
+			("TIFF (.tif)", ".tif"),
+			("IMAGIC (.img)", ".img"),
+			("HDF5 (.hdf)", ".hdf"),
+		]:
+			self.wcombo.addItem(label, ext)
+		self.fol.addRow("Format:", self.wcombo)
+
+		self.wspinbits = QtWidgets.QSpinBox()
+		self.wspinbits.setRange(-1, 32)
+		self.wspinbits.setValue(-1)
+		self.wspinbits.setToolTip("Bit depth of output data: -1 = no bit reduction (as far as the format allows); 8 or 16 rescales the data to that depth")
+		self.fol.addRow("Bits:", self.wspinbits)
+
+		if self.nimg > 1:
+			self.wspinfirst = QtWidgets.QSpinBox()
+			self.wspinfirst.setRange(0, self.nimg - 1)
+			self.wspinfirst.setValue(0)
+			self.wspinfirst.setToolTip("First image to save (0-based)")
+			self.fol.addRow("First Image #:", self.wspinfirst)
+
+			self.wspinlast = QtWidgets.QSpinBox()
+			self.wspinlast.setRange(0, self.nimg - 1)
+			self.wspinlast.setValue(self.nimg - 1)
+			self.wspinlast.setToolTip("Last image to save (0-based, inclusive)")
+			self.fol.addRow("Last Image #:", self.wspinlast)
+
+		self.bhb = QtWidgets.QHBoxLayout()
+		self.vbl.addLayout(self.bhb)
+		self.wbutok = QtWidgets.QPushButton("OK")
+		self.bhb.addWidget(self.wbutok)
+		self.wbutcancel = QtWidgets.QPushButton("Cancel")
+		self.bhb.addWidget(self.wbutcancel)
+		self.wbutok.clicked.connect(self.accept)
+		self.wbutcancel.clicked.connect(self.reject)
+		self.wbutok.setDefault(True)
+
+	def parameters(self):
+		"""The dialog values as a dict (call after a successful exec())."""
+		return {
+			"file": self.wlefile.text().strip(),
+			"format": self.wcombo.currentData(),
+			"bits": self.wspinbits.value(),
+			"first": self.wspinfirst.value() if self.nimg > 1 else 0,
+			"last": self.wspinlast.value() if self.nimg > 1 else 0,
+		}
 
 
 # ===========================================================================
@@ -474,6 +772,59 @@ class EMFileType(object):
 		finally:
 			brws.notbusy()
 
+	def show2dAvg(self, brws):
+		"""Avg All: unaligned average of the entire stack, shown in the last
+		opened 2-D image window (or a new one if none)."""
+		brws.busy()
+		try:
+			io = ImageIO(self.path, "r")
+			n = io.nimg
+			acc = None
+			for i in range(n):
+				img, _h = io.read_image(i)
+				img = np.asarray(img, dtype=np.float64)
+				acc = img if acc is None else acc + img
+			io.close()
+		except Exception as e:
+			brws.notbusy()
+			display_error("could not read %s: %s" % (self.path, e))
+			return
+		if acc is None:
+			brws.notbusy()
+			display_error("no images to average")
+			return
+		brws.notbusy()
+		brws._show_image2d([acc / n], self.path, new=False)
+
+	def show2dAvgRnd(self, brws):
+		"""Avg Rnd Subset: 10 averages, each over a random subset of
+		min(1/4 of the images, 1000) images, shown as a set of 2-D images
+		in the last opened 2-D image window (or a new one if none)."""
+		if getattr(self, "nimg", 1) < 8:
+			print("need at least 8 images in the stack to average random subsets")
+			return
+		brws.busy()
+		try:
+			io = ImageIO(self.path, "r")
+			n = io.nimg
+			nsub = min(n // 4, 1000)
+			avgs = []
+			for _ in range(10):
+				idx = sorted(random.randrange(n) for _ in range(nsub))
+				acc = None
+				for i in idx:
+					img, _h = io.read_image(i)
+					img = np.asarray(img, dtype=np.float64)
+					acc = img if acc is None else acc + img
+				avgs.append(acc / nsub)
+			io.close()
+		except Exception as e:
+			brws.notbusy()
+			display_error("could not compute random averages of %s: %s" % (self.path, e))
+			return
+		brws.notbusy()
+		brws._show_image2d(avgs, self.path, new=False)
+
 	def plot3dApp(self, brws):
 		"""Add this file's data to the last opened 3-D plot window (new window if none)."""
 		brws.busy()
@@ -511,7 +862,8 @@ class EMFileType(object):
 			brws.notbusy()
 
 	def saveAs(self, brws):
-		self._unimpl("saveAs")
+		"""Save this file's image(s) in a new file format (dialog in the browser)."""
+		brws._save_as(self.path, getattr(self, "nimg", 1))
 
 
 class EMFolderFileType(EMFileType):
@@ -652,8 +1004,6 @@ class EMJSONFileType(EMFileType):
 	def histApp(self, brws): self._unimpl("histApp")
 	def histNew(self, brws): self._unimpl("histNew")
 	def show2dStack3sec(self, brws): self._unimpl("show2dStack3sec")
-	def show2dStack3sec(self, brws):
-		self._unimpl("show2dStack3sec")
 
 
 class EMPlotFileType(EMFileType):
@@ -692,26 +1042,34 @@ class EMPlotFileType(EMFileType):
 				("Hist", "Add to current histogram", self.histApp),
 				("Hist +", "Make new histogram", self.histNew)]
 		if 3 <= self.ncol <= 5:
-			rtr.append(("Spheres", "Each X line is X-Y-Z[-A[-S]]. Show as spheres in 3-D", self.showSpheres))
+			rtr.append(("Spheres", "Each X line is X-Y-Z[-A[-S]]. Add to current 3-D window", self.showSpheres))
+			rtr.append(("Spheres +", "Each X line is X-Y-Z[-A[-S]]. New 3-D window", self.showSpheresNew))
 		return rtr
 
+	def _spheres_data(self):
+		"""Rows of the data file as (N, ncols) points: X-Y-Z[-amplitude[-S]]."""
+		columns, _labels = self.plot_data()
+		if columns is None:
+			raise ValueError("no data lines in %s" % self.path)
+		pts = np.array([np.asarray(c, dtype=np.float64) for c in columns]).T
+		if pts.shape[1] < 3:
+			raise ValueError("need at least 3 columns (X-Y-Z) in %s" % self.path)
+		return pts
+
 	def showSpheres(self, brws):
-		"""Open a new 3-D window showing each data row as a sphere at X-Y-Z
-		(4th column = brightness; 5th column ignored), like the EMAN2 browser."""
+		"""Show each data row as a sphere at X-Y-Z (4th column = brightness,
+		5th ignored) in the last opened 3-D window (new window if none)."""
 		brws.busy()
 		try:
-			columns, _labels = self.plot_data()
-			if columns is None:
-				raise ValueError("no data lines in %s" % self.path)
-			pts = np.array([np.asarray(c, dtype=np.float64) for c in columns]).T
-			if pts.shape[1] < 3:
-				raise ValueError("need at least 3 columns (X-Y-Z) in %s" % self.path)
-			pts = pts[:, :4].copy()
-			pts[:, :3] *= 256.0	# same display scaling as the EMAN2 browser
-			if pts.shape[1] == 3:
-				pts = np.column_stack([pts, np.ones(len(pts))])
-			target = brws._show_spheres(self.path)
-			target.add_scatter_plot(name=os.path.basename(self.path), data=pts, point_size=1.0)
+			brws._show_spheres([self._spheres_data()], self.path, new=False)
+		finally:
+			brws.notbusy()
+
+	def showSpheresNew(self, brws):
+		"""Open a new 3-D window with each data row as a sphere at X-Y-Z."""
+		brws.busy()
+		try:
+			brws._show_spheres([self._spheres_data()], self.path, new=True)
 		finally:
 			brws.notbusy()
 
@@ -748,7 +1106,6 @@ class EMBdbFileType(EMFileType):
 				("Show Stack+", "Show all images together in a new window", self.show2dStackNew),
 				("Show 2D", "Show in a scrollable 2D image window", self.show2dSingle),
 				("Show 2D+", "Show all images, one at a time in a new window", self.show2dSingleNew),
-				("Chimera", "Open in Chimera (if installed)", self.showChimera),
 				("FilterTool", "Open in filter tool", self.showFilterTool),
 				("ProjXYZ", "Make projections along Z,Y,X", self.showProjXYZ),
 				("Save As", "Saves images in new file format", self.saveAs)]
@@ -765,7 +1122,6 @@ class EMBdbFileType(EMFileType):
 				("Save As", "Saves images in new file format", self.saveAs)]
 		elif self.nimg > 1 and self.dim[2] > 1:
 			return [("Show 3D", "Show all in a single 3D window", self.show3DNew),
-				("Chimera", "Open in Chimera (if installed)", self.showChimera),
 				("Save As", "Saves images in new file format", self.saveAs)]
 		elif self.nimg > 1 and self.dim[1] > 1:
 			return [("Show Stack", "Show all images together in one window", self.show2dStack),
@@ -793,7 +1149,6 @@ class EMBdbFileType(EMFileType):
 	def plot2dApp(self, brws): self._unimpl("plot2dApp")
 	def plot2dNew(self, brws): self._unimpl("plot2dNew")
 	def showProjXYZ(self, brws): self._unimpl("showProjXYZ")
-	def showChimera(self, brws): self._unimpl("showChimera")
 
 
 class EMImageFileType(EMFileType):
@@ -828,7 +1183,6 @@ class EMImageFileType(EMFileType):
 				("Show Stack+", "New window", self.show2dStackNew),
 				("Show 2D", "Show in 2D image window", self.show2dSingle),
 				("Show 2D+", "New 2D window", self.show2dSingleNew),
-				("Chimera", "Open in Chimera", self.showChimera),
 				("FilterTool", "Open in filter tool", self.showFilterTool),
 				("Rng XYZ", "Show restricted XYZ projection", self.show2dStack3sec),
 				("Save As", "Save in new file format", self.saveAs)]
@@ -882,9 +1236,9 @@ class EMImageFileType(EMFileType):
 			brws._show_image2d(brws._read_2d_list(self.path), self.path, new=True)
 		finally:
 			brws.notbusy()
-	def showChimera(self, brws): self._unimpl("showChimera")
 	def showFilterTool(self, brws): self._unimpl("showFilterTool")
-	def show2dStack3sec(self, brws): self._unimpl("show2dStack3sec")
+	def show2dStack3sec(self, brws):
+		brws._show_xyz_projections(self.path, self.nimg)
 
 	def plot_data(self):
 		"""Images plot as intensity vs pixel index (all pixels, row-major)."""
@@ -930,11 +1284,7 @@ class EMStackFileType(EMFileType):
 		if self.nimg > 1 and self.dim[2] > 1:
 			rtr = [("Show all 3D", "Show all in a single 3D window", self.show3DAll),
 				("Show 1st 3D", "Show only the first volume", self.show3DNew),
-				("Show 1st 2D", "Show first volume as 2D stack", self.show2dSingle30),
-				("Show 2nd 2D", "Show second volume as 2D stack", self.show2dSingle31),
-				("Show All Zproj", "Show Z projection of all volumes", self.show2dStack3z),
 				("All XYZ", "Show restricted XYZ projections of all", self.show2dStack3sec),
-				("Chimera", "Open in Chimera", self.showChimera),
 				("Save As", "Save in new file format", self.saveAs)]
 		elif self.nimg > 1 and self.dim[1] > 1:
 			rtr = [("Show Stack", "Show all images together in one window", self.show2dStack),
@@ -946,7 +1296,8 @@ class EMStackFileType(EMFileType):
 				("FilterTool", "Open in filter tool", self.showFilterTool),
 				("Save As", "Save in new file format", self.saveAs)]
 			if 3 <= self.dim[0] <= 5:
-				rtr.append(("Spheres", "Each X line is X-Y-Z[-A[-S]]. Show as spheres in 3-D", self.showSpheres))
+				rtr.append(("Spheres", "Each X line is X-Y-Z[-A[-S]]. Add to current 3-D window", self.showSpheres))
+				rtr.append(("Spheres +", "Each X line is X-Y-Z[-A[-S]]. New 3-D window", self.showSpheresNew))
 		elif self.nimg > 1:
 			rtr = [("Plot 2D", "Plot all on a single 2-D plot", self.plot2dNew),
 				("Save As", "Save in new file format", self.saveAs)]
@@ -973,11 +1324,8 @@ class EMStackFileType(EMFileType):
 			brws._show_scene3d(vols, self.path, new=True)
 		finally:
 			brws.notbusy()
-	def show2dSingle30(self, brws): self._unimpl("show2dSingle30")
-	def show2dSingle31(self, brws): self._unimpl("show2dSingle31")
-	def show2dStack3z(self, brws): self._unimpl("show2dStack3z")
-	def show2dStack3sec(self, brws): self._unimpl("show2dStack3sec")
-	def showChimera(self, brws): self._unimpl("showChimera")
+	def show2dStack3sec(self, brws):
+		brws._show_xyz_projections(self.path, self.nimg)
 	def show2dStack(self, brws):
 		brws.busy()
 		try:
@@ -1002,13 +1350,61 @@ class EMStackFileType(EMFileType):
 			brws._show_image2d(brws._read_2d_list(self.path), self.path, new=True)
 		finally:
 			brws.notbusy()
-	def show2dAvg(self, brws): self._unimpl("show2dAvg")
-	def show2dAvgRnd(self, brws): self._unimpl("show2dAvgRnd")
-	def showSpheres(self, brws): self._unimpl("showSpheres")
+	def showSpheres(self, brws):
+		"""Show each image's rows as spheres (X-Y-Z[-A[-S]]) in the last opened
+		3-D window (new window if none); each image is its own scatter node."""
+		brws.busy()
+		try:
+			brws._show_spheres(self._spheres_data(), self.path, new=False)
+		finally:
+			brws.notbusy()
+
+	def showSpheresNew(self, brws):
+		"""Open a new 3-D window with each image's rows as spheres."""
+		brws.busy()
+		try:
+			brws._show_spheres(self._spheres_data(), self.path, new=True)
+		finally:
+			brws.notbusy()
+
+	def _spheres_data(self):
+		"""A 2-D image stack with 3-5 columns: the rows of each image are its
+		points (X-Y-Z[-A[-S]]); each image is one point set (as in EMAN2)."""
+		io = ImageIO(self.path, "r")
+		sets = []
+		try:
+			for i in range(io.nimg):
+				img, _h = io.read_image(i)
+				arr = np.asarray(img, dtype=np.float64)
+				if arr.ndim == 3:
+					arr = arr.reshape(arr.shape[0], -1)
+				if arr.ndim != 2 or arr.shape[1] < 3:
+					raise ValueError("need at least 3 columns (X-Y-Z) in %s" % self.path)
+				sets.append(arr)  # each row of the image -> a point
+		finally:
+			io.close()
+		if not sets:
+			raise ValueError("no images in %s" % self.path)
+		return sets
+
 	def showFilterTool(self, brws): self._unimpl("showFilterTool")
-	def plot2dNew(self, brws): self._unimpl("plot2dNew")
 	def plot2dLstApp(self, brws): self._unimpl("plot2dLstApp")
 	def plot2dLstNew(self, brws): self._unimpl("plot2dLstNew")
+
+	def plot_data(self):
+		"""A 1-D image stack plots as one dataset per image (the pixels of the
+		image as the series values), as in EMAN2."""
+		io = ImageIO(self.path, "r")
+		try:
+			cols = []
+			for i in range(io.nimg):
+				img, _h = io.read_image(i)
+				cols.append(np.asarray(img).ravel().tolist())
+		finally:
+			io.close()
+		if not cols:
+			return None, None
+		return cols, ["image %d" % i for i in range(len(cols))]
 
 
 class EMPDBFileType(EMFileType):
@@ -1026,14 +1422,14 @@ class EMPDBFileType(EMFileType):
 			("Show Ball and Stick +", "Show ball and stick representation of this PDB model in the current 3D window", self.showBallStick3dApp),
 			("Show Spheres", "Show spheres representation of this PDB model in a new 3D window", self.showSpheres3dNew),
 			("Show Spheres +", "Show spheres representation of this PDB model in the current 3D window", self.showSpheres3dApp),
-			("Chimera", "Open this PDB file in chimera (if installed)", self.showChimera),
 			("Save As", "Saves a copy of the selected PDB file", self.saveAs)]
 
 	def showSpheres3dApp(self, brws): self._unimpl("showSpheres3dApp")
 	def showSpheres3dNew(self, brws): self._unimpl("showSpheres3dNew")
 	def showBallStick3dApp(self, brws): self._unimpl("showBallStick3dApp")
 	def showBallStick3dNew(self, brws): self._unimpl("showBallStick3dNew")
-	def showChimera(self, brws): self._unimpl("showChimera")
+	def saveAs(self, brws):
+		brws._copy_file_as(self.path)
 
 
 # Register file types (keys must match the "type" strings from the updater)
@@ -1764,13 +2160,36 @@ class EMBrowserWidget(QtWidgets.QWidget):
 		target.destroyed.connect(lambda *_: setattr(target, "_plot_dead", True))
 		target.destroyed.connect(lambda *_: self._drop_view(self.view3d, target))
 
-	def _show_spheres(self, path):
-		"""Open a new 3-D scene window keyed by the file name (EMAN2's Spheres
-		action always opens a new window)."""
+	def _show_spheres(self, point_sets, path, new=False):
+		"""Add scatter plot(s) to a 3-D scene window keyed by the file name,
+		like Show 3D / Show 3D+. 'point_sets' is a list of Nx3/Nx4 arrays
+		(X-Y-Z[-amplitude]); each set becomes its own scatter plot node (a
+		stack of images contributes one node per image, as in EMAN2). new=False
+		adds to the last opened 3-D scene window (creating one if none);
+		new=True always opens a new window. Returns the window."""
 		from EMAN3.gui.emscene3d import EMScene3DWidget
 		key = os.path.basename(path)
-		target = EMScene3DWidget()
-		self._track_view3d(target)
+		if new:
+			target = EMScene3DWidget()
+			self._track_view3d(target)
+		else:
+			target = self._last_view3d()
+			if target is None:
+				target = EMScene3DWidget()
+				self._track_view3d(target)
+		nsets = len(point_sets)
+		for k, pts in enumerate(point_sets):
+			pts = np.asarray(pts, dtype=np.float32)
+			if pts.ndim == 1:
+				pts = pts[np.newaxis, :]
+			if pts.shape[1] == 3:
+				pts = np.column_stack([pts, np.ones(len(pts), dtype=np.float32)])
+			elif pts.shape[1] > 4:
+				pts = pts[:, :4]
+			name = key if nsets == 1 else "%s #%d" % (key, k)
+			target.add_scatter_plot(name=name, data=pts)
+		# The widget fits the camera to the first object added to the scene;
+		# subsequent additions preserve the user's current view.
 		target.setWindowTitle(key)
 		target.show()
 		target.raise_()
@@ -1928,6 +2347,197 @@ class EMBrowserWidget(QtWidgets.QWidget):
 		target.set_data(images, filename=path)
 		target.show()
 		target.raise_()
+
+	def _show_xyz_projections(self, path, nimg):
+		"""Rng XYZ / All XYZ: ask for slice parameters, compute the restricted
+		orthogonal projections of the requested range of volumes, and display
+		them. Single-volume (or 'stack output') results go to a 2-D image
+		window; otherwise the packed images are shown in a stack grid window."""
+		dlg = EMSliceParamDialog(self, nimg)
+		if dlg.exec() != QtWidgets.QDialog.Accepted:
+			return
+		p = dlg.parameters()
+		step = max(int(p["step"]), 1)
+		img0 = max(int(p["first"]), 0)
+		img1 = int(p["last"]) if 0 < int(p["last"]) <= nimg else nimg
+		if img1 <= img0:
+			display_error("empty range of images to project")
+			return
+
+		mask = None
+		if p["mask"]:
+			try:
+				mio = ImageIO(p["mask"], "r")
+				mask, _mh = mio.read_image(0)
+				mio.close()
+				mask = np.asarray(mask, dtype=np.float32)
+			except Exception as e:
+				print("warning: could not read mask volume %s: %s" % (p["mask"], e))
+		ref = None
+		if p["reference"]:
+			try:
+				rio = ImageIO(p["reference"], "r")
+				ref, _rh = rio.read_image(0)
+				rio.close()
+				ref = np.asarray(ref, dtype=np.float32)
+				if ref.ndim == 2:
+					ref = ref[np.newaxis, :, :]
+			except Exception as e:
+				print("warning: could not read reference volume %s: %s" % (p["reference"], e))
+
+		self.busy()
+		try:
+			io = ImageIO(path, "r")
+			apix = 1.0
+			try:
+				h0 = io.read_header(0)
+				apix = float(h0.get("apix_x") or h0.get("apix") or 1.0)
+			except Exception:
+				pass
+			images = []
+			for i in range(img0, img1, step):
+				try:
+					vol, _h = io.read_image(i)
+				except Exception as e:
+					print("warning: could not read image #%d of %s: %s" % (i, path, e))
+					continue
+				vol = np.asarray(vol, dtype=np.float32)
+				if vol.ndim == 2:
+					vol = vol[np.newaxis, :, :]
+				if mask is not None:
+					if mask.shape == vol.shape:
+						vol = vol * mask
+					else:
+						print("warning: mask shape %s does not match volume shape %s; ignoring mask" % (mask.shape, vol.shape))
+				out = make_ortho_proj(vol, p["layers"], p["center"],
+					p["lowpass"], p["highpass"], apix, p["stack_out"])
+				if isinstance(out, list):
+					images.extend(out)
+				else:
+					images.append(out)
+				QtWidgets.QApplication.processEvents()
+			if ref is not None:
+				if mask is not None and mask.shape == ref.shape:
+					ref = ref * mask
+				out = make_ortho_proj(ref, p["layers"], p["center"],
+					p["lowpass"], p["highpass"], apix, p["stack_out"])
+				if isinstance(out, list):
+					images.extend(out)
+				else:
+					images.append(out)
+			io.close()
+		finally:
+			self.notbusy()
+		if not images:
+			display_error("no images could be projected")
+			return
+		if nimg == 1 or p["stack_out"]:
+			self._show_image2d(images, path, new=not p["same_window"])
+		else:
+			self._show_imagemx(images, path, new=True)
+
+	# ---- Save As -------------------------------------------------------------
+
+	# Output formats that can only hold a single image; saving more than one
+	# image to such a format produces a numbered file set (output_0000.jpg, ...).
+	SINGLE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".pgm"}
+
+	def _save_as(self, path, nimg):
+		"""Save As: copy the selected image(s) of 'path' into a new file, in the
+		format of the user's choice (or determined by the output extension).
+		Single-image formats (e.g. JPEG) with N > 1 images produce a numbered
+		file set: output_0000.jpg, output_0001.jpg, ..."""
+		dlg = EMSaveAsDialog(self, default_name=os.path.basename(path), nimg=nimg)
+		if dlg.exec() != QtWidgets.QDialog.Accepted:
+			return
+		p = dlg.parameters()
+		out = p["file"] or path
+		if p["format"] is not None:
+			root, _cur = os.path.splitext(out)
+			out = root + p["format"]
+		if not os.path.isabs(out):
+			out = os.path.join(os.path.dirname(os.path.abspath(path)), out)
+		if os.path.normcase(os.path.normpath(out)) == os.path.normcase(os.path.normpath(path)):
+			display_error("output file is the same as the input file")
+			return
+
+		first = max(0, min(int(p["first"]), nimg - 1))
+		last = max(first, min(int(p["last"]), nimg - 1))
+
+		self.busy()
+		try:
+			io = ImageIO(path, "r")
+			images = []
+			header = None
+			for i in range(first, last + 1):
+				data, hdr = io.read_image(i)
+				images.append(_reduce_bits(np.asarray(data), int(p.get("bits", -1))))
+				if header is None:
+					header = hdr
+			io.close()
+		except Exception as e:
+			self.notbusy()
+			display_error("could not read %s: %s" % (path, e))
+			return
+
+		n = len(images)
+		if n == 0:
+			self.notbusy()
+			display_error("no images to save")
+			return
+		root, ext = os.path.splitext(out)
+		if n > 1 and ext.lower() in self.SINGLE_IMAGE_EXTS:
+			files = ["%s_%04d%s" % (root, k, ext) for k in range(n)]
+		else:
+			files = [out]
+		existing = [f for f in files if os.path.exists(f)]
+		if existing:
+			self.notbusy()
+			msg = ("The following file(s) already exist and will be overwritten:\n"
+				+ "\n".join(existing) + "\nContinue?")
+			if QtWidgets.QMessageBox.question(None, "Save As", msg) != QtWidgets.QMessageBox.Yes:
+				return
+
+		self.busy()
+		try:
+			if len(files) == 1 and n > 1:
+				# stack-capable format: all images into one file
+				wio = ImageIO(files[0], "rw")
+				try:
+					for k, data in enumerate(images):
+						wio.write_image(k, data, header)
+				finally:
+					wio.close()
+			else:
+				for fn, data in zip(files, images):
+					wio = ImageIO(fn, "rw")
+					try:
+						wio.write_image(0, data, header)
+					finally:
+						wio.close()
+					QtWidgets.QApplication.processEvents()
+		except Exception as e:
+			self.notbusy()
+			display_error("could not write %s: %s" % (files[0], e))
+			return
+		self.notbusy()
+
+	def _copy_file_as(self, path):
+		"""Save a copy of a non-image file (e.g. a PDB model) to a new location."""
+		dirname = os.path.dirname(os.path.abspath(path))
+		fn = QtWidgets.QFileDialog.getSaveFileName(self, "Save As", dirname, os.path.basename(path))[0]
+		if not fn:
+			return
+		if os.path.normcase(os.path.normpath(fn)) == os.path.normcase(os.path.normpath(path)):
+			display_error("output file is the same as the input file")
+			return
+		if os.path.exists(fn) and QtWidgets.QMessageBox.question(
+				None, "Save As", "%s already exists. Overwrite?" % fn) != QtWidgets.QMessageBox.Yes:
+			return
+		try:
+			shutil.copy2(path, fn)
+		except Exception as e:
+			display_error("could not copy %s to %s: %s" % (path, fn, e))
 
 	# ---- metadata cache polling ------------------------------------------------
 

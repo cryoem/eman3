@@ -578,7 +578,7 @@ class ImagicIO:
 
 		if meta.get("apix_x"): hed["resolx"] = float(meta["apix_x"])
 		if meta.get("apix_y"): hed["resoly"] = float(meta["apix_y"])
-		if meta.get("apix_z"): hed["resolz"] = float(meta["apiz_z"])
+		if meta.get("apix_z"): hed["resolz"] = float(meta["apix_z"])
 
 		# Write the per-image header record
 		self._hed_file.seek(index * IMAGIC_HEADER_DTYPE.itemsize)
