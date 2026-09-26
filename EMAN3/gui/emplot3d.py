@@ -1082,7 +1082,7 @@ class EMPlot3DInspector(QtWidgets.QWidget):
 		self.linewidth_spin.valueChanged.connect(self._on_appearance_change)
 		self.linewidth_spin.setToolTip("Set line thickness (1-10 pixels)")
 		ag.addWidget(self.linetype_combo, 1, 0)
-		ag.addWidget(self.linewidth_spin, 1, 1)
+		ag.addWidget(self.linewidth_spin, 2, 0)
 
 		self.symtype_combo = QtWidgets.QComboBox()
 		self.symtype_combo.addItems(["Circle", "Square", "Plus", "TriUp", "TriDown"])
@@ -1091,7 +1091,7 @@ class EMPlot3DInspector(QtWidgets.QWidget):
 		self.symsize_spin.setRange(1, 30)
 		self.symsize_spin.valueChanged.connect(self._on_appearance_change)
 		self.symsize_spin.setToolTip("Set marker size (1-30 pixels)")
-		ag.addWidget(self.symtype_combo, 2, 0)
+		ag.addWidget(self.symtype_combo, 1, 1)
 		ag.addWidget(self.symsize_spin, 2, 1)
 
 		apl.addLayout(ag)

@@ -114,6 +114,50 @@ def cache_path():
 
 	return cp
 
+
+def browser_cache_path(folder):
+	"""Returns the path to the browser metadata cache file for 'folder'.
+	Stored in the same location as the .lst file caches (see cache_path),
+	with the filename encoding a sanitized absolute path of the folder so that
+	the metadata is unambiguous regardless of the current working directory."""
+	fp = os.path.abspath(os.path.expanduser(folder))
+	safe = fp.replace("/", "_").replace("\\", "_").replace(":", "_")
+	return os.path.join(cache_path(), "browser_" + safe + ".json")
+
+
+# Bump when the per-file metadata scheme changes: updaters and the browser
+# treat caches written with any other version as stale and re-classify fully.
+BROWSER_CACHE_VERSION = 2
+
+
+def browser_cache_write(folder, entries, version=BROWSER_CACHE_VERSION):
+	"""Atomically writes the browser metadata for 'folder' (a dict of
+	filename -> {type, dim, nimg, size, mtime}) to the browser cache file,
+	tagging it with the current timestamp and format version.
+	Returns the cache file path."""
+	path = browser_cache_path(folder)
+	payload = {"timestamp": time.time(), "folder": os.path.abspath(os.path.expanduser(folder)), "entries": entries, "version": version}
+	tmp = path + ".tmp"
+	with open(tmp, "w") as f:
+		json.dump(payload, f)
+	os.replace(tmp, path)   # atomic: a failed write never leaves a partial cache behind
+	return path
+
+
+def browser_cache_read(folder):
+	"""Reads the browser metadata cache for 'folder'. Returns a tuple of
+	(timestamp, entries_dict, cache_path, version). timestamp is None if the
+	cache is missing or unreadable (in which case entries_dict is {} and
+	version is None)."""
+	path = browser_cache_path(folder)
+	try:
+		with open(path, "r") as f:
+			payload = json.load(f)
+		return payload.get("timestamp"), payload.get("entries", {}), path, payload.get("version")
+	except:
+		return None, {}, path, None
+
+
 # Without this, in many countries Qt will set things so "," is used as a decimal
 # separator by sscanf and other functions, which breaks CTF reading and some other things
 try:

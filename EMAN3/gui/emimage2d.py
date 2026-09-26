@@ -377,6 +377,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		self.setFocusPolicy(Qt.StrongFocus)
 		self.setMouseTracking(True)
 		self.setMinimumSize(128, 128)
+		self.resize(800, 800)
 
 		# ── Data state ──
 		self._stack = stack
@@ -569,7 +570,8 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		if not isinstance(incoming, (list, tuple)):
 			arr = np.asarray(incoming)
 			if arr.ndim == 3:
-				self._list_data = [arr[:, :, i] for i in range(arr.shape[2])]
+				# volumes are stored (nz, ny, nx): z-slices are axis 0
+				self._list_data = [arr[i, :, :] for i in range(arr.shape[0])]
 				self._list_idx = 0
 				self._data_array = self._list_data[0]
 			elif arr.ndim == 2:

@@ -83,6 +83,7 @@ class EMImageMXWidget(QtWidgets.QWidget):
 		self.setFocusPolicy(Qt.StrongFocus)
 		self.setMouseTracking(True)
 		self.setMinimumSize(256, 256)
+		self.resize(800, 700)
 
 		# Data state
 		self._data = None             # list of numpy arrays (ny, nx) float32

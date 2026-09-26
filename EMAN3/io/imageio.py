@@ -291,7 +291,12 @@ class ImageIO:
 		"""Number of images in the file."""
 		if self._io is not None:
 			# Trigger lazy init on classes that support it (e.g. HdfIO2)
-			return getattr(self._io, 'nimg', len(self._io))
+			n = getattr(self._io, 'nimg', None)
+			if n:
+				return n
+			# Some classes (e.g. MrcIO single images) leave nimg unset;
+			# their __len__ knows the count.
+			return len(self._io)
 		return 0
 
 	def __len__(self):

@@ -1521,7 +1521,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		self.contour_bins_spin.valueChanged.connect(self._on_contour_change)
 		self.contour_bins_spin.setToolTip("Grid resolution for contour density estimation")
 		ag.addWidget(self.linetype_combo, 1, 0)
-		ag.addWidget(self.linewidth_spin, 1, 1)
+		ag.addWidget(self.linewidth_spin, 2, 0)
 		ag.addWidget(self.contour_bins_spin, 1, 2)
 
 		self.symtype_combo = QtWidgets.QComboBox()
@@ -1536,7 +1536,7 @@ class EMPlot2DInspector(QtWidgets.QWidget):
 		self.contour_levels_spin.setValue(15)
 		self.contour_levels_spin.valueChanged.connect(self._on_contour_change)
 		self.contour_levels_spin.setToolTip("Number of contour lines to draw")
-		ag.addWidget(self.symtype_combo, 2, 0)
+		ag.addWidget(self.symtype_combo, 1, 1)
 		ag.addWidget(self.symsize_spin, 2, 1)
 		ag.addWidget(self.contour_levels_spin, 2, 2)
 

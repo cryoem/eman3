@@ -30,6 +30,11 @@ class EMANController(gfx.Controller):
 	    Wheel: zoom (adjust distance)
 	"""
 
+	# Upper bound for the camera distance (scene units). Voxel-based data
+	# maps 1 voxel -> 1 scene unit, and volumes up to ~2048^3 are viewable,
+	# so this must be far larger than the size-1 default assumption.
+	MAX_DISTANCE = 100000.0
+
 	def __init__(self, **kwargs):
 		super().__init__(**kwargs)
 		# Camera orientation in EMAN convention (degrees)
@@ -106,10 +111,13 @@ class EMANController(gfx.Controller):
 			if self._drag_start[1] > 0.9 * h:  # Bottom 10% = Phi
 				self._phi -= dx * 0.5
 			else:  # Top 90% = Az / Alt (pygfx uses +Y as UP)
-				# Horizontal drag → azimuth, vertical drag → altitude
+				# Horizontal drag → azimuth, vertical drag → altitude.
+				# Altitude spans the full 360° (wraps at ±180): it can pass
+				# through the poles, which is redundant with azimuth ± 180° but
+				# allows uninterrupted rotation without a hard stop.
 				self._azimuth -= dx * 0.4
 				self._altitude += dy * 0.4
-				self._altitude = max(-89.0, min(89.0, self._altitude))
+				self._altitude = (self._altitude + 180.0) % 360.0 - 180.0
 
 		self._drag_start = (x, y)
 		self._update_camera()
@@ -140,7 +148,7 @@ class EMANController(gfx.Controller):
 			self._distance *= 1.05
 		else:
 			self._distance *= 0.95
-		self._distance = max(0.1, min(self._distance, 1000.0))
+		self._distance = max(0.1, min(self._distance, self.MAX_DISTANCE))
 		self._update_camera()
 
 	# -- Core: recompute camera from Euler angles + distance + pan --
@@ -184,28 +192,27 @@ class EMANController(gfx.Controller):
 
 
 	def _compute_up_vector(self, az_rad, alt_rad, phi_rad):
-		"""Compute the camera up vector from Euler angles including phi roll."""
-		# Look direction (same convention as _update_camera, camera at +Z)
+		"""Compute the camera RIGHT vector (with phi roll applied) from the
+		Euler angles.
+
+		The phi=0 right reference is (cos az, 0, -sin az), which is
+		perpendicular to the view direction at every altitude. Because it
+		never degenerates, the apparent image orientation varies continuously
+		as the camera crosses the poles (alt ±90°) - in particular it does
+		NOT flip 180° when passing ±90° the way a world-up cross product
+		would. For |alt| < 90° this is identical to the previous
+		world-up-based formulation.
+		"""
 		look = np.array([
 			math.sin(az_rad) * math.cos(alt_rad),
 			math.sin(alt_rad),
 			math.cos(az_rad) * math.cos(alt_rad)
 		])
 
-		# Compute orthogonal right vector by crossing world-up (0,1,0) with look.
-		world_up = np.array([0.0, 1.0, 0.0])
-		cross_result = np.cross(world_up, look)
-		norm_cross = np.linalg.norm(cross_result)
-		# If look is nearly vertical (close to ±Y axis), use X axis instead
-		if norm_cross < 1e-4:
-			world_up = np.array([1.0, 0.0, 0.0])
-			cross_result = np.cross(look, world_up)
-			norm_cross = np.linalg.norm(cross_result)
-
-		up_before_phi = cross_result / max(norm_cross, 1e-10)
-
-		# Apply phi roll around look direction using Rodrigues formula
-		up = self._rodrigues(up_before_phi, look, phi_rad)
+		right0 = np.array([math.cos(az_rad), 0.0, -math.sin(az_rad)])
+		# Apply phi roll around the view axis (right0 is already perpendicular
+		# to look, so the Rodrigues rotation is a pure in-plane rotation).
+		up = self._rodrigues(right0, look, phi_rad)
 		return up
 
 	@staticmethod
@@ -1448,6 +1455,9 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		layout.setContentsMargins(0, 0, 0, 0)
 		layout.addWidget(self._canvas)
 
+		self.setMinimumSize(320, 240)
+		self.resize(800, 600)
+
 		self._scene_root = SceneRoot()
 		self._selected_node = self._scene_root
 		self._inspector = None
@@ -1471,6 +1481,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 
 		self._dirty = True
 		self._redraw = False
+		# If the first object is added before the scene/camera are initialized
+		# (init is deferred to first paint), remember its extent here and fit
+		# the view in _init_scene.
+		self._pending_fit_extent = 0.0
 
 		self._setup_gfx()
 
@@ -1520,6 +1534,14 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			self._controller.add_camera(self._camera)
 			# Set initial camera from controller state (az=0, alt=0, phi=0) for consistency
 			self._controller._update_camera()
+			# Apply a deferred view fit (first object added before the camera existed)
+			pend = self._pending_fit_extent
+			if pend > 0:
+				self._pending_fit_extent = 0.0
+				d = self._fit_distance(pend, self._camera)
+				if d is not None:
+					self._controller._distance = max(0.1, min(d, EMANController.MAX_DISTANCE))
+					self._controller._update_camera()
 			self._controller.register_events(self._renderer, self._canvas)
 
 			# Add camera to scene so renderer traverses it (required for parented lights)
@@ -1564,6 +1586,75 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			if node._gfx_node is not None:
 				node._gfx_node.visible = node._visible
 
+	# -- View fitting --------------------------------------------------------
+
+	def _node_extent(self, node):
+		"""Approximate size of a scene node (largest dimension, in scene units).
+		Falls back to 1.0 when the size cannot be determined."""
+		try:
+			if isinstance(node, DataNode):
+				data = node._data
+				if data is None and node._full_stack is not None:
+					data = node._full_stack[0]
+				if data is not None and np.asarray(data).size > 0:
+					return float(max(np.asarray(data).shape))
+			elif isinstance(node, (IsoSurfaceNode, VolumeSliceNode, VolumeRenderNode)):
+				# these render their parent DataNode's volume, 1 voxel = 1 unit
+				n = node
+				while n is not None:
+					if isinstance(n, DataNode) and n._data is not None:
+						return float(max(np.asarray(n._data).shape))
+					n = n._parent
+			elif isinstance(node, ScatterPlotNode):
+				d = np.asarray(node._data) if node._data is not None else None
+				if d is not None and len(d) > 0:
+					return float(np.max(d[:, :3].max(axis=0) - d[:, :3].min(axis=0)))
+			elif isinstance(node, CubeNode):
+				return max(node._width, node._height, node._depth)
+			elif isinstance(node, SphereNode):
+				return 2.0 * node._radius
+			elif isinstance(node, (CylinderNode, ConeNode)):
+				return max(2.0 * node._radius, node._height)
+			scale = getattr(node, "_scale", None)
+			if scale:
+				s = max(scale) if isinstance(scale, (list, tuple)) else float(scale)
+				if s > 0:
+					return s
+		except Exception:
+			pass
+		return 1.0
+
+	def _fit_distance(self, extent, cam):
+		"""Camera distance at which an object of 'extent' (largest dimension)
+		fits the view with a 20% margin, or None if it cannot be computed."""
+		diag = extent * 1.732  # bounding-box diagonal
+		fov_rad = math.radians(float(getattr(cam, "fov", 20.0)))
+		half_tan = math.tan(fov_rad / 2.0)
+		if half_tan <= 1e-6:
+			return None
+		return (diag / 2.0) / half_tan * 1.2
+
+	def _fit_view_to(self, node):
+		"""Set the camera distance so 'node' fits comfortably in view.
+		Used when the first object is added to the scene: voxel-based data
+		maps 1 voxel to 1 scene unit, so a 512^3 volume needs a distance an
+		order of magnitude larger than the empty-scene default of 10."""
+		scale = node._scale[0] if isinstance(node._scale, (list, tuple)) and len(node._scale) else 1.0
+		extent = self._node_extent(node) * scale
+		ctrl = getattr(self, "_controller", None)
+		cam = getattr(self, "_camera", None)
+		if ctrl is None or cam is None:
+			# Scene not initialized yet (deferred to first paint); remember the
+			# extent and fit once the camera exists (_init_scene).
+			self._pending_fit_extent = max(self._pending_fit_extent, extent)
+			return
+		d = self._fit_distance(extent, cam)
+		if d is None:
+			return
+		ctrl._distance = max(0.1, min(d, EMANController.MAX_DISTANCE))
+		ctrl._update_camera()
+		self._request_render()
+
 	# -- Shape creation helpers --
 
 	def add_cube(self, name=None, position=(0, 0, 0), scale=1.0, color=(0.8, 0.4, 0.2, 1.0), parent=None):
@@ -1585,9 +1676,13 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node._gfx_node = group
 		node._rebuild_geometry()
 		node.set_position(*position)
-		node.set_scale(scale)
+		# NOTE: 'scale' is already baked into the geometry dimensions; the node
+		# scale stays 1 (setting it again would apply the scale twice).
 
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1610,9 +1705,11 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node._gfx_node = group
 		node._rebuild_geometry()
 		node.set_position(*position)
-		node.set_scale(scale)
 
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1636,9 +1733,11 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node._gfx_node = group
 		node._rebuild_geometry()
 		node.set_position(*position)
-		node.set_scale(scale)
 
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1662,9 +1761,11 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node._gfx_node = group
 		node._rebuild_geometry()
 		node.set_position(*position)
-		node.set_scale(scale)
 
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1688,7 +1789,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node._gfx_node = group
 		node.set_position(*start)
 
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1720,7 +1824,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node.set_position(*position)
 		node.set_scale(scale)
 
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1743,7 +1850,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node.set_position(*position)
 		node.set_scale(scale)
 
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1775,22 +1885,48 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node._gfx_node = group
 		if node._data is not None:
 			node._rebuild_bbox()
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
-	def add_isosurface(self, name=None, threshold=0.5, color=(1.0, 0.4, 0.2),
+	def add_isosurface(self, name=None, threshold=None, color=(1.0, 0.4, 0.2),
 		parent=None):
-		"""Add an IsoSurfaceNode that renders isosurface from parent DataNode."""
+		"""Add an IsoSurfaceNode that renders isosurface from parent DataNode.
+
+		If threshold is not given, a reasonable default (mean + 1 standard
+		deviation of the volume data) is computed from the parent data node,
+		matching the EMAN2 3-D viewer's convention.
+		"""
 		if parent is None:
 			parent = self._selected_node
 		label = name or SceneNode.next_name("IsoSurface")
+		if threshold is None:
+			# Default: mean + 1 std of the parent data node's volume
+			threshold = 0.5
+			data = None
+			if isinstance(parent, DataNode):
+				data = parent._data
+			else:
+				for n in (parent, parent.parent if parent is not None else None):
+					if isinstance(n, DataNode) and n._data is not None:
+						data = n._data
+						break
+			if data is not None:
+				a = np.asarray(data)
+				if a.size > 0 and (float(a.max()) > float(a.min())):
+					threshold = float(a.mean() + a.std())
 		node = IsoSurfaceNode(name=label, threshold=threshold,
 			color=color, parent=parent)
 		group = gfx.Group()
 		node._gfx_node = group
 		node._rebuild_volume()
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1804,7 +1940,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		group = gfx.Group()
 		node._gfx_node = group
 		node._rebuild_slice()
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1817,7 +1956,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		group = gfx.Group()
 		node._gfx_node = group
 		node._rebuild_volume()
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
@@ -1831,7 +1973,10 @@ class EMScene3DWidget(QtWidgets.QWidget):
 		node._gfx_node = group
 		if data is not None:
 			node.set_data(data)
+		first = len(self._root_group.children) == 0
 		self._root_group.add(group)
+		if first:
+			self._fit_view_to(node)
 		self._request_render()
 		return node
 
