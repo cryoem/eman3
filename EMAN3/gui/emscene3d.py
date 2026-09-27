@@ -1597,10 +1597,20 @@ class EMScene3DWidget(QtWidgets.QWidget):
 			traceback.print_exc()
 
 	def _update_gfx_nodes(self):
-		"""Sync visibility of all gfx nodes."""
+		"""Sync visibility of all gfx nodes. A node is displayed only if it and
+		all of its ancestors are visible; hiding an ancestor suppresses the
+		whole subtree without altering the children's own checked states."""
 		for node in self._scene_root.get_all_nodes():
-			if node._gfx_node is not None:
-				node._gfx_node.visible = node._visible
+			if node._gfx_node is None:
+				continue
+			visible = True
+			n = node
+			while n is not None:
+				if not n._visible:
+					visible = False
+					break
+				n = n._parent
+			node._gfx_node.visible = visible
 
 	# -- View fitting --------------------------------------------------------
 
@@ -2232,6 +2242,12 @@ class EMScene3DInspector(QtWidgets.QWidget):
 		btn_layout.addWidget(self.remove_btn)
 		left_layout.addLayout(btn_layout)
 
+		# Top-level object selector: -1 shows all top-level objects, k (0-based)
+		# shows only the k-th one (checked in the tree, the others unchecked)
+		self.nth_slider = ValSlider(left_widget, (-1, 1), "Nth", value=-1)
+		self.nth_slider.setIntonly(True)
+		left_layout.addWidget(self.nth_slider)
+
 		# Mouse mode info (EMANController: Euler-angle based, no gimbal lock)
 		info_label = QtWidgets.QLabel("Left-drag: Rotate Az/Alt | Bottom 10%: Phi | Right-drag: Pan | Scroll: Zoom")
 		info_label.setStyleSheet("QLabel { color: gray; font-size: 9px; }")
@@ -2416,6 +2432,17 @@ class EMScene3DInspector(QtWidgets.QWidget):
 		bg_layout.addWidget(self.bg_color_btn)
 		layout.addWidget(bg_frame)
 
+		# Isosurface
+		iso_frame = QtWidgets.QGroupBox("Isosurface")
+		iso_layout = QtWidgets.QHBoxLayout(iso_frame)
+		iso_layout.addWidget(QtWidgets.QLabel("Set Threshold"))
+		self.iso_thresh_entry = QtWidgets.QLineEdit()
+		self.iso_thresh_entry.setFixedWidth(80)
+		iso_layout.addWidget(self.iso_thresh_entry)
+		self.iso_set_btn = QtWidgets.QPushButton("Set")
+		iso_layout.addWidget(self.iso_set_btn)
+		layout.addWidget(iso_frame)
+
 		# Buttons
 		self.snapshot_btn = QtWidgets.QPushButton("Save Snapshot")
 		layout.addWidget(self.snapshot_btn)
@@ -2433,6 +2460,8 @@ class EMScene3DInspector(QtWidgets.QWidget):
 
 		self.add_btn.clicked.connect(self._on_add_dialog)
 		self.remove_btn.clicked.connect(self._on_remove_selected)
+		self.nth_slider.valueChanged.connect(self._on_nth_changed)
+		self.iso_set_btn.clicked.connect(self._on_set_iso_threshold)
 		self.tree.itemClicked.connect(self._on_tree_click)
 		self.tree.itemChanged.connect(self._on_item_changed)
 
@@ -2821,6 +2850,71 @@ class EMScene3DInspector(QtWidgets.QWidget):
 
 		self.tree.expandItem(self.tree.topLevelItem(0))
 		self.tree.blockSignals(False)
+		self._sync_nth_slider()
+
+	def _sync_nth_slider(self):
+		"""Keep the Nth slider's range in step with the scene: minimum -1 (all
+		top-level objects), maximum = N-1 (0-based index of the last top-level
+		element). If the scene shrank past the current value, clamps it and
+		re-applies the selection so the scene matches the slider."""
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		n = len(tgt.get_scene_root().children)
+		self.nth_slider.setRange(-1, n - 1)
+		v = int(self.nth_slider.getValue())
+		if v > n - 1:
+			v = (n - 1) if n else -1
+			self.nth_slider.setValue(v, quiet=1)
+			self._apply_nth(v, tgt)
+		elif v < -1:
+			self.nth_slider.setValue(-1, quiet=1)
+			self._apply_nth(-1, tgt)
+
+	def _apply_nth(self, v, tgt):
+		"""Check only the indicated top-level object (0-based); v=-1 checks
+		all. Children keep their own checked states."""
+		tops = tgt.get_scene_root().children
+		if not tops:
+			return
+		k = int(v)
+		if k < 0:
+			for node in tops:
+				node.visible = True
+		else:
+			k = min(k, len(tops) - 1)
+			for i, node in enumerate(tops):
+				node.visible = (i == k)
+		tgt._request_render()
+
+	def _on_nth_changed(self, v):
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		self._apply_nth(int(v), tgt)
+		self.update_tree()
+
+	def _on_set_iso_threshold(self):
+		"""Set the threshold of every isosurface in the scene (at any level)
+		to the entered value, once, immediately."""
+		tgt = self._get_tgt()
+		if not tgt:
+			return
+		text = self.iso_thresh_entry.text().strip()
+		try:
+			v = float(text)
+		except ValueError:
+			print("invalid isosurface threshold: %r" % text)
+			return
+		count = 0
+		for node in tgt.get_scene_root().get_all_nodes():
+			if isinstance(node, IsoSurfaceNode):
+				node.set_threshold(v)
+				count += 1
+		if not count:
+			print("no isosurfaces in the scene")
+			return
+		tgt._request_render()
 
 	def _build_tree_item(self, node, parent_item):
 		item = QtWidgets.QTreeWidgetItem()
