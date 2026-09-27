@@ -436,19 +436,27 @@ def test_mrc():
 	except: pass
 
 	img1 = test_img_2d(48, 96)
+	img2 = test_img_2d(48, 96) + 0.5
 	io = MrcIO(out_s, "rw")
 	idx = io.write_header({"nx": 96, "ny": 48, "nz": 1, "bitdepth": 0}, -1)
 	io.write_data(img1, idx)
-	io.write_header({"nx": 96, "ny": 48, "nz": 1, "bitdepth": 0}, -1)
+	idx = io.write_header({"nx": 96, "ny": 48, "nz": 1, "bitdepth": 0}, -1)
+	io.write_data(img2, idx)
 	io = None
 
 	io = MrcIO(out_s, "r")
+	assert io.nimg == 2, f"nimg={io.nimg}"
 	d = io.read_data(0)
 	print(f"  stack[0] shape={d.shape}")
 	assert d.shape == (48, 96), f"Shape mismatch: {d.shape}"
 	assert float(d[0, 0]) == 0.0,   f"d[0,0]={d[0,0]}"
 	assert float(d[0, 1]) == 1.0,   f"d[0,1]={d[0,1]}"
 	assert float(d[1, 0]) == 96.0,  f"d[1,0]={d[1,0]}"
+	d1 = io.read_data(1)
+	assert d1.shape == (48, 96), f"Shape mismatch: {d1.shape}"
+	assert float(d1[0, 0]) == 0.5,  f"d1[0,0]={d1[0,0]}"
+	assert float(d1[0, 1]) == 1.5,  f"d1[0,1]={d1[0,1]}"
+	assert float(d1[1, 0]) == 96.5, f"d1[1,0]={d1[1,0]}"
 	print("  stack PASS")
 	io = None
 
