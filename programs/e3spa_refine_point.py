@@ -34,10 +34,11 @@ from EMAN3.EMAN3jax import (
 from EMAN3.io.imageio import ImageIO
 from EMAN3.transform import Transform
 from EMAN3.ctf import EMAN2Ctf
+from EMAN3.processor import *
 
 # Generic numpy volume helpers shared with the sibling program
 from programs.e3make3d_point import (
-	lowpass_gauss, normalize_edgemean, apply_symmetry, write_volume, compute_fsc
+	write_volume, compute_fsc
 )
 
 try: os.mkdir(".jaxcache")
@@ -391,7 +392,7 @@ def main():
 				if dbugvol is not None:
 					nyd=dbugvol.shape[1] # EMStack3D is shape N, Z, Y, X so need not to use shape[0]
 					if options.sym not in ("c1","C1","I","i"):
-						vol=EMStack3D(apply_symmetry(point.volume(nyd,zmax).numpy[0],sym)).do_fft().jax
+						vol=xform_applysym(EMStack3D(point.volume(nyd,zmax)), options.sym).do_fft().jax
 					else: vol=point.volume(nyd,zmax).do_fft().jax
 					fsc=jax_fsc_jit(vol,dbugvol)
 					out=open(f"fscm3d_{sn:02d}_{i:02d}.txt","w")
@@ -645,17 +646,17 @@ def main():
 
 	times.append(time.time())
 	vol=point.volume(outsz,zmax).center_clip(outsz)
-	vol=vol.numpy[0]
 	if options.sym not in ("c1","C1","I","i"):
 		if options.verbose>0 : print(f"Apply {options.sym} symmetry to map (not points)")
-		vol=apply_symmetry(vol,sym)
+		vol=xform_applysym(vol,options.sym)
 	times.append(time.time())
 	nhdr={"apix_x":apix*nxraw/outsz,"apix_y":apix*nxraw/outsz,"apix_z":apix*nxraw/outsz}
 	if options.ptcl3d_id is not None : nhdr["ptcl3d_id"]=options.ptcl3d_id
-	write_volume(f"{options.path}/threed_{sn:02d}_unfilt.hdf",vol,nhdr)
-	if options.volfiltlp>0: vol=lowpass_gauss(vol,(1.0/options.volfiltlp)*(apix*nxraw/outsz))
+	write_volume(f"{options.path}/threed_{sn:02d}_unfilt.hdf",vol.numpy[0],nhdr)
+	if options.volfiltlp>0: vol=linearfilter_lowpass_gaussian(vol,cutoff_freq=1.0/options.volfiltlp)
 	vol=normalize_edgemean(vol)
 	times.append(time.time())
+	vol=vol.numpy[0]
 	write_volume(f"{options.path}/threed_{sn:02d}.hdf",vol,nhdr)
 
 

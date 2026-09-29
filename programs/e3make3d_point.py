@@ -28,6 +28,8 @@ from EMAN3.EMAN3jax import (
 )
 from EMAN3.io.imageio import ImageIO
 
+from EMAN3.processor import *
+
 try: os.mkdir(".jaxcache")
 except: pass
 
@@ -40,71 +42,6 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 jax.config.update("jax_default_matmul_precision", "float32")
 
 EMANVERSION="e3make3d_point (EMAN3)"
-
-
-def lowpass_gauss(vol,fc):
-	"""Gaussian lowpass filter in Fourier space. fc is the half-amplitude cutoff in cycles/pixel"""
-	nz,ny,nx=vol.shape
-	# kz=np.fft.fftfreq(nz)*nz
-	kz=np.fft.fftfreq(nz)
-	# ky=np.fft.fftfreq(ny)*ny
-	ky=np.fft.fftfreq(ny)
-	# kx=np.fft.fftfreq(nx)*nx
-	kx=np.fft.fftfreq(nx)
-	KZ,KY,KX=np.meshgrid(kz,ky,kx,indexing="ij")
-	R=np.sqrt(KZ*KZ+KY*KY+KX*KX)
-	mult=np.exp(-2.0*np.log(2.0)*(R/fc)**2)
-	return np.fft.ifftn(np.fft.fftn(vol)*mult).real
-
-
-def normalize_edgemean(vol):
-	"""Linear transform such that the mean of the 3-pixel border around the edges is 0 and the std is 1
-	(same semantics as the EMAN2 "normalize.edgemean" processor)"""
-	ny,nx=vol.shape[0],vol.shape[1]
-	b=3
-	edgemean=(vol[0:b,:,:].mean()+vol[ny-b:,:,:].mean()+vol[:,0:b,:].mean()+vol[:,ny-b:,:].mean()+vol[:,:,0:b].mean()+vol[:,:,nx-b:].mean())/6.0
-	std=vol.std()
-	if std<1e-12 : return vol-edgemean
-	return (vol-edgemean)/std
-
-
-def apply_symmetry(vol,sym):
-	"""Average a real-space (z,y,x) volume over the symmetry units of sym (pure rotation about the center,
-	trilinear interpolation). Same intent as the EMAN2 "xform.applysym" processor applied to a map"""
-	orts=Orientations()
-	orts.init_from_transforms(sym.get_syms())
-	mxs=np.array(orts.to_mx3d())				# (3,3,M)
-	nz,ny,nx=vol.shape
-	c=np.array(((nz-1)/2.0,(ny-1)/2.0,(nx-1)/2.0))
-	z,y,x=np.meshgrid(np.arange(nz),np.arange(ny),np.arange(nx),indexing="ij")
-	P=np.stack((x,y,z),axis=-1).reshape((-1,3))		# (n,3) xyz order
-	shp=np.array(vol.shape)
-	out=np.zeros_like(vol)
-	cnt=np.zeros(P.shape[0])				# per-voxel count of symmetry units that contributed
-	for i in range(mxs.shape[2]):
-		q=(P-c)@mxs[:,:,i].T+c			# where to sample in the input volume
-		valid=(q>=0).all(axis=1)&(q<shp).all(axis=1)
-		if not valid.any(): continue
-		qv=q[valid]
-		i0=np.floor(qv).astype(np.int32)
-		frac=qv-i0
-		i1=np.minimum(i0+1,shp-1)					# clamp the +1 tap to the last index
-		def g(ix,iy,iz): return vol[iz,iy,ix]		# vol is (z,y,x); coords are xyz
-		vv=(
-			g(i0[:,0],i0[:,1],i0[:,2])*(1-frac[:,0])*(1-frac[:,1])*(1-frac[:,2])+\
-			g(i0[:,0],i0[:,1],i1[:,2])*(1-frac[:,0])*(1-frac[:,1])*frac[:,2]+\
-			g(i0[:,0],i1[:,1],i0[:,2])*(1-frac[:,0])*frac[:,1]*(1-frac[:,2])+\
-			g(i0[:,0],i1[:,1],i1[:,2])*(1-frac[:,0])*frac[:,1]*frac[:,2]+\
-			g(i1[:,0],i0[:,1],i0[:,2])*frac[:,0]*(1-frac[:,1])*(1-frac[:,2])+\
-			g(i1[:,0],i0[:,1],i1[:,2])*frac[:,0]*(1-frac[:,1])*frac[:,2]+\
-			g(i1[:,0],i1[:,1],i0[:,2])*frac[:,0]*frac[:,1]*(1-frac[:,2])+\
-			g(i1[:,0],i1[:,1],i1[:,2])*frac[:,0]*frac[:,1]*frac[:,2]
-		)
-		out.reshape(-1)[valid]+=vv
-		cnt[valid]+=1.0
-	m=cnt>0
-	out.reshape(-1)[m]/=cnt[m]
-	return out
 
 
 def write_volume(path,vol,hdr=None):
@@ -492,7 +429,7 @@ def main():
 			if dbugvol is not None:
 				nyd=dbugvol.shape[0]
 				if options.sym not in ("c1","C1","I","i"):
-					vol=EMStack3D(apply_symmetry(point.volume(nyd,zmax).numpy[0],sym)).do_fft().jax
+					vol=xform_applysym(EMStack3D(point.volume(nyd,zmax)), options.sym).do_fft().jax
 				else: vol=point.volume(nyd,zmax).do_fft().jax
 				fsc=jax_fsc_jit(vol,dbugvol)
 				out=open(f"fscm3d_{sn:02d}_{i:02d}.txt","w")
@@ -627,16 +564,17 @@ def main():
 		else: vol=final_point.volume_np(outsz,zmax).center_clip(outsz)
 	elif options.postclip>0 : vol=point.volume(outsz,zmax).center_clip(options.postclip)
 	else : vol=point.volume(outsz,zmax).center_clip(outsz)
-	vol=vol.numpy[0]
 	if options.sym not in ("c1","C1","I","i"):
 		if options.verbose>0 : print(f"Apply {options.sym} symmetry to map (not points)")
-		vol=apply_symmetry(vol,sym)
+		vol=xform_applysym(vol,options.sym)
 	times.append(time.time())
 	nhdr={"apix_x":apix*nxraw/outsz,"apix_y":apix*nxraw/outsz,"apix_z":apix*nxraw/outsz,"sym":options.sym}
 	if options.ptcl3d_id is not None : nhdr["ptcl3d_id"]=options.ptcl3d_id
-	write_volume(options.volout.replace(".hdf","_unfilt.hdf"),vol,nhdr)
-	if options.volfiltlp>0: vol=lowpass_gauss(vol,(1.0/options.volfiltlp)*(apix*nxraw/outsz))
+	write_volume(options.volout.replace(".hdf","_unfilt.hdf"),vol.numpy[0],nhdr)
+	if options.volfiltlp>0: vol=linearfilter_lowpass_gaussian(vol,cutoff_freq=1.0/options.volfiltlp)
+
 	vol=normalize_edgemean(vol)
+	vol=vol.numpy[0]
 	times.append(time.time())
 	write_volume(options.volout,vol,nhdr)
 

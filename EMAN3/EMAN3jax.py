@@ -338,6 +338,7 @@ class EMStack():
 		on each axis"""
 		pass
 
+	# Anya TODO note: This automatically puts nz as 1, so it doesn't work for saving EMStack3D. Also it doesn't have its own write_images method
 	def write_images(self,fsp=None,bits=12,n0=0):
 		"""Write images to an HDF5 file. fsp is the output filename, bits controls
 		compression/bit-depth (0=float32, 8=uint8, 16=uint16), n0 is start index."""
@@ -1450,7 +1451,7 @@ def pointset_project_simple_sym_fn(pointary, ortary, ny, tytx, symmx):
 	return jnp.mean(jax.vmap(prjset_simple_single_sym, in_axes=[None, None, None, None, 2])(pointary, ortary, ny, tytx, symmx), axis=0)
 
 
-def point_project_ctf_single_fn(pointary,mx,ctf_info,apix,boxsize,tytx,astig):
+def point_project_ctf_single_fn(pointary,mx,ctf_info,apix,boxsize,tytx,astig,beamtiltZ):
 
 	"""This exists as a function separate from the Point class to better support JAX optimization. It is called by the corresponding Point method.
 	Same as point_project_single_fn, but includes single defocus value CTF modification, does not include symmetry
@@ -1503,7 +1504,7 @@ def point_project_ctf_single_fn(pointary,mx,ctf_info,apix,boxsize,tytx,astig):
 
 # A jit compiled and vmapped over orientations version of point_project_ctf_single_fn. Makes multiple projections
 # Also same as point_project_simple_fn only with single defocus value CTF modification
-point_project_ctf_fn=jax.jit(jax.vmap(point_project_ctf_single_fn, in_axes=[None, 2, None, None, None, 0, 0, 0]) ,static_argnames=["boxsize"])
+point_project_ctf_fn=jax.jit(jax.vmap(point_project_ctf_single_fn, in_axes=[None, 2, None, None, None, 0, 0,0]) ,static_argnames=["boxsize"])
 
 def prj_ctf_single_sym(pointary, ortary, ctf_info, apix, boxsize, tytx, astig, beamtiltZ, symmx):
 	"""Like point_project_ctf_fn, but includes symmetry. Calculates the projections of pointary in the orientation defined by ortary and tytx, but modified into the symmetrical unit specified by symmx.
@@ -1674,7 +1675,7 @@ def point_volume_fn(pointary,boxsize,zsize):
 
 	return vol
 
-def jit_apply_ctf(ctf_info, proj, dfary, astig, apix,sign_only):
+def jit_apply_ctf(ctf_info, proj, dfary, astig, apix,beamtiltZ,sign_only):
 	"""jitable version of apply_ctf function in CTFStack class. Called in projection code"""
 	ctfary = jit_compute_2d_ctf(ctf_info[0], ctf_info[1], jnp.pi/2-astig[1], apix, proj.shape[1], dfary, astig[2], astig[3], sign_only)
 	return jnp.fft.irfft2(jnp.fft.rfft2(proj) * ctfary)
@@ -2355,7 +2356,7 @@ def ort_gradient_step_ctf_optax(point,ptclsfds,meta,ctf_info,dsapix,symmx,weight
 	pointary=point.jax
 	ptcls=ptclsfds.jax
 
-	frcs, [gradort, gradtytx] = ort_sym_prj_frc_loss_ctf(pointary,meta[:,2:5],ctf_info,dsapix,meta[:,0:2],meta[:,5:9],symmx,ptcls,weight,thresh)
+	frcs, [gradort, gradtytx] = ort_sym_prj_frc_loss_ctf(pointary,meta[:,2:5],ctf_info,dsapix,meta[:,0:2],meta[:,5:9],meta[:,11:26],symmx,ptcls,weight,thresh)
 
 	qual=frcs
 	stdort=gradort.std()		# orientation spinvec std
@@ -2368,11 +2369,11 @@ def sym_prj_frc_loss_ctf(pointary,ortary,ctf_info,dsapix,tytx,astig,beamtiltZ,sy
 	comparison of the Points in point to particles in known orientations. Returns -frc since optax wants to minimize, not maximize
 	Includes single value CTF"""
 	ny=ptcls.shape[1]
-	prj=point_project_ctf_sym_fn(pointary, ortary, ctf_info, dsapix, ny, tytx, astig, symmx)
+	prj=point_project_ctf_sym_fn(pointary, ortary, ctf_info, dsapix, ny, tytx, astig, jnp.ones(astig.shape), symmx)
 	return -jax_frc_jit(jax_fft2d(prj),ptcls,weight,thresh)
 
 point_sym_prj_frc_loss_ctf=jax.jit(jax.value_and_grad(sym_prj_frc_loss_ctf))
-ort_sym_prj_frc_loss_ctf=jax.jit(jax.value_and_grad(sym_prj_frc_loss_ctf, argnums=(1, 5)))
+ort_sym_prj_frc_loss_ctf=jax.jit(jax.value_and_grad(sym_prj_frc_loss_ctf, argnums=(1, 4)))
 
 def point_gradient_step_layered_ctf_optax(point,ptclsfds,meta,ctf_info,dfstep,dsapix,symmx,weight,thresh):
 # def gradient_step_layered_ctf_optax(point,ptclsfds,orts,ctf_info,tytx,astig,dfstep,dsapix,weight=1.0,relstep=1.0,frc_Z=3.0):
