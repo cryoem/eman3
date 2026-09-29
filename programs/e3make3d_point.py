@@ -497,7 +497,7 @@ def main():
 				ctf=ptclsfds.ctf
 				wavelength=12.2639/np.sqrt(ptclsfds.voltage*1000.0+0.97845*ptclsfds.voltage*ptclsfds.voltage)
 				dfstep=2*apix*apix/(wavelength*10000)
-				ctf_projs=EMStack2D(point_project_ctf_sym_fn(pointary, orts.jax, jnp.array([wavelength,ptclsfds.cs]), dsapix, ny, tytx, ctf, 0.0, symmx))
+				ctf_projs=EMStack2D(point_project_ctf_sym_fn(pointary, orts.jax, jnp.array([wavelength,ptclsfds.cs]), dsapix, ny, tytx, ctf, symmx))
 				layered_ctf_projs=EMStack2D(point_project_layered_ctf_sym_fn(pointary,orts.jax,jnp.array([wavelength,ptclsfds.cs]),dfstep,dsapix,ny,tytx,ctf, symmx))
 			ptclds=EMStack2D(jnp.fft.irfft2(ptclsfds.jax,s=(ny,ny)))
 			transforms=orts.transforms(tytx=tytx)
