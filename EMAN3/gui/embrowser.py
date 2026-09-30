@@ -1739,14 +1739,15 @@ class EMFileItemModel(QtCore.QAbstractItemModel):
 				data = None
 		else:
 			return QtCore.QModelIndex()
-		if data == None:
-			return QtCore.QModelIndex()
+		if data == None or data is self.root:
+			return QtCore.QModelIndex()   # top-level items must report an invalid parent
 		return self.createIndex(index.row(), 0, data)
 
 	def sort(self, column, order):
 		if column < 0:
 			return
-		self.root.sort(column, order)
+		reverse = bool(getattr(order, "value", order))   # Qt.SortOrder enum (or int) -> bool
+		self.root.sort(column, reverse)
 		self.layoutChanged.emit()
 
 	def findSelected(self, toplevel=True):
@@ -1782,7 +1783,7 @@ class SortSelTree(QtWidgets.QTreeView):
 		else:
 			self.scol = col
 			self.sdir = 1
-		self.header().setSortIndicator(self.scol, self.sdir)
+		self.header().setSortIndicator(self.scol, Qt.SortOrder.AscendingOrder if self.sdir else Qt.SortOrder.DescendingOrder)
 		self.header().setSortIndicatorShown(True)
 		self.sortByColumn(self.scol, self.sdir)
 
@@ -1796,7 +1797,7 @@ class SortSelTree(QtWidgets.QTreeView):
 		except Exception:
 			pass
 
-		QtWidgets.QTreeView.sortByColumn(self, col, ascend)
+		QtWidgets.QTreeView.sortByColumn(self, col, Qt.SortOrder.AscendingOrder if ascend else Qt.SortOrder.DescendingOrder)
 
 		sel = self.model().findSelected()
 		if len(sel) == 0:
@@ -1804,7 +1805,7 @@ class SortSelTree(QtWidgets.QTreeView):
 		qis = QtCore.QItemSelection()
 		for i in sel:
 			qis.select(i, i)
-		self.selectionModel().select(qis, QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows)
+		self.selectionModel().select(qis, QtCore.QItemSelectionModel.SelectionFlags.ClearAndSelect | QtCore.QItemSelectionModel.SelectionFlags.Rows)
 
 
 # ===========================================================================
