@@ -137,8 +137,8 @@ class Transform:
     
     def rotate(self, by: 'Transform') -> None:
         """Post-multiply: result = by * self"""
-        self.matrix[:] = by.matrix @ self.matrix
-    
+        self.matrix[:] = (by * self).matrix
+
     def rotate_origin(self, by: 'Transform') -> None:
         """Pre-multiply for rotation (rotation only)"""
         self.matrix[:, :3] = by.matrix[:, :3] @ self.matrix[:, :3]
@@ -177,6 +177,17 @@ class Transform:
         t.matrix = self.matrix.copy()
         t.transpose_inplace()
         return t
+
+    def __mul__(self, other: 'Transform') -> 'Transform':
+        """Compose two transforms (EMAN2 operator* convention): (self*other) applies
+        other first, then self. Uses 4x4 homogeneous matrices for correct affine composition"""
+        A = np.asarray(self.matrix)
+        B = np.asarray(other.matrix)
+        if A.shape != (4, 4): A = self.get_matrix_4x4()
+        if B.shape != (4, 4): B = other.get_matrix_4x4()
+        out = Transform()
+        out.matrix = (A @ B)[:3, :4]
+        return out
     
     # === Euler rotation methods ===
     
@@ -472,6 +483,19 @@ class Transform:
             n2 = A1 / sinomega if sinomega > 1e-10 else 0
             n3 = A2 / sinomega if sinomega > 1e-10 else 0
             result['e0'], result['e1'], result['e2'], result['e3'] = float(cosOover2), float(sinOover2 * n1), float(sinOover2 * n2), float(sinOover2 * n3)
+        elif euler_type == 'spin':
+            # axis (n1,n2,n3) + rotation angle omega in degrees (EMAN2 "spin" convention)
+            trace = self.matrix[0, 0] + self.matrix[1, 1] + self.matrix[2, 2]
+            cosomega = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+            A0 = (self.matrix[1, 2] - self.matrix[2, 1]) / 2.0
+            A1 = (self.matrix[2, 0] - self.matrix[0, 2]) / 2.0
+            A2 = (self.matrix[0, 1] - self.matrix[1, 0]) / 2.0
+            sinomega = np.sqrt(A0**2 + A1**2 + A2**2)
+            n1 = A0 / sinomega if sinomega > 1e-10 else 0.0
+            n2 = A1 / sinomega if sinomega > 1e-10 else 0.0
+            n3 = A2 / sinomega if sinomega > 1e-10 else 0.0
+            result['n1'], result['n2'], result['n3'] = float(n1), float(n2), float(n3)
+            result['omega'] = float(np.arccos(cosomega) * 180.0 / np.pi)
         return result
 
     def get_params(self, euler_type: str = 'eman') -> Dict:

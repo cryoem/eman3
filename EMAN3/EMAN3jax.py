@@ -72,6 +72,7 @@ from jax import grad, jit
 from jax import lax
 from jax import random
 import jaxlib
+import optax
 from functools import partial
 
 import faulthandler
@@ -531,7 +532,7 @@ class EMStack2D(EMStack):
 			self._meta=np.zeros((imgs.shape[0],11),dtype=np.float32)
 			if parent is not None:
 				if parent.metadata.shape==(imgs.shape[0],11): self._meta=parent._meta.copy()
-				else: raise Exception(f"EMStack2D(imgs,meta) has {imgs.shape[0]} images but metadata shape is {meta.shape}")
+				else: raise Exception(f"EMStack2D(imgs,meta) has {imgs.shape[0]} images but metadata shape is {parent._meta.shape}")
 				self.apix,self.is_phase_flipped,self.voltage,self.cs=parent.apix,parent.is_phase_flipped,parent.voltage,parent.cs
 			## Extract metadata from headers if provided
 			elif headers is not None:
@@ -927,7 +928,7 @@ class Orientations():
 			else: self._data=np.zeros((data,3),np.float32)
 		elif isinstance(data,str): self.init_symmetry(data)
 		elif (isinstance(data,list) or isinstance(data,tuple)) and isinstance(data[0],Transform):
-			self.initfromtransforms(data)
+			self.init_from_transforms(data)
 		else:
 			try: self._data=np.array(data,np.float32)
 			except: raise Exception(f"Orientations must be initialized with an integer (number of orientations) or a N x 3 numpy array. Got {type(data)}:  {data}")
@@ -1217,7 +1218,7 @@ significantly altering the spatial distribution. npoint specifies the total numb
 #		proj=tf.zeros((len(orts),boxsize,boxsize))		# projections
 		proj2=[]
 		mx=orts.to_mx2d(swapxy=True)
-		if tytx is None: tytx=jnp.zeros
+		if tytx is None: tytx=jnp.zeros((self._data.shape[0],2))
 		return EMStack2D(point_project_simple_fn(self._data,mx,boxsize,tytx))
 
 	def project_ctf(self,orts,ctf_stack,boxsize,dfrange,tytx=None):
@@ -2426,6 +2427,122 @@ def sym_prj_frc_loss_layered_ctf(pointary,ortary,ctf_info,dfstep,dsapix,tytx,ast
 
 point_sym_prj_frc_loss_layered_ctf=jax.jit(jax.value_and_grad(sym_prj_frc_loss_layered_ctf), static_argnames=["dfstep","dsapix"])
 ort_sym_prj_frc_loss_layered_ctf=jax.jit(jax.value_and_grad(sym_prj_frc_loss_layered_ctf, argnums=(1,5)), static_argnames=["dfstep","dsapix"])
+
+#################################################### FITTING A 2-D POINTS MODEL TO A SINGLE 2-D IMAGE #################################################
+# Reusable coarse-to-fine fit of a 2-D Points model (x,y,amp; z=0) to a single 2-D image by maximizing band-limited FRC.
+# Intended for representing a single 2-D image (eg a micrograph) by a sparse set of 2-D Points, for subsequent CTF estimation
+# (see programs/e3ctf.py) or other uses. Point coordinates are box-relative (-0.5..0.5) and therefore sampling-invariant:
+# the same Points array projects consistently to any box size, which is what makes the coarse-to-fine strategy work.
+
+def _pointfit_sizes(S):
+	"""Default coarse-to-fine working sizes for an image of even square size S: [S/8, S/4, S/2, S], each rounded down to even
+	and clamped to a minimum of 16, strictly ascending and ending at S."""
+	out=[]
+	for f in (0.125,0.25,0.5):
+		s=int(S*f)//2*2
+		if s<16: s=16
+		if s>out[-1] if out else s>0: out.append(s)
+	if S>out[-1] if out else S>0: out.append(S)
+	return out
+
+def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100, lr=0.003, thresh=0.0, seed=0, band=None, verbose=0):
+	"""Fit a set of 2-D Points (x,y,amp; z=0) to a single 2-D image by maximizing band-limited FRC, working coarse-to-fine
+	across progressively larger working sizes and point counts. The identity orientation is used (no rotation or symmetry),
+	so the result is a 2-D object model. The Point coordinates are box-relative (-0.5..0.5), hence sampling-invariant
+	agross the working sizes; the same final Points array may be projected to any box size.
+
+	img - 2-D real image (numpy or jax), even square size S
+	apix - A/pix
+	nfinal - number of Points at the largest (final) working size
+	ninit - number of Points at the smallest (coarsest) working size (default max(16, round(nfinal/16)))
+	sizes - optional list of even working sizes, strictly ascending and MUST end at the image size S (default auto)
+	iters - number of Adam gradient steps per working size (an int, or a list aligned with sizes)
+	lr - Adam learning rate
+	thresh - FRC threshold passed to jax_frc_jit (0 = no thresholding)
+	seed - RNG seed for the initial random Points
+	band - (lo,hi) spatial frequency in 1/Angstrom used to weight the FRC (default 0..Nyquist); the upper bound is clamped
+		to each working size's Nyquist, so coarse stages fit only the frequencies they can represent
+	verbose - 0 (quiet), 1 (per-stage summary), 2 (per-iteration progress)
+	Returns (Points, final_frc) where final_frc is the band-limited FRC of the fitted model vs the image at the full size S."""
+	img=np.asarray(img,np.float32)
+	S=img.shape[0]
+	if img.ndim!=2 or img.shape[1]!=S or S%2!=0 : raise Exception(f"fit_points_to_image_2d requires an even, square, 2-D image, got shape {img.shape}")
+	if nfinal<1 : raise Exception("nfinal must be >= 1")
+	sizes=[int(s) for s in (sizes if sizes is not None else _pointfit_sizes(S))]
+	if sizes[-1]!=S : raise Exception(f"sizes must end at the image size {S}, got {sizes}")
+	if any(s%2!=0 or s>S for s in sizes) : raise Exception(f"sizes must be even and <= the image size: {sizes}")
+	if any(sizes[i]>=sizes[i+1] for i in range(len(sizes)-1)) : raise Exception(f"sizes must be strictly ascending: {sizes}")
+	if ninit is None: ninit=max(16,int(round(nfinal/16.0)))
+	ninit=min(max(1,ninit),nfinal)
+	if band is None: band=(0.0,1.0/(2.0*apix))
+	lo,hi=float(band[0]),float(band[1])
+	if hi<=0 : raise Exception("band hi must be > 0")
+
+	orts=jnp.array([[0.,0.,0.]])
+	tytx=jnp.array([[0.,0.]])
+	symmx=jnp.eye(3)[None,...]
+
+	if isinstance(iters,(list,tuple)):
+		iters=[int(x) for x in iters]
+		if len(iters)!=len(sizes) : raise Exception(f"iters (as a list) must align with sizes ({len(sizes)})")
+	else:
+		iters=[int(iters)]*len(sizes)
+
+	rng=np.random.default_rng(seed)
+	N=ninit
+	# x,y uniform in (-0.5,0.5); z=0 (2-D, unused under the identity orientation); amp uniform in (-1/3,1/3)
+	pa=jnp.stack([rng.uniform(-0.5,0.5,N),rng.uniform(-0.5,0.5,N),np.zeros(N),rng.uniform(-1.0/3.0,1.0/3.0,N)],axis=1).astype(jnp.float32)
+
+	imgf_full=jax_fft2d(jnp.asarray(img)[np.newaxis,...])	# (1,S,S//2+1) complex64
+	imgf_cache={S:imgf_full}
+	def imgf_at(s):
+		if s not in imgf_cache: imgf_cache[s]=jax_downsample_2d(imgf_full,s)	# (1,s,s//2+1) complex64
+		return imgf_cache[s]
+
+	def weight_at(s):
+		# rbin = freq[1/A]*apix[A/px]*orig_npx is size-invariant; clamp both bounds to the working size's Nyquist
+		rl=int(lo*apix*S) if lo>0 else 0
+		rh=int(hi*apix*S)
+		rl=min(rl,s//2); rh=min(rh,s//2)
+		if rl>=rh: rl=rh-1
+		if rl<0: rl=0
+		w=np.zeros(s//2+1)
+		w[rl:rh+1]=1.0
+		w=w/w.sum()*len(w)		# compensate for the .mean() inside jax_frc_jit so the metric is a true band average
+		return jnp.array(w)
+
+	def loss(p,imgf,w,s):
+		prj=point_project_simple_sym_fn(p,orts,s,tytx,symmx)	# (1,s,s) real
+		return -jax_frc_jit(jax_fft2d(prj),imgf,w,thresh)
+	lv=jax.jit(jax.value_and_grad(loss,argnums=0),static_argnames=["s"])
+
+	ns=len(sizes)
+	def target(stage): return int(round(ninit+(nfinal-ninit)*stage/(ns-1))) if ns>1 else nfinal
+
+	for stage,s in enumerate(sizes):
+		rad_img_int(s)
+		imgf=imgf_at(s)
+		w=weight_at(s)
+		t=target(stage)
+		if len(Points(np.array(pa)))<t:
+			P=Points(np.array(pa)); P.replicate_abs(t,dev=0.01); pa=P.jax
+		optim=optax.adam(lr)
+		st=optim.init(pa)
+		its=iters[stage]
+		for it in range(its):
+			val,grad=lv(pa,imgf,w,s)
+			upd,st=optim.update(grad,st,pa)
+			pa=optax.apply_updates(pa,upd)
+			frc=-float(jnp.nan_to_num(val))
+			if verbose>=2 and (it%max(1,its//10)==0 or it==its-1): print(f"    size={s} it={it}/{its} band_FRC={frc:.4f}")
+		pa=pa.at[:,2].set(0.0)		# enforce 2-D (z=0)
+		frc=-float(jnp.nan_to_num(lv(pa,imgf,w,s)[0]))
+		if verbose>=1: print(f"  stage {stage+1}/{ns}: size={s:5d} N={len(Points(np.array(pa))):6d} band_FRC={frc:.4f}")
+
+	P=Points(np.array(pa))
+	P[:,2]=0.0
+	frc=-float(jnp.nan_to_num(lv(P.jax,imgf_at(S),weight_at(S),S)[0]))
+	return (P,float(frc))
 
 def ccf_step_align(point,ptclsfds,orts,tytx):
 	"""Uses CCF to update all translational alignments in one step with CCF"""

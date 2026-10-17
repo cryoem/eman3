@@ -1697,17 +1697,23 @@ and translate them into a dictionary."""
 
 	def normalize(self):
 		"""This will read the entire file and insure that the line-length parameter is valid. If it is not,
-it will rewrite the file with a valid line-length. """
+	it will rewrite the file with a valid line-length."""
 
-		self.ptr.seek(self.seekbase)
-		self.n=0
 		while 1:
-			ln=self.ptr.readline()
-			if len(ln)==0 :break
-			if len(ln)!=self.linelen :
-				self.rewrite()
-				break
-			self.n+=1
+			self.ptr.seek(self.seekbase)
+			self.n=0
+			need_rewrite=False
+			while 1:
+				ln=self.ptr.readline()
+				if len(ln)==0 : break
+				if len(ln)!=self.linelen :
+					self.rewrite()
+					need_rewrite=True
+					break
+				self.n+=1
+			if not need_rewrite: break
+			# if we rewrote, self.seekbase/self.linelen changed and the record
+			# count must be recomputed (the count up to the mismatch is stale)
 
 	def rewrite(self,minlen=0):
 		"""This will reprocess the entire file to make sure the line length is correct. It does take 2 passes,

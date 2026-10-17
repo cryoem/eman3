@@ -398,7 +398,7 @@ def _read_mrc_header(raw):
 		fields["creatid"] = struct.unpack_from(endian+"h", data, 96)[0]
 		
 		# exttyp[4]
-		fields["exttyp"] = data[104:108].decode("ascii", errors="replace")
+		fields["exttyp"] = data[104:108].decode("ascii", errors="replace").strip("\x00")
 		
 		# nversion(int)
 		fields["nversion"] = struct.unpack_from(endian+"i", data, 108)[0]
@@ -432,7 +432,7 @@ def _read_mrc_header(raw):
 		fields["zorigin"] = struct.unpack_from(endian+"f", data, 204)[0]
 		
 		# map string
-		fields["map"] = data[208:212].decode("ascii", errors="replace")
+		fields["map"] = data[208:212].decode("ascii", errors="replace").strip("\x00")
 		
 		# machinestamp + rms + nlabels
 		fields["machinestamp"] = struct.unpack_from(endian+"i", data, 212)[0]
@@ -650,6 +650,8 @@ class MrcIO:
 			self.is_stack = True
 
 		if self._is_new_file:
+			if mode == "r":
+				raise FileIOError(f"Cannot open file '{self.filename}' for reading: no such file")
 			fmode = "wb+"
 			self._initialized = True
 		elif mode == "r":

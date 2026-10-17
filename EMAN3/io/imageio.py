@@ -203,6 +203,9 @@ class ImageIO:
 		self._ext = ext.lower()
 
 		if not os.path.exists(self._filename):
+			if self._mode == "r":
+				raise FileNotFoundError(
+					f"Cannot open image file '{self._filename}' for reading: no such file")
 			# File doesn't exist — infer format from extension only
 			io_cls = self._class_for_extension(ext)
 			if io_cls is None:

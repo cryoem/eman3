@@ -808,7 +808,9 @@ def _write_attribute(loc, name, val):
 	elif isinstance(val, (float, np.floating)):
 		loc.attrs[name] = np.float32(val)
 	elif isinstance(val, str):
-		loc.attrs[name] = val
+		# HDF5 variable-length strings cannot hold embedded NULLs (e.g. from
+		# fixed-width char fields in binary headers); drop them rather than fail
+		loc.attrs[name] = val.replace("\x00", "")
 	else:
 		# Try to serialize Transform objects (have get_matrix_string method)
 		if hasattr(val, 'get_matrix_string'):

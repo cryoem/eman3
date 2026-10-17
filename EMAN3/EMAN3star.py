@@ -137,6 +137,9 @@ class StarFile(dict):
 						x=float(self.curdict[k][0])		# if we can convert the first item to a float then we do the array conversion, not perfect, but will block most strings from conversion
 						self.curdict[k]=np.array(self.curdict[k])
 					except: pass
+			else:
+				# unrecognized line: fail fast rather than spin forever (no branch consumed it)
+				raise ValueError(f"StarFile: unrecognized line {line!r} in {self.filename}")
 
 		if len(self["default"])==0: del self["default"]
 
