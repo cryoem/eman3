@@ -32,7 +32,7 @@
 """MRC image format reader/writer for EMAN.
 
 MRC (Medical Research Council) stores 1D, 2D or 3D images with a rich binary
-header (~1048 bytes before IMOD extensions, or ~1144 with full IMOD). Multiple
+header (1024 bytes, matching the C++ MrcHeader struct). Multiple
 data modes: float32, uint8, int16, uint16, and packed 4-bit (UHEX).
 
 Supported extensions:
@@ -98,9 +98,14 @@ _HOST_LITTLE = (sys.byteorder == "little")
 
 
 def _generate_machine_stamp():
-	"""Generate the machine endian stamp used in MRC headers."""
+	"""Generate the machine endian stamp used in MRC headers.
+
+	Matches C++ MrcIO::generate_machine_stamp(): on a little-endian host the
+	stamp bytes are 44 41 00 00 (int value 0x4144); on big-endian 11 11 00 00
+	(int value 0x11110000).
+	"""
 	if _HOST_LITTLE:
-		return 0x41440000  # little-endian
+		return 0x4144  # little-endian
 	else:
 		return 0x11110000  # big-endian
 
@@ -120,11 +125,11 @@ def _get_mode_size(mode):
 	return sizes.get(mode, 0)
 
 
-# MRC header size: first 52 ints (208 bytes) + "MAP " (4) + machinestamp(4) + rms(4)
-#   + nlabels(4) + labels[10][80] (800) = 1040 bytes (CCP4/MRC2000 format).
-# IMOD adds extra fields between byte 96 and the MAP string.
-# The C++ struct includes IMOD extensions making it ~1048 bytes.
-MRC_HEADER_SIZE = 1048
+# MRC header size = sizeof(MrcHeader) in the C++ implementation (libEM/io/mrcio.h):
+#   224 bytes of fixed fields (through "MAP "/machinestamp/rms/nlabels at 208-223)
+#   + labels[10][80] (800 bytes) = 1024 bytes.
+# Image data starts at 1024 + nsymbt (matching C++ MrcIO read_data/write).
+MRC_HEADER_SIZE = 1024
 
 # FEI extended header: complex packed struct, calculated by C++ as __attribute__((packed))
 FEI_EXT_HEADER_SIZE = 632
@@ -133,7 +138,7 @@ FEI_EXT_HEADER_SIZE = 632
 def _build_mrc_header(fields):
 	"""Build MRC header bytes from a dict of field values.
 	
-	Returns bytes of length MRC_HEADER_SIZE (1048).
+	Returns bytes of length MRC_HEADER_SIZE (1024).
 	Layout matches the C++ MrcHeader struct including IMOD extensions.
 	"""
 	buf = bytearray(MRC_HEADER_SIZE)
@@ -231,8 +236,8 @@ def _build_mrc_header(fields):
 	# offset 220: nlabels(4)
 	# offset 224: labels[10][80] = 800 bytes
 	
-	# Total = 224 + 800 = 1024. That's not matching our header size of 1048.
-	# The discrepancy is the IMOD fields that extend the struct. Let me look at what comes after blank[6]:
+	# Total = 224 + 800 = 1024, matching MRC_HEADER_SIZE = sizeof(MrcHeader).
+	# The IMOD fields are all within those 224 leading bytes (offsets 96-207).
 	# The original C++ has more IMOD fields between offset 96 and MAP. Specifically:
 	# After creatid+blank (offset 104), we have exttyp+nversion+blank2, then the shorts, floats, etc.
 	
@@ -589,7 +594,7 @@ class MrcIO:
 	"""Read and write MRC format image files.
 
 	MRC stores float32, uint8, int16 or uint16 image data with a rich binary
-	header (~1048 bytes). Supports single images, stacks (MRCS), and FEI extended
+	header (1024 bytes). Supports single images, stacks (MRCS), and FEI extended
 	headers. BigTIFF-style sequential writes for multi-image files.
 
 	Modes: "r" (read-only), "rw" (read-write, creates new file if it doesn't exist).
