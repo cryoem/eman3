@@ -1698,6 +1698,36 @@ def jit_compute_2d_ctf(wavelength, cs, phase, apix, ny, defocus, dfdiff, dfang, 
 		ctf = jnp.sign(ctf)
 	return ctf
 
+def ctf_image(ny, apix, wl, cs, ac_phase, df, dfdiff, dfang, tx=0.0, ty=0.0):
+	"""Return the CTF amplitude image of shape (ny, ny//2+1) for the given parameters.
+
+	Matches the codebase CTF convention (see EMAN3/ctf.py and jit_compute_2d_ctf):
+	  CTF(s) = cos( -g1*s^4 + g2*df(s)*s^2 + tilt(s) - ac_phase )
+	  g1 = (pi/2)*Cs*1e7*lambda^3   (Cs in mm, lambda in A)
+	  g2 = pi*lambda*1e4            (defocus in um, s in 1/A)
+	  ac_phase = pi/2 - asin(ampcont/100)
+	with an in-plane beam-tilt phase term  tilt(s) = 2*pi*(tx*sx + ty*sy)  (tx,ty in A).
+	astigmatism: df(s) = df + (dfdiff/2)*cos(2*theta - 2*pi*dfang/180).
+
+	Unlike jit_compute_2d_ctf (which is jitted for batched projection work), this is a plain
+	function that recomputes its own frequency grid, so it is convenient to call directly for a
+	single image or from arbitrary contexts.
+
+	Units: df,dfdiff microns; dfang degrees; tx,ty Angstroms; wl Angstroms; cs mm; apix A/pix.
+	"""
+	fx = jnp.arange(ny // 2 + 1)
+	fy = jnp.arange(ny); fy = jnp.where(fy > ny // 2, fy - ny, fy)
+	Y, X = jnp.meshgrid(fy, fx, indexing='ij')          # (ny, ny//2+1)
+	sx = X / (apix * ny); sy = Y / (apix * ny)          # 1/A
+	s2 = sx * sx + sy * sy
+	g1 = (jnp.pi / 2.0) * cs * 1.0e7 * wl ** 3
+	g2 = jnp.pi * wl * 1.0e4
+	ang = jnp.arctan2(sy, sx)
+	dfi = df + (dfdiff / 2.0) * jnp.cos(2.0 * ang - (2.0 * jnp.pi / 180.0) * dfang)
+	tilt = 2.0 * jnp.pi * (tx * sx + ty * sy)
+	gam = -g1 * s2 * s2 + g2 * dfi * s2 + tilt
+	return jnp.cos(gam - ac_phase)
+
 def jax_to_mx2d(ortary,swapxy=False):
 	"""Returns the current set of orientations as a 2 x 3 x N matrix which will transform a set of 3-vectors to a set of
 	2-vectors, ignoring the resulting Z component. Typically used with Points to generate projections.
@@ -2445,7 +2475,54 @@ def _pointfit_sizes(S):
 	if S>out[-1] if out else S>0: out.append(S)
 	return out
 
-def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100, lr=0.003, thresh=0.0, seed=0, band=None, verbose=0):
+def point_interpolate_simple_fn(pointary, boxsize):
+	"""Bilinearly interpolate a set of 2-D points (x,y,amp) into a real image. The plain 2-D analog of
+	point_project_simple_fn for the identity orientation: no 3-D transformation, symmetry, or Z is involved.
+
+	pointary  - (N,3) array of [x, y, amp]; x,y in -0.5..0.5 (box-relative), amp is the (signed) weight
+	boxsize   - even target image size in pixels; the -0.5..0.5 range maps onto the box
+	conv      - point x maps to image columns and point y to image rows, with (0,0) at the image center
+	returns   - (boxsize, boxsize) float32 image of the bilinearly interpolated points
+	"""
+	amp = pointary[:, 2]
+	cx = (pointary[:, 0] + 0.5) * boxsize     # x -> column pixel coord (0..boxsize)
+	yy = (pointary[:, 1] + 0.5) * boxsize     # y -> row pixel coord (0..boxsize)
+	cxf = jnp.floor(cx); cxi = cxf.astype(jnp.int32); cxf = cx - cxf
+	yyf = jnp.floor(yy); yyi = yyf.astype(jnp.int32); yyf = yy - yyf
+	# bilinear weights for the four surrounding pixels
+	w00 = amp * (1.0 - cxf) * (1.0 - yyf)
+	w10 = amp * (cxf) * (1.0 - yyf)
+	w11 = amp * (cxf) * (yyf)
+	w01 = amp * (1.0 - cxf) * (yyf)
+	weights = jnp.concat([w00, w10, w11, w01], axis=0)
+	cols = jnp.concat([cxi, cxi + 1, cxi + 1, cxi], axis=0)     # col offset (0,1,1,0)
+	rows = jnp.concat([yyi, yyi, yyi + 1, yyi + 1], axis=0)     # row offset (0,0,1,1)
+	img = jnp.zeros((boxsize, boxsize), dtype=jnp.float32)
+	img = img.at[rows, cols].add(weights, mode="drop")          # out-of-box contributions dropped
+	return img
+
+point_interpolate_simple = jax.jit(point_interpolate_simple_fn, static_argnames=["boxsize"])
+
+def point_interpolate_ctf_fn(pointary, boxsize, apix, ctf_info, astig, sign_only=False):
+	"""2-D analog of point_project_ctf_fn: interpolate a set of 2-D points (x,y,amp) into a real image and
+	apply a single uniform CTF. No 3-D transformation, symmetry, or Z is involved. Reuses the same CTF
+	machinery as the 3-D projection code (jit_apply_ctf / jit_compute_2d_ctf), so the 2-D and 3-D CTF
+	conventions are identical.
+
+	pointary  - (N,3) array of [x, y, amp]; x,y in -0.5..0.5 (box-relative), amp is the (signed) weight
+	boxsize   - even image size in pixels; the -0.5..0.5 range maps onto the box
+	apix      - A/pix at this boxsize
+	ctf_info  - [wavelength (A), cs (mm)]
+	astig     - [defocus (um), asin(ampcont/100), dfdiff (um), dfang (deg)]
+	sign_only - if True, apply only the CTF sign (phase-flip), not the full amplitude
+	returns   - (boxsize, boxsize) float32 CTF-modulated image
+	"""
+	img = jnp.expand_dims(point_interpolate_simple_fn(pointary, boxsize), 0)   # (1, boxsize, boxsize)
+	return jnp.squeeze(jit_apply_ctf(ctf_info, img, jnp.reshape(astig[0], (1,)), astig, apix, sign_only), 0)
+
+point_interpolate_ctf = jax.jit(point_interpolate_ctf_fn, static_argnames=["boxsize", "sign_only"])
+
+def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100, lr=0.003, thresh=0.0, seed=0, band=None, verbose=0, dump_prefix=None):
 	"""Fit a set of 2-D Points (x,y,amp; z=0) to a single 2-D image by maximizing band-limited FRC, working coarse-to-fine
 	across progressively larger working sizes and point counts. The identity orientation is used (no rotation or symmetry),
 	so the result is a 2-D object model. The Point coordinates are box-relative (-0.5..0.5), hence sampling-invariant
@@ -2463,6 +2540,7 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 	band - (lo,hi) spatial frequency in 1/Angstrom used to weight the FRC (default 0..Nyquist); the upper bound is clamped
 		to each working size's Nyquist, so coarse stages fit only the frequencies they can represent
 	verbose - 0 (quiet), 1 (per-stage summary), 2 (per-iteration progress)
+	dump_prefix - if set, save the Points after each coarse-to-fine stage to <dump_prefix><stage>.txt (1-based stage number)
 	Returns (Points, final_frc) where final_frc is the band-limited FRC of the fitted model vs the image at the full size S."""
 	img=np.asarray(img,np.float32)
 	S=img.shape[0]
@@ -2477,10 +2555,6 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 	if band is None: band=(0.0,1.0/(2.0*apix))
 	lo,hi=float(band[0]),float(band[1])
 	if hi<=0 : raise Exception("band hi must be > 0")
-
-	orts=jnp.array([[0.,0.,0.]])
-	tytx=jnp.array([[0.,0.]])
-	symmx=jnp.eye(3)[None,...]
 
 	if isinstance(iters,(list,tuple)):
 		iters=[int(x) for x in iters]
@@ -2512,7 +2586,7 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 		return jnp.array(w)
 
 	def loss(p,imgf,w,s):
-		prj=point_project_simple_sym_fn(p,orts,s,tytx,symmx)	# (1,s,s) real
+		prj=jnp.expand_dims(point_interpolate_simple(p[:,[0,1,3]],s),0)	# (1,s,s) real; p is (N,4) x,y,z,amp
 		return -jax_frc_jit(jax_fft2d(prj),imgf,w,thresh)
 	lv=jax.jit(jax.value_and_grad(loss,argnums=0),static_argnames=["s"])
 
@@ -2538,6 +2612,8 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 		pa=pa.at[:,2].set(0.0)		# enforce 2-D (z=0)
 		frc=-float(jnp.nan_to_num(lv(pa,imgf,w,s)[0]))
 		if verbose>=1: print(f"  stage {stage+1}/{ns}: size={s:5d} N={len(Points(np.array(pa))):6d} band_FRC={frc:.4f}")
+		if dump_prefix is not None:
+			Points(np.array(pa)).save(f"{dump_prefix}{stage+1}.txt")
 
 	P=Points(np.array(pa))
 	P[:,2]=0.0

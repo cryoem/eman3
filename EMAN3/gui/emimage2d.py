@@ -1,6 +1,7 @@
 # EMAN3 2D Image Viewer - PyGfx rendering with PySide6
 # Ported from EMAN2 qtgui/emimage2d.py
 
+import time
 import weakref
 from math import sqrt
 from EMAN3.gui.valslider import ValSlider, ValBox
@@ -158,6 +159,134 @@ def _compute_rendered_histogram(rgb_float):
 	gray = rgb_float[::8, ::8, 0].ravel()
 	hist, _ = np.histogram(gray * 255, bins=256, range=(0, 256))
 	return hist.astype(np.uint32)
+
+
+def _fft_origin_masked_stats(data):
+	"""mean/sigma/min/max of FFT display data with the Fourier origin excluded.
+
+	After ``fftshift`` the DC term sits at the center pixel. For images with a
+	large non-zero mean it dominates the range and crushes the rest of the
+	spectrum to black, so it is excluded from all auto-contrast range math
+	(this fixed offset adds nothing to the visual interpretation of the
+	power spectrum).
+	"""
+	data = np.asarray(data)
+	ny, nx = data.shape[0], data.shape[1]
+	mask = np.ones((ny, nx), dtype=bool)
+	mask[ny // 2, nx // 2] = False
+	vals = data[mask]
+	mean = float(np.mean(vals))
+	sigma = float(np.std(vals))
+	return mean, sigma, float(np.min(vals)), float(np.max(vals))
+
+
+def _calc_radial_power(fft, n_bins):
+	"""Radial average of |FFT|^2 for an unshifted 2D FFT.
+
+	Replicates EMAN2 ``EMData::calc_radial_dist(n_bins, 0.0, 1.0, 1)`` on a 2D
+	half-complex (real-input) image: pixels (x, y) with x in [0, nx/2] and
+	y in [0, ny), skipping the conjugate-duplicate column (x == 0, y > ny/2).
+	Radii are measured from the corner origin with y folded about ny/2, and
+	values are linearly interpolated between bins (the fractional spill into a
+	bin beyond the last one is dropped, as in the C++ implementation).
+	"""
+	ny, nx = fft.shape
+	npairs = nx // 2 + 1
+	power = np.abs(fft[:, :npairs]) ** 2
+
+	x = np.arange(npairs, dtype=np.float64)[np.newaxis, :]
+	y = np.arange(ny)
+	y1 = np.where(y < ny // 2, y, ny - y).astype(np.float64)[:, np.newaxis]
+	r = np.hypot(x, y1)
+
+	# C++ skips the duplicated Nyquist column (x==0, y>ny/2)
+	valid = np.ones((ny, npairs), dtype=bool)
+	valid[ny // 2 + 1:, 0] = False
+
+	r = r[valid]
+	v = power[valid]
+
+	f = r.astype(np.int64)
+	frac = r - f
+
+	ret = np.zeros(n_bins)
+	norm = np.zeros(n_bins)
+
+	m = f < n_bins
+	if m.any():
+		np.add.at(ret, f[m], v[m] * (1.0 - frac[m]))
+		np.add.at(norm, f[m], 1.0 - frac[m])
+
+	f1 = f + 1
+	m1 = f1 < n_bins
+	if m1.any():
+		np.add.at(ret, f1[m1], v[m1] * frac[m1])
+		np.add.at(norm, f1[m1], frac[m1])
+
+	out = np.zeros(n_bins)
+	np.divide(ret, norm, out=out, where=norm > 0)
+	return out
+
+
+def _calc_azimuthal_amplitude(fft, n_bins=180, a0_deg=-90.0, da_deg=1.0,
+						    rmin=4.0, rmax=None):
+	"""Azimuthal average of |FFT| for an unshifted 2D FFT.
+
+	Replicates EMAN2 ``EMData::calc_az_dist(n_bins, a0_deg, da_deg, rmin, rmax)``
+	on a 2D half-complex (real-input) image: amplitudes of pixels (x, y) with
+	x in [0, nx/2], y in [0, ny) whose radius lies in [rmin, rmax], binned by
+	angle into n_bins bins starting at a0_deg with linear interpolation
+	(angles outside the bin range are dropped, as in the C++ implementation).
+	"""
+	ny, nx = fft.shape
+	if rmax is None:
+		rmax = ny // 3
+	npairs = nx // 2 + 1
+	amp = np.abs(fft[:, :npairs])
+
+	x = np.arange(npairs, dtype=np.float64)[np.newaxis, :]
+	y = np.arange(ny)
+	y1 = np.where(y < ny // 2, y, y - ny).astype(np.float64)[:, np.newaxis]
+
+	r = np.hypot(x, y1)
+	keep = (r >= rmin) & (r <= rmax)
+
+	a0 = a0_deg * np.pi / 180.0
+	da = da_deg * np.pi / 180.0
+	ang = (np.arctan2(y1, x) - a0) / da
+	# C++ special case: the (0, -ny/2) pixel is assigned angle a0
+	ang[ny // 2, 0] = 0.0
+	# Note: the C++ implementation initializes its weight accumulator to 1e-5
+	# (epsilon to avoid divide-by-zero), which biases the result; replicate so
+	# that sparse bins match EMAN2 output exactly.
+
+	i = np.floor(ang).astype(np.int64)
+	frac = ang - i
+
+	acc = np.zeros(n_bins)
+	wgt = np.zeros(n_bins)
+
+	m = (i == 0) & keep
+	if m.any():
+		acc[0] += float(np.sum(amp[m] * (1.0 - frac[m])))
+		wgt[0] += float(np.sum(1.0 - frac[m]))
+
+	m = (i == n_bins - 1) & keep
+	if m.any():
+		acc[n_bins - 1] += float(np.sum(amp[m] * frac[m]))
+		wgt[n_bins - 1] += float(np.sum(frac[m]))
+
+	m = (i > 0) & (i < n_bins - 1) & keep
+	if m.any():
+		ii = i[m]
+		np.add.at(acc, ii, amp[m] * (1.0 - frac[m]))
+		np.add.at(wgt, ii, 1.0 - frac[m])
+		np.add.at(acc, ii + 1, amp[m] * frac[m])
+		np.add.at(wgt, ii + 1, frac[m])
+
+	out = np.zeros(n_bins)
+	np.divide(acc, wgt + 1e-5, out=out)
+	return out
 
 
 def _render_fft_complex_rgb(data_complex, scale, origin_x, origin_y,
@@ -588,6 +717,12 @@ class EMImage2DWidget(QtWidgets.QWidget):
 		# Auto-contrast on new data
 		self.auto_contrast(inspector_update=False, display_update=False)
 
+		# If an FFT display mode is active, refresh the power spectrum for the
+		# new data (and its contrast params) instead of reusing the stale one
+		self._fft_cache.clear()
+		if self.curfft > 0:
+			self._compute_fft_display(self.curfft)
+
 		# Set initial scale to match display/image ratio (native zoom)
 		ny, nx = self._data_array.shape
 		w = self.width() if self.width() > 0 else 512
@@ -601,7 +736,7 @@ class EMImage2DWidget(QtWidgets.QWidget):
 
 		# Update inspector
 		if self.inspector:
-			self.inspector_update(use_fourier=False)
+			self.inspector_update(use_fourier=(self.curfft > 0))
 			if self._list_data is not None:
 				self.inspector.enable_image_range(0, len(self._list_data), self._list_idx)
 			else:
@@ -753,30 +888,43 @@ class EMImage2DWidget(QtWidgets.QWidget):
 			self.full_contrast(inspector_update, display_update)
 
 	def auto_contrast_fft(self, inspector_update=True, display_update=True):
-		"""Auto-contrast on current FFT display data."""
+		"""Auto-contrast on current FFT display data.
+
+		The Fourier origin (center) pixel is excluded from the range calculations
+		since its fixed DC offset adds nothing to the power spectrum display.
+		Amplitude/intensity data are non-negative, so the lower limit is always
+		0 and the upper limit is mean + 3 sigma.
+		"""
 		data = self._display_fft
 		if data is None:
 			return
-		mean = float(np.mean(data))
-		sigma = float(np.std(data))
-		m0 = float(np.min(data))
-		m1 = float(np.max(data))
-		self.fminden = m0
-		self.fmaxden = m1
-		self.fcurmin = max(m0, mean - 3.0 * sigma)
-		self.fcurmax = min(m1, mean + 3.0 * sigma)
+		mean, sigma, m0, m1 = _fft_origin_masked_stats(data)
+		if self.curfft in (1, 2):
+			self.fminden = 0.0
+			self.fmaxden = m1
+			self.fcurmin = 0.0
+			self.fcurmax = mean + 3.0 * sigma
+		else:
+			self.fminden = m0
+			self.fmaxden = m1
+			self.fcurmin = max(m0, mean - 3.0 * sigma)
+			self.fcurmax = min(m1, mean + 3.0 * sigma)
 		if inspector_update and self.inspector:
 			self.inspector_update(use_fourier=True)
 		if display_update:
 			self.force_display_update()
 
 	def full_contrast_fft(self, inspector_update=True, display_update=True):
-		"""Full contrast on current FFT display data."""
+		"""Full contrast on current FFT display data (origin pixel excluded).
+
+		Amplitude/intensity data are non-negative, so the lower limit is 0.
+		"""
 		data = self._display_fft
 		if data is None:
 			return
-		self.fcurmin = float(np.min(data))
-		self.fcurmax = float(np.max(data))
+		_, _, m0, m1 = _fft_origin_masked_stats(data)
+		self.fcurmin = 0.0 if self.curfft in (1, 2) else m0
+		self.fcurmax = m1
 		self.fminden = self.fcurmin
 		self.fmaxden = self.fcurmax
 		if inspector_update and self.inspector:
@@ -818,22 +966,28 @@ class EMImage2DWidget(QtWidgets.QWidget):
 				print(f"FFT compute error: {e}")
 
 		# Always recalculate contrast params for this mode (they may have been clobbered)
-		if mode in (2, 3):
-			m0 = float(np.min(self._display_fft))
-			m1 = float(np.max(self._display_fft))
-			mean = float(np.mean(self._display_fft))
-			sigma = float(np.std(self._display_fft))
+		# The Fourier origin (center) pixel is excluded from all range calculations
+		# since its fixed DC offset adds nothing to the power spectrum display.
+		# Amplitude/intensity data are non-negative: lower limit is 0, upper limit
+		# is mean + 3 sigma.
+		if mode == 2:
+			mean, sigma, m0, m1 = _fft_origin_masked_stats(self._display_fft)
+			self.fminden = 0.0
+			self.fmaxden = m1
+			self.fcurmin = 0.0
+			self.fcurmax = mean + 3.0 * sigma
+		elif mode == 3:
+			mean, sigma, m0, m1 = _fft_origin_masked_stats(self._display_fft)
 			self.fminden = m0
 			self.fmaxden = min(m1, mean + 20.0 * sigma)
 			self.fcurmin = m0
 			self.fcurmax = self.fmaxden
 		elif mode == 1:
-			m0 = float(np.min(np.abs(self._display_fft)))
-			m1 = float(np.max(np.abs(self._display_fft)))
-			self.fminden = m0
+			mean, sigma, m0, m1 = _fft_origin_masked_stats(np.abs(self._display_fft))
+			self.fminden = 0.0
 			self.fmaxden = m1
-			self.fcurmin = m0
-			self.fcurmax = m1
+			self.fcurmin = 0.0
+			self.fcurmax = mean + 3.0 * sigma
 		else:
 			self.fcurmin = 0
 			self.fcurmax = 1
@@ -1468,6 +1622,7 @@ class EMImageInspector2D(QtWidgets.QWidget):
 		super().__init__()
 		self._target_ref = weakref.ref(target)
 		self._busy_slider = 0
+		self._pspec_wins = []  # live EMPlot2DWidget windows for power spectra
 
 		self.setWindowTitle("Image Controls")
 		self.setWindowFlags(Qt.Window)
@@ -2018,14 +2173,105 @@ class EMImageInspector2D(QtWidgets.QWidget):
 		except Exception:
 			pass
 
-	def do_pspec_single(self, idx):
-		pass
+	def do_pspec_single(self, ign=None):
+		"""Compute the 1-D power spectrum of the current image and plot it."""
+		tgt = self.target()
+		if tgt is None:
+			return
+		data = tgt._get_current_data()
+		if data is None:
+			return
 
-	def do_pspec_az(self):
-		pass
+		ny = data.shape[0]
+		n_bins = ny // 2
+		pspec = _calc_radial_power(np.fft.fft2(data), n_bins)
 
-	def do_pspec_stack(self):
-		pass
+		ds = 1.0 / (ny * self._get_apix(tgt))
+		s = ds * np.arange(n_bins, dtype=np.float64)
+
+		key = f"img_{tgt._list_idx}" if tgt._list_data is not None else time.strftime("%H:%M:%S")
+		self._show_pspec_window((s, pspec), key, ["Spatial freq (1/A)", "Power"])
+
+	def do_pspec_az(self, ign=None):
+		"""Compute the azimuthal amplitude profile of the current image and plot it."""
+		tgt = self.target()
+		if tgt is None:
+			return
+		data = tgt._get_current_data()
+		if data is None:
+			return
+
+		ny = data.shape[0]
+		pspec = _calc_azimuthal_amplitude(np.fft.fft2(data), 180, -90.0, 1.0, 4.0, ny // 3)
+		s = np.arange(-90.0, 90.0, 1.0)
+
+		key = f"img_{tgt._list_idx}" if tgt._list_data is not None else time.strftime("%H:%M:%S")
+		self._show_pspec_window((s, pspec), key, ["Angle (deg)", "Amplitude"])
+
+	def do_pspec_stack(self, ign=None):
+		"""Compute the average 1-D power spectrum of all stack images and plot it."""
+		tgt = self.target()
+		if tgt is None or tgt._list_data is None or len(tgt._list_data) < 2:
+			return
+
+		ny = tgt._list_data[0].shape[0]
+		n_bins = ny // 2
+		acc = None
+		for im in tgt._list_data:
+			p = _calc_radial_power(np.fft.fft2(im), n_bins)
+			acc = p if acc is None else acc + p
+		acc /= float(len(tgt._list_data))
+
+		ds = 1.0 / (ny * self._get_apix(tgt))
+		s = ds * np.arange(n_bins, dtype=np.float64)
+		self._show_pspec_window((s, acc), "stack avg", ["Spatial freq (1/A)", "Power"], new_window=True)
+
+	def _get_apix(self, tgt):
+		"""Best available pixels-per-Angstrom for the frequency axis scale."""
+		meta = getattr(tgt, "_metadata", None)
+		if isinstance(meta, dict):
+			for k in ("apix", "apix_x"):
+				try:
+					v = float(meta.get(k))
+					if v > 0:
+						return v
+				except (TypeError, ValueError):
+					pass
+		try:
+			v = float(self.mtapix.getValue())
+			if v > 0:
+				return v
+		except Exception:
+			pass
+		return 1.0
+
+	def _show_pspec_window(self, columns, key, column_labels, new_window=False):
+		"""Show a power-spectrum curve in a 2-D plot window.
+
+		Reuses the most recently opened plot window (adding the curve under
+		'key') unless new_window is True, in which case a fresh window is made.
+		"""
+		from EMAN3.gui.emplot2d import EMPlot2DWidget
+
+		if not new_window:
+			self._pspec_wins = [w for w in self._pspec_wins
+								 if not getattr(w, "_plot_dead", False)]
+			if self._pspec_wins:
+				win = self._pspec_wins[-1]
+				win.set_data(columns, key=key, column_labels=column_labels)
+				win.setWindowTitle(key)
+				win.show()
+				win.raise_()
+				return
+
+		win = EMPlot2DWidget()
+		win._plot_dead = False
+		win.destroyed.connect(lambda *_: setattr(win, "_plot_dead", True))
+		self._pspec_wins.append(win)
+		win.set_data(columns, key=key, replace=True, column_labels=column_labels)
+		win.setWindowTitle(key)
+		win.show()
+		win.raise_()
 
 	def do_snapshot(self):
 		tgt = self.target()
