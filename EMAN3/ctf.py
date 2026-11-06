@@ -64,6 +64,7 @@ class EMAN2Ctf:
 		self.dfang = 0.0
 		self.bfactor = 0.0
 		self.ampcont = 0.0
+
 		self.voltage = 0.0
 		self.cs = 0.0
 		self.apix = 1.0
@@ -714,5 +715,451 @@ class EMAN2Ctf:
 
 	def __repr__(self):
 		return (f"EMAN2Ctf(defocus={self.defocus:.1f}, dfdiff={self.dfdiff:.1f}, "
-		        f"dfang={self.dfang:.0f}, voltage={self.voltage:.1f}kV, cs={self.cs:.2f}mm, "
-		        f"ampcont={self.ampcont:.1f}%, apix={self.apix:.3f})")
+			        f"dfang={self.dfang:.0f}, voltage={self.voltage:.1f}kV, cs={self.cs:.2f}mm, "
+			        f"ampcont={self.ampcont:.1f}%, apix={self.apix:.3f})")
+
+
+class EMAN3Ctf:
+	"""EMAN3-style CTF model, based on EMAN2Ctf.
+
+	Differences from EMAN2Ctf:
+		- No background or SNR (dsbg, background, snr are not part of the EMAN3
+		  correction model). Any CtfType that requires SNR or background estimates
+		  (CTF_BACKGROUND, CTF_SNR, CTF_SNR_SMOOTH, CTF_WIENER_FILTER, CTF_TOTAL,
+		  CTF_NOISERATIO) raises CtfTypeError if generation is attempted.
+		- Adds beam tilt (tilt_x, tilt_y) in A, following the Relion convention
+		  (rlnBeamTiltX/Y). In the 2-D CTF the tilt contributes a
+		  direction-dependent term to the CTF phase that scales with the cube of
+		  the spatial frequency:
+		  dphi = pi * lambda * (ux^2+uy^2) * (ux*tx + uy*ty)
+		  so it shifts the zero crossings direction-dependently. It does not
+		  affect the 1-D curve (direction-dependent, like astigmatism).
+
+	Attributes (common with EMAN2Ctf):
+		defocus  - Defocus in microns (positive = underfocus)
+		bfactor  - B-factor in A^2, x-ray convention (e^-B/4 s^2 in amplitude space)
+		voltage  - Microscope voltage in kV
+		cs       - Spherical aberration coefficient in mm
+		apix     - Angstroms per pixel
+		dfdiff   - Defocus difference for astigmatism (defocus is major elliptical axis)
+		dfang    - Angle of major elliptical axis in degrees, counterclockwise from x
+		ampcont  - Amplitude contrast as a percentage (e.g. 10 for 10%)
+		tilt_x   - Beam tilt along x in A (Relion rlnBeamTiltX convention)
+		tilt_y   - Beam tilt along y in A (Relion rlnBeamTiltY convention)
+	"""
+
+	#: CtfTypes that require SNR or background estimates, which EMAN3Ctf does not model
+	_UNSUPPORTED_TYPES = (
+		CtfType.CTF_BACKGROUND,
+		CtfType.CTF_SNR,
+		CtfType.CTF_SNR_SMOOTH,
+		CtfType.CTF_WIENER_FILTER,
+		CtfType.CTF_TOTAL,
+		CtfType.CTF_NOISERATIO,
+	)
+
+	def __init__(self):
+		self.defocus = 0.0
+		self.dfdiff = 0.0
+		self.dfang = 0.0
+		self.bfactor = 0.0
+		self.ampcont = 0.0
+		self.voltage = 0.0
+		self.cs = 0.0
+		self.apix = 1.0
+		self.tilt_x = 0.0
+		self.tilt_y = 0.0
+
+	def wavelength(self):
+		"""Electron wavelength in Angstroms (relativistic)."""
+		lam = 12.2639 / math.sqrt(self.voltage * 1000.0 + 0.97845 * self.voltage * self.voltage)
+		return lam
+
+	def defocus_at_angle(self, ang):
+		"""Returns defocus as a function of angle.
+
+		ang - angle in radians
+		"""
+		if self.dfdiff == 0.0:
+			return self.defocus
+		return self.defocus + self.dfdiff / 2.0 * math.cos(2.0 * ang - 2.0 * math.pi / 180.0 * self.dfang)
+
+	def get_defocus(self):
+		"""Returns the defocus in microns."""
+		return self.defocus
+
+	def get_dfdiff(self):
+		"""Returns the defocus difference for astigmatism."""
+		return self.dfdiff
+
+	def get_bfactor(self):
+		"""Returns the B-factor in A^2."""
+		return self.bfactor
+
+	def get_tilt(self):
+		"""Returns the beam tilt (tilt_x, tilt_y) in A (Relion convention)."""
+		return (self.tilt_x, self.tilt_y)
+
+	def set_tilt(self, tilt_x, tilt_y):
+		"""Sets the beam tilt (A, Relion convention)."""
+		self.tilt_x = float(tilt_x)
+		self.tilt_y = float(tilt_y)
+
+	def get_phase(self):
+		"""Returns the phase shift based on amplitude contrast.
+
+		Phase is defined as zero for pure phase contrast (user convenience).
+		The phase shift used in cos(gamma - phase) is shifted -pi/2 from this.
+		"""
+		if self.ampcont > -100.0 and self.ampcont <= 100.0:
+			return math.asin(self.ampcont / 100.0)
+		if self.ampcont > 100.0:
+			return math.pi - math.asin(2.0 - self.ampcont / 100.0)
+		return -math.pi - math.asin(-2.0 - self.ampcont / 100.0)
+
+	def set_phase(self, phase):
+		"""Sets the amplitude contrast depending on the given phase shift (radians)."""
+		if phase >= -math.pi / 2.0 and phase < math.pi / 2.0:
+			self.ampcont = math.sin(phase) * 100.0
+		elif phase >= math.pi / 2.0 and phase <= math.pi:
+			self.ampcont = (2.0 - math.sin(phase)) * 100.0
+		elif phase > -math.pi and phase < -math.pi / 2.0:
+			self.ampcont = (-2.0 - math.sin(phase)) * 100.0
+
+	def _check_type(self, ctf_type):
+		"""Raise CtfTypeError for CtfTypes that require SNR or background."""
+		if ctf_type in self._UNSUPPORTED_TYPES:
+			raise CtfTypeError(
+				f"CtfType {ctf_type} requires SNR or background estimates, which are not part of the EMAN3 CTF model")
+
+	def to_dict(self):
+		"""Returns a dictionary representation of the CTF parameters."""
+		return {
+			"defocus": self.defocus,
+			"dfdiff": self.dfdiff,
+			"dfang": self.dfang,
+			"bfactor": self.bfactor,
+			"ampcont": self.ampcont,
+			"voltage": self.voltage,
+			"cs": self.cs,
+			"apix": self.apix,
+			"tilt_x": self.tilt_x,
+			"tilt_y": self.tilt_y,
+		}
+
+	def from_dict(self, d):
+		"""Initialize CTF parameters from a dictionary (background/snr keys, if
+		present, are ignored)."""
+		self.defocus = float(d.get("defocus", 0.0))
+		self.dfdiff = float(d.get("dfdiff", 0.0))
+		self.dfang = float(d.get("dfang", 0.0))
+		self.bfactor = float(d.get("bfactor", 0.0))
+		self.ampcont = float(d.get("ampcont", 0.0))
+		self.voltage = float(d.get("voltage", 0.0))
+		self.cs = float(d.get("cs", 0.0))
+		self.apix = float(d.get("apix", 1.0))
+		self.tilt_x = float(d.get("tilt_x", 0.0))
+		self.tilt_y = float(d.get("tilt_y", 0.0))
+
+	def to_jsondict(self):
+		"""Creates a dict representation of the object for JSON serialization purposes."""
+		d = self.to_dict()
+		d["__class__"] = "EMAN3Ctf"
+		return d
+
+	def to_vector(self):
+		"""Returns a flat list of all CTF parameters for serialization.
+
+		Order: [defocus, dfdiff, dfang, bfactor, ampcont, voltage, cs, apix, tilt_x, tilt_y]
+		"""
+		return [self.defocus, self.dfdiff, self.dfang, self.bfactor, self.ampcont,
+		        self.voltage, self.cs, self.apix, self.tilt_x, self.tilt_y]
+
+	def from_vector(self, vctf):
+		"""Initialize CTF parameters from a flat list. Order matches to_vector()."""
+		self.defocus = float(vctf[0])
+		self.dfdiff = float(vctf[1])
+		self.dfang = float(vctf[2])
+		self.bfactor = float(vctf[3])
+		self.ampcont = float(vctf[4])
+		self.voltage = float(vctf[5])
+		self.cs = float(vctf[6])
+		self.apix = float(vctf[7])
+		self.tilt_x = float(vctf[8])
+		self.tilt_y = float(vctf[9])
+
+	def to_eman2_string(self):
+		"""Returns an EMAN2-format CTF string (EMAN2Ctf 'E' prefix).
+
+		EMAN2's C++ reader only recognizes CTF strings starting with 'E'/'O'
+		followed by a digit, and EMAN2's Python layer crashes when it finds
+		a plain string in the 'ctf' header key, so HDF files must use this
+		format (rather than the EMAN3-native '3' format of to_string()) for
+		that value. Beam tilt has no EMAN2 equivalent and is dropped here;
+		use to_jsondict() when tilt must be preserved.
+		"""
+		c = EMAN2Ctf()
+		c.defocus = self.defocus
+		c.dfdiff = self.dfdiff
+		c.dfang = self.dfang
+		c.bfactor = self.bfactor
+		c.ampcont = self.ampcont
+		c.voltage = self.voltage
+		c.cs = self.cs
+		c.apix = self.apix
+		return c.to_string()
+
+	def to_string(self):
+		"""Returns a compact string representation of the CTF.
+
+		Format: 3<defocus> <dfdiff> <dfang> <bfactor> <ampcont> <voltage> <cs>
+				<apix> <tilt_x> <tilt_y>
+		The leading '3' identifies this as an EMAN3 CTF string.
+		"""
+		vals = [self.defocus, self.dfdiff, self.dfang, self.bfactor, self.ampcont,
+		        self.voltage, self.cs, self.apix, self.tilt_x, self.tilt_y]
+		return "3" + " ".join(f"{v:.10g}" for v in vals)
+
+	def from_string(self, ctf_str):
+		"""Parse an EMAN3 CTF string (leading '3', see to_string()) and initialize
+		parameters. Returns 0 on success, 1 on parse error. Raises CtfTypeError if
+		the string is empty or doesn't start with '3'.
+		"""
+		if not ctf_str:
+			raise CtfTypeError("Empty CTF string")
+		ctf_str = ctf_str.strip()
+		if ctf_str[0] != '3':
+			raise CtfTypeError(f"Trying to initialize EMAN3Ctf object with bad string (type='{ctf_str[0]}')")
+		try:
+			vals = [float(x) for x in ctf_str[1:].split()]
+			if len(vals) != 10:
+				return 1
+			(self.defocus, self.dfdiff, self.dfang, self.bfactor, self.ampcont,
+			 self.voltage, self.cs, self.apix, self.tilt_x, self.tilt_y) = vals
+		except (ValueError, IndexError):
+			return 1
+		return 0
+
+	def copy_from(self, other_ctf):
+		"""Copy parameters from another EMAN3Ctf or EMAN2Ctf object (EMAN2 objects
+		imply zero beam tilt; background/snr are not copied)."""
+		if not other_ctf:
+			return
+		self.defocus = other_ctf.defocus
+		self.dfdiff = other_ctf.dfdiff
+		self.dfang = other_ctf.dfang
+		self.bfactor = other_ctf.bfactor
+		self.ampcont = other_ctf.ampcont
+		self.voltage = other_ctf.voltage
+		self.cs = other_ctf.cs
+		self.apix = other_ctf.apix
+		self.tilt_x = float(getattr(other_ctf, "tilt_x", 0.0))
+		self.tilt_y = float(getattr(other_ctf, "tilt_y", 0.0))
+
+	def equal(self, other):
+		"""Check if two EMAN3Ctf objects have the same parameters."""
+		if not isinstance(other, EMAN3Ctf):
+			return False
+		for a in ("defocus", "dfdiff", "dfang", "bfactor", "ampcont", "voltage", "cs", "apix", "tilt_x", "tilt_y"):
+			if getattr(self, a) != getattr(other, a):
+				return False
+		return True
+
+	def zero(self, n=0):
+		"""Calculate the CTF zero crossings (neglecting beam tilt, which shifts
+		them direction-dependently).
+
+		n - specific zero index, or 0 for all zeros.
+		Returns a list of spatial frequencies at which CTF crosses zero.
+		"""
+		lam = self.wavelength()
+		ac = self.ampcont / 100.0
+		phase_shift = math.asin(ac)
+
+		zeros = []
+		num_zeros = 50
+		for m in range(1, num_zeros):
+			gamma_target = (math.pi * (m - 0.5)) + phase_shift
+
+			r1_sq = gamma_target / (-2.0 * math.pi * self.defocus * lam)
+			if r1_sq < 0:
+				continue
+			r1 = math.sqrt(abs(r1_sq)) * 1e-4
+
+			r2_sq = gamma_target / (2.0 * math.pi * 2.5e6 * self.cs * lam * lam * lam)
+
+			zeros.append(float(r1))
+			if r2_sq > 0:
+				r2 = math.sqrt(r2_sq) ** (1.0 / 3.0)
+				if r2 < 1.0:
+					zeros.append(float(r2))
+
+		if n == 0:
+			return sorted(set(zeros))
+		if 0 <= n < len(zeros):
+			return zeros[n]
+		raise CtfTypeError(f"Zero index {n} out of range ({len(zeros)} zeros found)")
+
+	def compute_1d(self, size, ds, ctf_type):
+		"""Compute a 1D CTF curve.
+
+		size - image dimension (output array is size//2 elements)
+		ds - spatial frequency step (typically 1/(apix * size))
+		ctf_type - one of the CtfType constants. CtfTypes requiring SNR or
+			background estimates raise CtfTypeError (not part of the EMAN3 model).
+
+		The 1-D curve is radially symmetric; direction-dependent terms (astigmatism,
+		beam tilt) are not applied, as in EMAN2Ctf.compute_1d.
+
+		Returns a numpy float32 array.
+		"""
+		if self.voltage <= 0:
+			raise CtfTypeError("Voltage must be set (voltage > 0)")
+		self._check_type(ctf_type)
+
+		npts = size // 2
+		s = np.arange(npts, dtype=np.float32) * ds
+		s_sq = s * s
+
+		lam = self.wavelength()
+		g1 = math.pi / 2.0 * self.cs * 1e7 * lam ** 3
+		g2_coeff = math.pi * lam * 1e4
+		acac = math.pi / 2.0 - self.get_phase()
+
+		gam = -g1 * s_sq ** 2 + g2_coeff * self.defocus * s_sq
+		bf_env = np.exp(-(self.bfactor / 4.0) * s_sq)
+		v = np.cos(gam - acac) * bf_env
+
+		if ctf_type == CtfType.CTF_AMP:
+			result = v
+		elif ctf_type == CtfType.CTF_ABS:
+			result = np.abs(v)
+		elif ctf_type == CtfType.CTF_INTEN:
+			result = v * v
+		elif ctf_type == CtfType.CTF_SIGN:
+			c = np.cos(gam - acac)
+			result = np.where(c < 0, -1.0, 1.0).astype(np.float32)
+		elif ctf_type == CtfType.CTF_POWEVAL:
+			mf = np.ones_like(s)
+			mask_low = s < 0.04
+			mf[mask_low] = 0.0
+			mask_trans = (s >= 0.04) & (s < 0.05)
+			mf[mask_trans] = 1.0 - np.exp(-((s[mask_trans] - 0.04) * 300.0) ** 2)
+			c = np.cos(gam - acac)
+			part = np.where(c > 0.9, np.exp(-(50.0 / 4.0) * s_sq), 0.0)
+			result = mf * part * part
+		elif ctf_type == CtfType.CTF_FITREF:
+			mf = np.ones_like(s)
+			mask_low = s < 0.04
+			mf[mask_low] = 0.0
+			mask_trans = (s >= 0.04) & (s < 0.05)
+			mf[mask_trans] = 1.0 - np.exp(-((s[mask_trans] - 0.04) * 300.0) ** 2)
+			c = np.cos(gam - acac) * bf_env
+			result = mf * c * c
+		elif ctf_type == CtfType.CTF_ALIFILT:
+			c = np.cos(gam - acac) ** 2 * bf_env
+			result = c
+		else:
+			raise CtfTypeError(f"Unrecognized CtfType {ctf_type}")
+
+		return result.astype(np.float32)
+
+	def compute_2d_complex(self, ny, ctf_type):
+		"""Compute a 2D complex-frequency-space CTF multiplier.
+
+		ny - image dimension in Y (X is ny+2 for even, ny+1 for odd)
+		ctf_type - one of the CtfType constants. CtfTypes requiring SNR or
+			background estimates raise CtfTypeError (not part of the EMAN3 model).
+
+		If the beam tilt is non-zero, the direction-dependent tilt term
+		pi * lambda * (ux^2+uy^2) * (ux*tx + uy*ty) (scales with the cube of the
+		spatial frequency; Relion beam-tilt convention, tx/ty in A) is added to
+		the CTF phase. The result is real-valued (zero crossings shift
+		direction-dependently with the tilt).
+
+		Returns a complex64 numpy array of shape (ny, nx//2) ready to multiply
+		with Fourier-domain image data element-wise.
+		"""
+		if self.voltage <= 0:
+			raise CtfTypeError("Voltage must be set (voltage > 0)")
+		self._check_type(ctf_type)
+
+		nx = ny + 2 if ny % 2 == 0 else ny + 1
+
+		lam = self.wavelength()
+		g1 = math.pi / 2.0 * self.cs * 1e7 * lam ** 3
+		g2_coeff = math.pi * lam * 1e4
+		acac = math.pi / 2.0 - self.get_phase()
+
+		y_arr = np.arange(-ny // 2, ny // 2)
+		x_arr = np.arange(nx // 2)
+		X, Y = np.meshgrid(x_arr, y_arr)
+		ds = 1.0 / (self.apix * ny)
+		R = np.hypot(X, Y) * ds
+		R_sq = R * R
+		A = np.arctan2(Y, X)
+
+		if self.dfdiff == 0:
+			df_eff = self.defocus
+		else:
+			df_eff = self.defocus + self.dfdiff / 2.0 * np.cos(
+				2.0 * A - 2.0 * math.pi / 180.0 * self.dfang
+			)
+		gam = -g1 * R_sq ** 2 + g2_coeff * df_eff * R_sq
+
+		# Beam tilt term (Relion convention, tx/ty in A): direction-dependent,
+		# scales with the cube of the spatial frequency.
+		if self.tilt_x != 0.0 or self.tilt_y != 0.0:
+			gam = gam + math.pi * lam * R_sq * (X * ds * self.tilt_x + Y * ds * self.tilt_y)
+
+		bf_env = np.exp(-(self.bfactor / 4.0) * R_sq)
+
+		result = np.ones((ny, nx // 2), dtype=np.complex64)
+
+		if ctf_type == CtfType.CTF_AMP:
+			result.real = np.cos(gam - acac) * bf_env
+
+		elif ctf_type == CtfType.CTF_ABS:
+			result.real = np.abs(np.cos(gam - acac) * bf_env)
+
+		elif ctf_type == CtfType.CTF_INTEN:
+			v = np.cos(gam - acac) * bf_env
+			result.real = v * v
+
+		elif ctf_type == CtfType.CTF_SIGN:
+			v = np.cos(gam - acac)
+			result.real = np.where(v < 0, -1.0, 1.0)
+
+		elif ctf_type == CtfType.CTF_POWEVAL:
+			mf = np.ones_like(R)
+			mask_low = R < 0.04
+			mf[mask_low] = 0.0
+			mask_trans = (R >= 0.04) & (R < 0.05)
+			mf[mask_trans] = 1.0 - np.exp(-((R[mask_trans] - 0.04) * 300.0) ** 2)
+			v = np.cos(gam - acac)
+			part = np.where(v > 0.9, np.exp(-(50.0 / 4.0 * R_sq)), 0.0)
+			result.real = mf * part * part
+
+		elif ctf_type == CtfType.CTF_FITREF:
+			mf = np.ones_like(R)
+			mask_low = R < 0.04
+			mf[mask_low] = 0.0
+			mask_trans = (R >= 0.04) & (R < 0.05)
+			mf[mask_trans] = 1.0 - np.exp(-((R[mask_trans] - 0.04) * 300.0) ** 2)
+			v = np.cos(gam - acac) * bf_env
+			result.real = mf * v * v
+
+		elif ctf_type == CtfType.CTF_ALIFILT:
+			v = np.cos(gam - acac) ** 2 * bf_env
+			result.real = v
+
+		else:
+			raise CtfTypeError(f"Unrecognized CtfType {ctf_type}")
+
+		return result.astype(np.complex64)
+
+	def __repr__(self):
+		return (f"EMAN3Ctf(defocus={self.defocus:.1f}, dfdiff={self.dfdiff:.1f}, "
+			        f"dfang={self.dfang:.0f}, voltage={self.voltage:.1f}kV, cs={self.cs:.2f}mm, "
+			        f"ampcont={self.ampcont:.1f}%, apix={self.apix:.3f}, "
+			        f"tilt=({self.tilt_x:.3f},{self.tilt_y:.3f})A")

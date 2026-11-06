@@ -49,7 +49,7 @@ import threading
 import traceback
 import re
 import numpy as np
-from EMAN3.ctf import EMAN2Ctf
+from EMAN3.ctf import EMAN2Ctf, EMAN3Ctf
 from EMAN3.transform import Transform
 
 # If set, fairly verbose debugging information will be written to the console
@@ -171,7 +171,8 @@ def transform_from_jsondict(dct):
 	return ret
 
 def eman3ctf_from_jsondict(dct):
-	ret=EMAN3Ctf(dct["dfmajor"], dct["dfminor"], dct["dfang"], dct["voltage"], dct["cs"], dct["ampcont"], dct["apix"])
+	ret=EMAN3Ctf()
+	ret.from_dict(dct)
 	return ret
 
 ############

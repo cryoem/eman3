@@ -2522,6 +2522,25 @@ def point_interpolate_ctf_fn(pointary, boxsize, apix, ctf_info, astig, sign_only
 
 point_interpolate_ctf = jax.jit(point_interpolate_ctf_fn, static_argnames=["boxsize", "sign_only"])
 
+def _reseed_bad_points(pa, rng, ampfrac=0.05):
+	"""Reseed, at random in-box locations with random amplitudes, any Points that have left the image
+	box (x or y outside -0.5..0.5) or whose |amplitude| has decayed below ampfrac of the maximum point
+	amplitude. Points outside the box no longer contribute to the interpolated image, so their
+	gradient is zero and they can never move back on their own; negligible-amplitude Points are
+	recycled to keep the set populated with live candidates. Returns (updated jnp array, n_reseeded)."""
+	pn=np.array(pa)
+	ampmax=float(np.abs(pn[:,3]).max())
+	bad=(pn[:,0]<-0.5)|(pn[:,0]>0.5)|(pn[:,1]<-0.5)|(pn[:,1]>0.5)|(np.abs(pn[:,3])<ampfrac*ampmax)
+	nb=int(np.count_nonzero(bad))
+	if nb==0:
+		return pa,0
+	pn[bad,0]=rng.uniform(-0.5,0.5,nb)
+	pn[bad,1]=rng.uniform(-0.5,0.5,nb)
+	pn[bad,2]=0.0
+	pn[bad,3]=rng.uniform(-1.0/3.0,1.0/3.0,nb)
+	return jnp.array(pn,jnp.float32),nb
+
+
 def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100, lr=0.003, thresh=0.0, seed=0, band=None, verbose=0, dump_prefix=None):
 	"""Fit a set of 2-D Points (x,y,amp; z=0) to a single 2-D image by maximizing band-limited FRC, working coarse-to-fine
 	across progressively larger working sizes and point counts. The identity orientation is used (no rotation or symmetry),
@@ -2539,6 +2558,9 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 	seed - RNG seed for the initial random Points
 	band - (lo,hi) spatial frequency in 1/Angstrom used to weight the FRC (default 0..Nyquist); the upper bound is clamped
 		to each working size's Nyquist, so coarse stages fit only the frequencies they can represent
+	At the end of each optimizer step, Points outside the image box (where they no longer contribute to
+	the image and have no gradient) or with |amplitude| below 5% of the maximum point amplitude are
+	reseeded at a random in-box location with a random amplitude
 	verbose - 0 (quiet), 1 (per-stage summary), 2 (per-iteration progress)
 	dump_prefix - if set, save the Points after each coarse-to-fine stage to <dump_prefix><stage>.txt (1-based stage number)
 	Returns (Points, final_frc) where final_frc is the band-limited FRC of the fitted model vs the image at the full size S."""
@@ -2565,7 +2587,8 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 	rng=np.random.default_rng(seed)
 	N=ninit
 	# x,y uniform in (-0.5,0.5); z=0 (2-D, unused under the identity orientation); amp uniform in (-1/3,1/3)
-	pa=jnp.stack([rng.uniform(-0.5,0.5,N),rng.uniform(-0.5,0.5,N),np.zeros(N),rng.uniform(-1.0/3.0,1.0/3.0,N)],axis=1).astype(jnp.float32)
+#	pa=jnp.stack([rng.uniform(-0.5,0.5,N),rng.uniform(-0.5,0.5,N),np.zeros(N),rng.uniform(-1.0/3.0,1.0/3.0,N)],axis=1).astype(jnp.float32)
+	pa=jnp.stack([rng.uniform(-0.5,0.5,N),rng.uniform(-0.5,0.5,N),np.zeros(N),np.full(N,0.5)],axis=1).astype(jnp.float32)
 
 	imgf_full=jax_fft2d(jnp.asarray(img)[np.newaxis,...])	# (1,S,S//2+1) complex64
 	imgf_cache={S:imgf_full}
@@ -2607,6 +2630,7 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 			val,grad=lv(pa,imgf,w,s)
 			upd,st=optim.update(grad,st,pa)
 			pa=optax.apply_updates(pa,upd)
+			pa,_=_reseed_bad_points(pa,rng)
 			frc=-float(jnp.nan_to_num(val))
 			if verbose>=2 and (it%max(1,its//10)==0 or it==its-1): print(f"    size={s} it={it}/{its} band_FRC={frc:.4f}")
 		pa=pa.at[:,2].set(0.0)		# enforce 2-D (z=0)
@@ -2619,6 +2643,264 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 	P[:,2]=0.0
 	frc=-float(jnp.nan_to_num(lv(P.jax,imgf_at(S),weight_at(S),S)[0]))
 	return (P,float(frc))
+
+
+def fit_points_to_image_ctf_2d(img, apix, nfinal, ctf, ninit=None, sizes=None, iters=100, lr=0.003, thresh=0.0, seed=0, verbose=0, dump_prefix=None):
+	"""Fit a set of 2-D Points (x,y,amp; z=0) to a single 2-D image WITH a known CTF, by maximizing
+	FRC between the CTF-modulated point model and the image, working coarse-to-fine across
+	progressively larger working sizes and point counts (as in fit_points_to_image_2d). Because the
+	CTF is known rather than being fitted, the full band (0..Nyquist) is used in the FRC.
+
+	img - 2-D real image (numpy or jax), even square size S
+	apix - A/pix
+	nfinal - number of Points at the largest (final) working size
+	ctf - dict of the (known, fixed) CTF parameters: "voltage" (kV) and "cs" (mm) are required,
+	    "ampcont" (%) defaults to 7; optional: "defocus" (um, default 1.0), "dfdiff" (um),
+	    "dfang" (deg), "bfactor" (A^2, Gaussian envelope damping of the object),
+	    "tilt_x"/"tilt_y" (A, in-plane beam tilt, Relion convention)
+	ninit - number of Points at the smallest (coarsest) working size (default max(16, round(nfinal/16)))
+	sizes - optional list of even working sizes, strictly ascending and MUST end at the image size S (default auto)
+	iters - number of Adam gradient steps per working size (an int, or a list aligned with sizes)
+	lr - Adam learning rate
+	thresh - FRC threshold passed to jax_frc_jit (0 = no thresholding)
+	seed - RNG seed for the initial random Points
+	At the end of each optimizer step, Points outside the image box (where they no longer contribute to
+	the image and have no gradient) or with |amplitude| below 5% of the maximum point amplitude are
+	reseeded at a random in-box location with a random amplitude
+	verbose - 0 (quiet), 1 (per-stage summary), 2 (per-iteration progress)
+	dump_prefix - if set, save the Points after each coarse-to-fine stage to <dump_prefix><stage>.txt (1-based stage number)
+	Returns (Points, final_frc) where final_frc is the FRC of the CTF-modulated model vs the image at the full size S."""
+	img=np.asarray(img,np.float32)
+	S=img.shape[0]
+	if img.ndim!=2 or img.shape[1]!=S or S%2!=0 : raise Exception(f"fit_points_to_image_ctf_2d requires an even, square, 2-D image, got shape {img.shape}")
+	if nfinal<1 : raise Exception("nfinal must be >= 1")
+	sizes=[int(s) for s in (sizes if sizes is not None else _pointfit_sizes(S))]
+	if sizes[-1]!=S : raise Exception(f"sizes must end at the image size {S}, got {sizes}")
+	if any(s%2!=0 or s>S for s in sizes) : raise Exception(f"sizes must be even and <= the image size: {sizes}")
+	if any(sizes[i]>=sizes[i+1] for i in range(len(sizes)-1)) : raise Exception(f"sizes must be strictly ascending: {sizes}")
+	if ninit is None: ninit=max(16,int(round(nfinal/16.0)))
+	ninit=min(max(1,ninit),nfinal)
+
+	if isinstance(iters,(list,tuple)):
+		iters=[int(x) for x in iters]
+		if len(iters)!=len(sizes) : raise Exception(f"iters (as a list) must align with sizes ({len(sizes)})")
+	else:
+		iters=[int(iters)]*len(sizes)
+
+	# Known (fixed) CTF parameters
+	voltage=float(ctf.get("voltage",0.0))
+	if voltage<=0 : raise Exception("fit_points_to_image_ctf_2d requires ctf['voltage'] (kV) > 0")
+	cs=float(ctf.get("cs",0.0))
+	if cs<=0 : raise Exception("fit_points_to_image_ctf_2d requires ctf['cs'] (mm) > 0")
+	ampcont=float(ctf.get("ampcont",7.0))
+	df=float(ctf.get("defocus",1.0))
+	dd=float(ctf.get("dfdiff",0.0))
+	da=float(ctf.get("dfang",0.0))
+	B=float(ctf.get("bfactor",0.0))
+	tx=float(ctf.get("tilt_x",0.0))
+	ty=float(ctf.get("tilt_y",0.0))
+	wl=12.2639/(voltage*1000.0+0.97845*voltage*voltage)**0.5
+	ac_phase=pi/2.0-asin(max(-1.0,min(1.0,ampcont/100.0)))
+
+	ctf_cache={}
+	def ctf_at(s):
+		"""CTF amplitude (with optional B damping) on the size-s rfft grid: (s, s//2+1) real"""
+		if s in ctf_cache: return ctf_cache[s]
+		c=ctf_image(s, apix, wl, cs, ac_phase, df, dd, da, tx, ty)
+		if B>0:
+			fx=jnp.arange(s//2+1); fy=jnp.arange(s); fy=jnp.where(fy>s//2, fy-s, fy)
+			Y,X=jnp.meshgrid(fy,fx,indexing='ij')
+			s2=(X*X+Y*Y)/(apix*s)**2
+			c=c*jnp.exp(-B*s2/4.0)
+		ctf_cache[s]=c
+		return c
+
+	rng=np.random.default_rng(seed)
+	N=ninit
+	# x,y uniform in (-0.5,0.5); z=0 (2-D, unused); amp uniform in (-1/3,1/3)
+	pa=jnp.stack([rng.uniform(-0.5,0.5,N),rng.uniform(-0.5,0.5,N),np.zeros(N),rng.uniform(-1.0/3.0,1.0/3.0,N)],axis=1).astype(jnp.float32)
+
+	imgf_full=jax_fft2d(jnp.asarray(img)[np.newaxis,...])	# (1,S,S//2+1) complex64
+	imgf_cache={S:imgf_full}
+	def imgf_at(s):
+		if s not in imgf_cache: imgf_cache[s]=jax_downsample_2d(imgf_full,s)	# (1,s,s//2+1)
+		return imgf_cache[s]
+
+	def weight_at(s):
+		w=np.ones(s//2+1)
+		w=w/w.sum()*len(w)		# compensate for the .mean() inside jax_frc_jit so the metric is a true band average
+		return jnp.array(w)
+
+	def loss(p,imgf,w,s,ctf_s):
+		prj=jnp.expand_dims(point_interpolate_simple(p[:,[0,1,3]],s),0)	# (1,s,s) real
+		simf=jax_fft2d(prj)*ctf_s[np.newaxis,:,:]		# FFT of the CTF-simulated image (the CTF is real, so this is exact)
+		return -jax_frc_jit(simf,imgf,w,thresh)
+	lv=jax.jit(jax.value_and_grad(loss,argnums=0),static_argnames=["s"])
+
+	ns=len(sizes)
+	def target(stage): return int(round(ninit+(nfinal-ninit)*stage/(ns-1))) if ns>1 else nfinal
+
+	for stage,s in enumerate(sizes):
+		rad_img_int(s)
+		imgf=imgf_at(s)
+		w=weight_at(s)
+		ctf_s=ctf_at(s)
+		t=target(stage)
+		if len(Points(np.array(pa)))<t:
+			P=Points(np.array(pa)); P.replicate_abs(t,dev=0.01); pa=P.jax
+		optim=optax.adam(lr)
+		st=optim.init(pa)
+		its=iters[stage]
+		for it in range(its):
+			val,grad=lv(pa,imgf,w,s,ctf_s)
+			upd,st=optim.update(grad,st,pa)
+			pa=optax.apply_updates(pa,upd)
+			pa,_=_reseed_bad_points(pa,rng)
+			frc=-float(jnp.nan_to_num(val))
+			if verbose>=2 and (it%max(1,its//10)==0 or it==its-1): print(f"    size={s} it={it}/{its} CTF_FRC={frc:.4f}")
+		pa=pa.at[:,2].set(0.0)		# enforce 2-D (z=0)
+		frc=-float(jnp.nan_to_num(lv(pa,imgf,w,s,ctf_s)[0]))
+		if verbose>=1: print(f"  stage {stage+1}/{ns}: size={s:5d} N={len(Points(np.array(pa))):6d} CTF_FRC={frc:.4f}")
+		if dump_prefix is not None:
+			Points(np.array(pa)).save(f"{dump_prefix}{stage+1}.txt")
+
+	P=Points(np.array(pa))
+	P[:,2]=0.0
+	frc=-float(jnp.nan_to_num(lv(P.jax,imgf_at(S),weight_at(S),S,ctf_at(S))[0]))
+	return (P,float(frc))
+
+
+def fit_points_to_image_dot_2d(img, apix, nfinal, ctf, ninit=None, sizes=None, iters=100, lr=0.003, seed=0, verbose=0, dump_prefix=None):
+	"""Fit a set of 2-D Points (x,y,amp; z=0) to a single 2-D image WITH a known CTF, by maximizing
+	the cosine-normalized inner product in Fourier space between the CTF-modulated point model and the
+	image. Works coarse-to-fine across progressively larger working sizes and point counts (as in
+	fit_points_to_image_ctf_2d), but with a deliberately simpler metric: a single global vector inner
+	product Re(<img, simf>) / (|img| |simf|) instead of the per-frequency FRC. This is a standalone
+	function (not shared with the FRC version) so its loss closure is simple and JIT-compiles cheaply.
+	The normalization makes the metric invariant to the overall amplitude scale of the point set, so
+	amplitudes cannot run away to inflate the score. The value ranges over -1..1 and is NOT directly
+	comparable to FRC.
+
+	img - 2-D real image (numpy or jax), even square size S
+	apix - A/pix
+	nfinal - number of Points at the largest (final) working size
+	ctf - dict of the (known, fixed) CTF parameters: "voltage" (kV) and "cs" (mm) are required,
+	    "ampcont" (%) defaults to 7; optional: "defocus" (um, default 1.0), "dfdiff" (um),
+	    "dfang" (deg), "bfactor" (A^2, Gaussian envelope damping of the object),
+	    "tilt_x"/"tilt_y" (A, in-plane beam tilt, Relion convention)
+	ninit - number of Points at the smallest (coarsest) working size (default max(16, round(nfinal/16)))
+	sizes - optional list of even working sizes, strictly ascending and MUST end at the image size S (default auto)
+	iters - number of Adam gradient steps per working size (an int, or a list aligned with sizes)
+	lr - Adam learning rate
+	seed - RNG seed for the initial random Points
+	At the end of each optimizer step, Points outside the image box (where they no longer contribute to
+	the image and have no gradient) or with |amplitude| below 5% of the maximum point amplitude are
+	reseeded at a random in-box location with a random amplitude
+	verbose - 0 (quiet), 1 (per-stage summary), 2 (per-iteration progress)
+	dump_prefix - if set, save the Points after each coarse-to-fine stage to <dump_prefix><stage>.txt (1-based stage number)
+	Returns (Points, final_dot) where final_dot is the normalized Fourier-space inner product of the
+	CTF-modulated model vs the image at the full size S."""
+	img=np.asarray(img,np.float32)
+	S=img.shape[0]
+	if img.ndim!=2 or img.shape[1]!=S or S%2!=0 : raise Exception(f"fit_points_to_image_dot_2d requires an even, square, 2-D image, got shape {img.shape}")
+	if nfinal<1 : raise Exception("nfinal must be >= 1")
+	sizes=[int(s) for s in (sizes if sizes is not None else _pointfit_sizes(S))]
+	if sizes[-1]!=S : raise Exception(f"sizes must end at the image size {S}, got {sizes}")
+	if any(s%2!=0 or s>S for s in sizes) : raise Exception(f"sizes must be even and <= the image size: {sizes}")
+	if any(sizes[i]>=sizes[i+1] for i in range(len(sizes)-1)) : raise Exception(f"sizes must be strictly ascending: {sizes}")
+	if ninit is None: ninit=max(16,int(round(nfinal/16.0)))
+	ninit=min(max(1,ninit),nfinal)
+
+	if isinstance(iters,(list,tuple)):
+		iters=[int(x) for x in iters]
+		if len(iters)!=len(sizes) : raise Exception(f"iters (as a list) must align with sizes ({len(sizes)})")
+	else:
+		iters=[int(iters)]*len(sizes)
+
+	# Known (fixed) CTF parameters
+	voltage=float(ctf.get("voltage",0.0))
+	if voltage<=0 : raise Exception("fit_points_to_image_dot_2d requires ctf['voltage'] (kV) > 0")
+	cs=float(ctf.get("cs",0.0))
+	if cs<=0 : raise Exception("fit_points_to_image_dot_2d requires ctf['cs'] (mm) > 0")
+	ampcont=float(ctf.get("ampcont",7.0))
+	df=float(ctf.get("defocus",1.0))
+	dd=float(ctf.get("dfdiff",0.0))
+	da=float(ctf.get("dfang",0.0))
+	B=float(ctf.get("bfactor",0.0))
+	tx=float(ctf.get("tilt_x",0.0))
+	ty=float(ctf.get("tilt_y",0.0))
+	wl=12.2639/(voltage*1000.0+0.97845*voltage*voltage)**0.5
+	ac_phase=pi/2.0-asin(max(-1.0,min(1.0,ampcont/100.0)))
+
+	ctf_cache={}
+	def ctf_at(s):
+		"""CTF amplitude (with optional B damping) on the size-s rfft grid: (s, s//2+1) real"""
+		if s in ctf_cache: return ctf_cache[s]
+		c=ctf_image(s, apix, wl, cs, ac_phase, df, dd, da, tx, ty)
+		if B>0:
+			fx=jnp.arange(s//2+1); fy=jnp.arange(s); fy=jnp.where(fy>s//2, fy-s, fy)
+			Y,X=jnp.meshgrid(fy,fx,indexing='ij')
+			s2=(X*X+Y*Y)/(apix*s)**2
+			c=c*jnp.exp(-B*s2/4.0)
+		ctf_cache[s]=c
+		return c
+
+	rng=np.random.default_rng(seed)
+	N=ninit
+	# x,y uniform in (-0.5,0.5); z=0 (2-D, unused); amp uniform in (-1/3,1/3)
+	pa=jnp.stack([rng.uniform(-0.5,0.5,N),rng.uniform(-0.5,0.5,N),np.zeros(N),rng.uniform(-1.0/3.0,1.0/3.0,N)],axis=1).astype(jnp.float32)
+
+	imgf_cache={S:jax_fft2d(jnp.asarray(img)[np.newaxis,...])}	# (1,s,s//2+1) complex64
+	def imgf_at(s):
+		if s not in imgf_cache: imgf_cache[s]=jax_downsample_2d(imgf_cache[S],s)
+		return imgf_cache[s]
+
+	imgnorm_cache={}
+	def imgnorm_at(s):
+		"""|imgf| on the size-s rfft grid (constant per size, so cache it)"""
+		if s not in imgnorm_cache: imgnorm_cache[s]=jnp.sqrt(jnp.sum(jnp.abs(imgf_at(s))**2))
+		return imgnorm_cache[s]
+
+	def loss(p,s,ctf_s,imgf,imgnorm):
+		prj=jnp.expand_dims(point_interpolate_simple(p[:,[0,1,3]],s),0)	# (1,s,s) real
+		simf=jax_fft2d(prj)*ctf_s[np.newaxis,:,:]		# FFT of the CTF-simulated image (the CTF is real, so this is exact)
+		dot=jnp.real(jnp.sum(jnp.conj(imgf)*simf))
+		simnorm=jnp.sqrt(jnp.sum(jnp.abs(simf)**2))
+		return -dot/(imgnorm*simnorm+1e-12)
+	lv=jax.jit(jax.value_and_grad(loss,argnums=0),static_argnames=["s"])
+
+	ns=len(sizes)
+	def target(stage): return int(round(ninit+(nfinal-ninit)*stage/(ns-1))) if ns>1 else nfinal
+
+	for stage,s in enumerate(sizes):
+		rad_img_int(s)
+		imgf=imgf_at(s)
+		imgnorm=imgnorm_at(s)
+		ctf_s=ctf_at(s)
+		t=target(stage)
+		if len(Points(np.array(pa)))<t:
+			P=Points(np.array(pa)); P.replicate_abs(t,dev=0.01); pa=P.jax
+		optim=optax.adam(lr)
+		st=optim.init(pa)
+		its=iters[stage]
+		for it in range(its):
+			val,grad=lv(pa,s,ctf_s,imgf,imgnorm)
+			upd,st=optim.update(grad,st,pa)
+			pa=optax.apply_updates(pa,upd)
+			pa,_=_reseed_bad_points(pa,rng)
+			dot=-float(jnp.nan_to_num(val))
+			if verbose>=2 and (it%max(1,its//10)==0 or it==its-1): print(f"    size={s} it={it}/{its} DOT={dot:.4f}")
+		pa=pa.at[:,2].set(0.0)		# enforce 2-D (z=0)
+		dot=-float(jnp.nan_to_num(lv(pa,s,ctf_s,imgf,imgnorm)[0]))
+		if verbose>=1: print(f"  stage {stage+1}/{ns}: size={s:5d} N={len(Points(np.array(pa))):6d} DOT={dot:.4f}")
+		if dump_prefix is not None:
+			Points(np.array(pa)).save(f"{dump_prefix}{stage+1}.txt")
+
+	P=Points(np.array(pa))
+	P[:,2]=0.0
+	dot=-float(jnp.nan_to_num(lv(P.jax,S,ctf_at(S),imgf_at(S),imgnorm_at(S))[0]))
+	return (P,float(dot))
+
 
 def ccf_step_align(point,ptclsfds,orts,tytx):
 	"""Uses CCF to update all translational alignments in one step with CCF"""

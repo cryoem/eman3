@@ -32,7 +32,8 @@
 # e3ctf.py
 #
 # Estimate the CTF (defocus, astigmatism amount, astigmatism direction and
-# in-plane beam tilt) of a single micrograph using a sparse 2-D "point" model of
+# in-plane beam tilt) of a micrograph (several may be given, each processed
+# independently) using a sparse 2-D "point" model of
 # the object. The approach:
 #
 #   1. Fit a modest set of 2-D points (x,y,amp; z=0) to the micrograph WITHOUT
@@ -78,8 +79,10 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from EMAN3.EMAN3 import EMArgumentParser, E3init, E3end, error_exit, warning, good_size_small
+from EMAN3.EMAN3 import EMArgumentParser, E3init, E3end, error_exit, warning, good_size_small, info_name
 from EMAN3.EMAN3jax import Points, fit_points_to_image_2d, point_interpolate_simple, jax_fft2d, jax_frc_jit, rad_img_int
+from EMAN3.EMAN3jsondb import js_open_dict
+from EMAN3.ctf import EMAN3Ctf
 from EMAN3.io.imageio import ImageIO
 from EMAN3.processor import normalize_edgemean_2d_real
 
@@ -87,12 +90,47 @@ EMANVERSION = "e3ctf (EMAN3)"
 
 
 
-def _dump_points(n, points):
-	"""Debug helper: write the current point set (Nx4, x,y,z,amp) to test_<n>.txt."""
+def _dump_points(n, points, prefix=""):
+	"""Debug helper: write the current point set (Nx4, x,y,z,amp) to <prefix>test_<n>.txt."""
 	if isinstance(points, Points):
-		points.save(f"test_{n}.txt")
+		points.save(f"{prefix}test_{n}.txt")
 	else:
-		Points(np.array(points, np.float32)).save(f"test_{n}.txt")
+		Points(np.array(points, np.float32)).save(f"{prefix}test_{n}.txt")
+
+
+def _stem(micro):
+	"""Basename of a file with all extensions stripped (used for batch-mode naming)."""
+	b = os.path.basename(micro)
+	while "." in b:
+		b = b.rsplit(".", 1)[0]
+	return b
+
+
+def _perfile_name(path, micro, batch):
+	"""For a batch run, derive a unique output filename from the micrograph name so results
+	don't clobber each other, e.g. results.json + micrographs/set001.hdf -> results_set001.json.
+	Single-file runs keep the given name unchanged."""
+	if not batch:
+		return path
+	root, ext = os.path.splitext(path)
+	s = _stem(micro)
+	if root.endswith(f"_{s}"):
+		return path
+	return f"{root}_{s}{ext}" if ext else f"{root}_{s}"
+
+
+def _info_file_for(micro):
+	"""Info file (info/<base>_info.json) for a micrograph, following the EMAN2 project
+	convention (info/ next to micrographs/, programs run from the project folder).
+	Prefers an existing info/ directory: CWD-relative (the project folder), within the
+	micrograph's own folder, or as a sibling of it; otherwise CWD-relative (created)."""
+	base = info_name(micro)
+	for cand in (base,
+	             os.path.join(os.path.dirname(micro), base),
+	             os.path.join(os.path.dirname(os.path.dirname(micro)), base)):
+		if os.path.isdir(os.path.dirname(cand)):
+			return cand
+	return base
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +140,7 @@ class CtfEstimator():
 	"""Estimates CTF parameters for a single (square) micrograph from a point model."""
 
 	def __init__(self, img, apix, wl, cs, ac_phase, npoints, band_ptcl,
-	             dfmin, dfmax, dfdiffmax, tilt, seed, bfactor, bmax, expand, verbose=0):
+	             dfmin, dfmax, dfdiffmax, tilt, seed, bfactor, bmax, expand, dbgprefix="", debug=False, write_eval=False, verbose=0):
 		"""img - (S,S) real micrograph subregion (numpy), S even
 		apix - A/pix
 		wl - electron wavelength in A
@@ -117,7 +155,13 @@ class CtfEstimator():
 		           fit, fitted in the simultaneous stage)
 		bmax - upper bound (A^2) for the fitted B-factor in the simultaneous stage
 		expand - stage 3 point expansion factor (total points = expand x current)
-		seed - RNG seed"""
+		seed - RNG seed
+		dbgprefix - filename prefix for the debug outputs (test.hdf, eval.hdf, test_<N>.txt);
+		             in a batch run it is "<micrograph name>_" so per-file outputs don't clobber
+		             each other (default "")
+		debug - write the debug outputs (test.hdf and the per-stage test_<N>.txt point dumps)
+		write_eval - write eval.hdf, the side-by-side log-amplitude view of the fit
+		verbose - 0 (quiet), 1 (per-stage summary), 2 (per-iteration progress)"""
 		self.S = img.shape[0]
 		self.apix = apix
 		self.wl = wl
@@ -161,12 +205,16 @@ class CtfEstimator():
 		self.bmax = bmax
 		self.expand = float(expand)
 		self.seed = int(seed)
+		self.dbgprefix = dbgprefix
+		self.debug = debug
+		self.write_eval = write_eval
 
 		# Stage 1: fit a 2-D point model to the micrograph WITHOUT CTF, at low resolution
 		if self.verbose >= 1:
 			print(f"  fitting {npoints} points (band {band_ptcl[0]:.4f}-{band_ptcl[1]:.4f} 1/A) ...")
 		t0 = time.time()
-		self.points, self.ptcl_frc = fit_points_to_image_2d(self.img, apix, npoints, band=band_ptcl, seed=seed, verbose=verbose, dump_prefix="test_")
+		self.points, self.ptcl_frc = fit_points_to_image_2d(self.img, apix, npoints, band=band_ptcl, seed=seed, verbose=verbose,
+															   dump_prefix=(self.dbgprefix + "test_") if self.debug else None)
 		if self.verbose >= 1:
 			print(f"    point fit done in {time.time()-t0:.1f}s, low-res FRC={self.ptcl_frc:.3f}")
 
@@ -410,7 +458,7 @@ class CtfEstimator():
 		sim_arr = np.asarray(normalize_edgemean_2d_real(jnp.asarray(sim_arr, jnp.float32)[None, ...]), np.float32)[0]
 		hdr = {"nx": sim_arr.shape[1], "ny": sim_arr.shape[0], "nz": 1,
 		       "apix_x": self.apix, "apix_y": self.apix, "apix_z": self.apix}
-		io = ImageIO("test.hdf", mode="rw")
+		io = ImageIO(self.dbgprefix + "test.hdf", mode="rw")
 		try:
 			io.write_image(0, sim_arr, hdr)
 			io.write_image(1, self.img, hdr)
@@ -446,7 +494,7 @@ class CtfEstimator():
 		left = amp_view(self.img)                                          # real data: left semicircle
 		right = amp_view(np.asarray(sim).reshape(ny, ny))[:, ::-1]         # model: mirror to right semicircle
 		comb = np.hstack((left, right)).astype(np.float32)
-		io = ImageIO("eval.hdf", mode="rw")
+		io = ImageIO(self.dbgprefix + "eval.hdf", mode="rw")
 		try:
 			io.write_image(0, comb, {"nx": comb.shape[1], "ny": comb.shape[0], "nz": 1,
 			                       "apix_x": self.apix, "apix_y": self.apix, "apix_z": self.apix})
@@ -468,17 +516,17 @@ class CtfEstimator():
 			init = [df1, 0.0, 0.0]
 		# Stage 2: refine points + full CTF + B-factor from the defocus-only solution
 		ctf, points, score, sim, bf = self._simultaneous_fit(init, self.points.jax)
-		_dump_points(5, points)
+		if self.debug: _dump_points(5, points, self.dbgprefix)
 		# Stage 3: expand the point set and fit the points by FRC with the CTF held fixed
 		points_exp = self._expand_points(points, self.expand)
-		_dump_points(6, points_exp)
+		if self.debug: _dump_points(6, points_exp, self.dbgprefix)
 		points3, frc3 = self._fit_points_frc(points_exp, ctf, bf)
-		_dump_points(7, points3)
+		if self.debug: _dump_points(7, points3, self.dbgprefix)
 		# Stage 4: a final all-parameter optimization cycle on the expanded point model
 		ctf, points, score, sim, bf = self._simultaneous_fit(ctf, points3)
-		_dump_points(8, points)
-		self._save_debug_density(sim)
-		self._save_eval_image(sim)
+		if self.debug: _dump_points(8, points, self.dbgprefix)
+		if self.debug: self._save_debug_density(sim)
+		if self.write_eval: self._save_eval_image(sim)
 		return {"defocus": float(ctf[0]), "dfdiff": float(ctf[1]), "dfang": float(ctf[2]),
 		        "tilt_x": float(ctf[3]) if self.tilt else 0.0,
 		        "tilt_y": float(ctf[4]) if self.tilt else 0.0,
@@ -512,7 +560,7 @@ def header_get(hdr, *keys, default=None):
 
 
 def estimate_ctf(img, apix, voltage, cs, ampcont, npoints, dfmin, dfmax, dfdiffmax,
-                 tilt, seed, side_frac, bfactor, bmax, expand, verbose=0):
+                 tilt, seed, side_frac, bfactor, bmax, expand, dbgprefix="", debug=False, write_eval=False, verbose=0):
 	"""Estimate the CTF of a single micrograph.
 	img - (H,W) real micrograph
 	Returns a dict with: defocus, dfdiff, dfang, tilt_x, tilt_y, bfactor, apix, voltage, cs, ampcont,
@@ -533,7 +581,8 @@ def estimate_ctf(img, apix, voltage, cs, ampcont, npoints, dfmin, dfmax, dfdiffm
 	band_ptcl = (0.0, 0.1 * nyq)                                                # ~10% of Nyquist (seed point fit only)
 
 	est = CtfEstimator(sub, apix, wl, cs, ac_phase, npoints, band_ptcl,
-	                   dfmin, dfmax, dfdiffmax, tilt, seed, bfactor, bmax, expand, verbose)
+	                   dfmin, dfmax, dfdiffmax, tilt, seed, bfactor, bmax, expand,
+	                   dbgprefix, debug, write_eval, verbose)
 	params = est.estimate()
 
 	params.update({"apix": apix, "voltage": voltage, "cs": cs, "ampcont": ampcont,
@@ -544,19 +593,20 @@ def estimate_ctf(img, apix, voltage, cs, ampcont, npoints, dfmin, dfmax, dfdiffm
 
 def main():
 	progname = os.path.basename(sys.argv[0])
-	usage = """prog [options] <micrograph>
+	usage = """prog [options] <micrograph> [<micrograph> ...]
 
-Estimate the CTF (defocus, astigmatism, beam tilt) of a single micrograph using a
+Estimate the CTF (defocus, astigmatism, beam tilt) of one or more micrographs using a
 sparse 2-D point model of the object fitted at low resolution without CTF, then
 optimizing a parameterized CTF (plus the B-factor) by maximizing the real-space
-correlation against the micrograph.
+correlation and Fourier power-spectrum correlation against the micrograph. Each file
+is processed independently with the same command-line parameters.
 
 Requires voltage, Cs and amplitude contrast (or finds them in the header).
 
 
 """
 	parser = EMArgumentParser(usage=usage, version=EMANVERSION)
-	parser.add_pos_argument(name="micrograph", help="Input micrograph (2-D image file)", default="",
+	parser.add_pos_argument(name="micrograph", help="Input micrograph(s) (2-D image file(s))", default="",
 	                        guitype='filebox', row=0, col=0, rowspan=1, colspan=3)
 	parser.add_argument("--voltage", type=float, default=None, help="Microscope voltage in kV (default from header if present)")
 	parser.add_argument("--cs", type=float, default=None, help="Spherical aberration in mm (default from header if present)")
@@ -573,70 +623,122 @@ Requires voltage, Cs and amplitude contrast (or finds them in the header).
 	parser.add_argument("--seed", type=int, default=0, help="RNG seed for the point fit (default 0)")
 	parser.add_argument("--sidefrac", type=float, default=0.9, help="Fraction of the shortest axis used for the centered square working region (default 0.9)")
 	parser.add_argument("--savepoints", type=str, default=None, help="If set, save the fitted point model to this text file")
-	parser.add_argument("--output", type=str, default=None, help="Output JSON filename (default <micrograph>_ctf.json)")
+	parser.add_argument("--debug", action="store_true", help="Write the debug outputs: test.hdf (the final point-model simulation plus the micrograph region) and the per-stage point sets (test_<stage>.txt)")
+	parser.add_argument("--eval", action="store_true", help="Write eval.hdf, a side-by-side log-amplitude view of the real and simulated power spectra")
+	parser.add_argument("--output", type=str, default=None, help="If set, also write a standalone JSON file with the CTF parameters (in addition to the ctf_frame3 entry in the micrograph's info file)")
 	parser.add_argument("--verbose", "-v", dest="verbose", action="store", metavar="n", type=int, default=0, help="verbose level [0-9]")
 	parser.add_argument("--ppid", type=int, default=-1, help="Set the PID of the parent process")
 
 	(options, args) = parser.parse_args()
 	logid = E3init(sys.argv, options.ppid)
 
-	micro = args[0]
-	if not os.path.isfile(micro):
-		error_exit(f"Cannot find input micrograph: {micro}")
+	if not args:
+		error_exit("No micrograph(s) specified")
+	for micro in args:
+		if not os.path.isfile(micro):
+			error_exit(f"Cannot find input micrograph: {micro}")
 
-	img, hdr = load_micrograph(micro, options.verbose)
+	batch = len(args) > 1
+	results = []
+	t0batch = time.time()
+	for micro in args:
+		t0 = time.time()
+		try:
+			img, hdr = load_micrograph(micro, options.verbose)
 
-	apix = options.apix if options.apix > 0 else float(header_get(hdr, "apix_x", "apix", "pixel_size", default=0.0))
-	if apix <= 0:
-		error_exit("Could not determine apix. Specify --apix.")
-	voltage = options.voltage if options.voltage is not None else header_get(hdr, "voltage", "kV", "voltage_kV")
-	cs = options.cs if options.cs is not None else header_get(hdr, "cs", "cs_mm", "spherical_aberration")
-	ampcont = options.ampcont if options.ampcont is not None else header_get(hdr, "ampcont", "amp_contrast", "amp_cont")
-	if voltage is None or float(voltage) <= 0:
-		error_exit("Could not determine voltage (kV). Specify --voltage.")
-	voltage = float(voltage)
-	if cs is None or float(cs) <= 0:
-		warning("Cs not specified/found; defaulting to 2.7 mm. Specify --cs for accuracy.")
-		cs = 2.7
-	cs = float(cs)
-	if ampcont is None:
-		warning("Amplitude contrast not specified/found; defaulting to 7%%. Specify --ampcont.")
-		ampcont = 7.0
-	ampcont = float(ampcont)
+			apix = options.apix if options.apix > 0 else float(header_get(hdr, "apix_x", "apix", "pixel_size", default=0.0))
+			if apix <= 0:
+				raise Exception("Could not determine apix. Specify --apix.")
+			voltage = options.voltage if options.voltage is not None else header_get(hdr, "voltage", "kV", "voltage_kV")
+			cs = options.cs if options.cs is not None else header_get(hdr, "cs", "cs_mm", "spherical_aberration")
+			ampcont = options.ampcont if options.ampcont is not None else header_get(hdr, "ampcont", "amp_contrast", "amp_cont")
+			if voltage is None or float(voltage) <= 0:
+				raise Exception("Could not determine voltage (kV). Specify --voltage.")
+			voltage = float(voltage)
+			if cs is None or float(cs) <= 0:
+				warning("Cs not specified/found; defaulting to 2.7 mm. Specify --cs for accuracy.")
+				cs = 2.7
+			cs = float(cs)
+			if ampcont is None:
+				warning("Amplitude contrast not specified/found; defaulting to 7%. Specify --ampcont.")
+				ampcont = 7.0
+			ampcont = float(ampcont)
 
-	print(f"CTF estimation: {micro}")
-	print(f"  apix={apix:.4f} A/px  voltage={voltage} kV  cs={cs} mm  ampcont={ampcont}%")
+			print(f"CTF estimation: {micro}")
+			print(f"  apix={apix:.4f} A/px  voltage={voltage} kV  cs={cs} mm  ampcont={ampcont}%")
 
-	t0 = time.time()
-	params = estimate_ctf(img, apix, voltage, cs, ampcont, options.npoints,
-	                      options.dfmin, options.dfmax, options.dfdiffmax,
-	                      not options.notilt, options.seed,
-	                      options.sidefrac, options.bfactor, options.bmax, options.expand, options.verbose)
-	el = time.time() - t0
+			prefix = f"{_stem(micro)}_" if batch else ""
+			params = estimate_ctf(img, apix, voltage, cs, ampcont, options.npoints,
+			                      options.dfmin, options.dfmax, options.dfdiffmax,
+			                      not options.notilt, options.seed,
+			                      options.sidefrac, options.bfactor, options.bmax, options.expand,
+			                      prefix, options.debug, options.eval, options.verbose)
+			el = time.time() - t0
 
-	print(f"\n  RESULT (in {el:.1f}s):")
-	print(f"    defocus  = {params['defocus']:.4f} um")
-	print(f"    dfdiff   = {params['dfdiff']:.4f} um")
-	print(f"    dfang    = {params['dfang']:.2f} deg")
-	if not options.notilt:
-		print(f"    tilt     = ({params['tilt_x']:.2f}, {params['tilt_y']:.2f}) A")
-	print(f"    bfactor  = {params['bfactor']:.1f} A^2")
-	print(f"    low-res FRC (seed fit) = {params['ptcl_frc']:.4f}   (seed only, expected to be low)")
-	print(f"    FRC (stage 3, expanded points) = {params['expand_frc']:.4f}")
-	print(f"    score (stage 4 fit) = {params['fit_score']:.4f}")
+			print(f"\n  RESULT (in {el:.1f}s):")
+			print(f"    defocus  = {params['defocus']:.4f} um")
+			print(f"    dfdiff   = {params['dfdiff']:.4f} um")
+			print(f"    dfang    = {params['dfang']:.2f} deg")
+			if not options.notilt:
+				print(f"    tilt     = ({params['tilt_x']:.2f}, {params['tilt_y']:.2f}) A")
+			print(f"    bfactor  = {params['bfactor']:.1f} A^2")
+			print(f"    low-res FRC (seed fit) = {params['ptcl_frc']:.4f}   (seed only, expected to be low)")
+			print(f"    FRC (stage 3, expanded points) = {params['expand_frc']:.4f}")
+			print(f"    score (stage 4 fit) = {params['fit_score']:.4f}")
 
-	out = options.output if options.output else os.path.splitext(micro)[0] + "_ctf.json"
-	outdict = {k: params[k] for k in ("defocus", "dfdiff", "dfang", "tilt_x", "tilt_y",
-	                                 "bfactor", "apix", "voltage", "cs", "ampcont", "side", "npoints",
-	                                 "ptcl_frc", "fit_score", "expand_factor", "expand_frc")}
-	import json
-	with open(out, "w") as fh:
-		json.dump(outdict, fh, indent=2)
-	print(f"  wrote {out}")
+			# Record the estimate as an EMAN3Ctf object under "ctf_frame3" in the micrograph's
+			# info file (EMAN2 project convention). "ctf_frame" is left for EMAN2Ctf objects so
+			# that EMAN2 can still read the info file.
+			ctf = EMAN3Ctf()
+			ctf.from_dict({"defocus": params["defocus"], "dfdiff": params["dfdiff"], "dfang": params["dfang"],
+			               "bfactor": params["bfactor"], "voltage": voltage, "cs": cs, "ampcont": ampcont,
+			               "apix": apix, "tilt_x": params["tilt_x"], "tilt_y": params["tilt_y"]})
+			infoname = _info_file_for(micro)
+			os.makedirs(os.path.dirname(infoname), exist_ok=True)
+			jdb = js_open_dict(infoname)
+			old = jdb["ctf_frame"] if "ctf_frame" in jdb else None
+			if isinstance(old, (list, tuple)) and len(old) > 1:
+				old = old[1]
+			jdb["ctf_frame3"] = ctf
+			jdb.sync()
+			jdb.close()
+			print(f"  wrote ctf_frame3 -> {infoname}")
+			if old is not None and hasattr(old, "defocus"):
+				print(f"    existing ctf_frame : defocus={old.defocus:.4f} um  dfdiff={old.dfdiff:.4f} um  dfang={old.dfang:.2f} deg")
+				print(f"    new ctf_frame3     : defocus={ctf.defocus:.4f} um  dfdiff={ctf.dfdiff:.4f} um  dfang={ctf.dfang:.2f} deg")
 
-	if options.savepoints:
-		params["points"].save(options.savepoints)
-		print(f"  wrote {options.savepoints}")
+			if options.output:
+				outname = _perfile_name(options.output, micro, batch)
+				outdict = {k: params[k] for k in ("defocus", "dfdiff", "dfang", "tilt_x", "tilt_y",
+			                                     "bfactor", "apix", "voltage", "cs", "ampcont", "side", "npoints",
+			                                     "ptcl_frc", "fit_score", "expand_factor", "expand_frc")}
+				import json
+				with open(outname, "w") as fh:
+					json.dump(outdict, fh, indent=2)
+				print(f"  wrote {outname}")
+
+			if options.savepoints:
+				spname = _perfile_name(options.savepoints, micro, batch)
+				params["points"].save(spname)
+				print(f"  wrote {spname}")
+
+			if options.debug:
+				print(f"  wrote debug outputs: {prefix}test.hdf, {prefix}test_<stage>.txt")
+			if options.eval:
+				print(f"  wrote {prefix}eval.hdf")
+
+			results.append((micro, True, None))
+		except Exception as e:
+			results.append((micro, False, str(e)))
+			print(f"\n  ERROR on {micro}: {e}")
+
+	if batch:
+		print(f"\nSUMMARY (batch, {time.time() - t0batch:.1f}s total): {sum(1 for _, ok, _ in results if ok)}/{len(results)} succeeded")
+		for micro, ok, err in results:
+			if ok:
+				print(f"  OK    {micro}")
+			else:
+				print(f"  FAIL  {micro}  ({err})")
 
 	E3end(logid)
 

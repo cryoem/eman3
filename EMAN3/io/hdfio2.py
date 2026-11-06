@@ -59,6 +59,11 @@ class FileIOError(Exception):
 	pass
 
 
+# 12 x float32 compound with the EMAN2 C++ HdfIO2::write_attr() field names
+# ("00".."23"), used to store Transform matrices per the EMAN2 convention.
+_TRANSFORM_DTYPE = np.dtype([("%d%d" % (r, c), "<f4") for r in range(3) for c in range(4)])
+
+
 class InvalidDimensions(Exception):
 	"""Indicates a mismatch between data size and header indicated size."""
 	pass
@@ -275,51 +280,74 @@ def _read_hdf5_attr(attr):
 	if hasattr(attr, 'dtype'):
 		dtype = attr.dtype
 
+	# EMAN2 C++ HdfIO2 stores Transform as a 12 x float32 compound ("00".."23").
+	# Reconstruct a Transform object, mirroring the C++ read_attr() COMPOUND branch.
+	if dtype is not None and dtype.kind == 'V' and dtype.names is not None:
+		names = list(dtype.names)
+		if len(names) == 12 and all(np.dtype(dtype[n]).kind == 'f' for n in names):
+			arr = np.asarray(attr)
+			flat = [float(arr[n].item()) for n in names]
+			from EMAN3.transform import Transform
+			t = Transform()
+			t.set_matrix(flat)
+			return t
+
+	# EMAN2 boolean convention: a single-byte integer holds 'T' or 'F'
+	if dtype is not None and dtype.kind in ('i', 'u') and dtype.itemsize == 1:
+		return int(np.asarray(attr).reshape(-1)[0]) == ord('T')
+
 	# Try to extract the value — handle various h5py return types
-	if isinstance(attr, (bytes, str)):
+	if isinstance(attr, (bytes, bytearray)):
+		return _decode_string(bytes(attr))
+	elif isinstance(attr, str):
 		return _decode_string(attr)
+	elif isinstance(attr, np.ndarray):
+		if attr.dtype.names is not None:
+			# non-Transform structured array: return nested list of values
+			return attr.astype(object).tolist()
+		if attr.ndim == 0 or attr.size == 1:
+			# EMAN2 C++ writes scalars with a 1-point dataspace; C++ read_attr()
+			# likewise treats pts==1 as a scalar
+			val = attr.item()
+		else:
+			# array stored as attribute (EMAN2 FLOATARRAY/INTARRAY convention)
+			return attr.tolist()
 	elif hasattr(attr, 'item'):
 		# numpy scalar or similar — try extracting cleanly
 		try:
 			val = attr.item()
 		except ValueError:
 			# multi-element array stored as attribute
-			val = np.asarray(attr).tolist()
-		dtype = dtype if dtype is not None else getattr(attr, 'dtype', None)
-	elif isinstance(attr, np.ndarray):
-		val = attr
-		dtype = dtype if dtype is not None else attr.dtype
+			return np.asarray(attr).tolist()
 	else:
 		# Fallback: try [()] or just use directly
 		try:
 			val = attr[()]
 		except (TypeError, IndexError):
 			val = attr
-		dtype = dtype if dtype is not None else getattr(attr, 'dtype', None)
 
 	if isinstance(val, (bytes, str)):
 		return _decode_string(val)
-	elif isinstance(val, bool):
-		return val
+	elif isinstance(val, (bool, np.bool_)):
+		return bool(val)
 	elif isinstance(val, (int, np.integer)):
 		return int(val)
 	elif isinstance(val, (float, np.floating)):
 		return float(val)
-	elif isinstance(val, np.ndarray):
-		return val.tolist()
-
-	# If we somehow got an unrecognised type, convert to string
-	try:
-		return val.tolist()
-	except Exception:
-		return str(val) if val is not None else None
+	elif isinstance(val, (list, tuple)):
+		return list(val)
+	return val
 
 
 def _decode_string(val):
-	"""Decode a string value from HDF5."""
-	if isinstance(val, bytes):
-		return val.decode('utf-8', errors='replace')
-	return str(val)
+	"""Decode a string value from HDF5.
+
+	Fixed-length C strings (EMAN2 convention) read back as byte sequences
+	padded with a trailing NUL; strip it.
+	"""
+	if isinstance(val, (bytes, bytearray)):
+		return bytes(val).rstrip(b'\x00').decode('utf-8', errors='replace')
+	return str(val).rstrip('\x00')
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +420,7 @@ class HdfIO2:
 			if self._mode == "r":
 				raise FileFormatError("HDF5 file has no /MDF/images group")
 			images_grp = mdff.create_group("images")
-			images_grp.attrs["imageid_max"] = -1
+			images_grp.attrs["imageid_max"] = np.int32(-1)
 		else:
 			images_grp = mdff["images"]
 
@@ -487,17 +515,24 @@ class HdfIO2:
 			d["apix_y"] = apix
 			d["apix_z"] = apix
 
-		# Auto-detect CTF strings starting with E followed by digit
+		# Auto-detect CTF strings: 'E' prefix = EMAN2Ctf, '3' prefix = EMAN3Ctf
 		if "ctf" in d and isinstance(d["ctf"], str):
 			ctf_str = d["ctf"].strip()
-			if len(ctf_str) > 1 and ctf_str[0] == 'E' and (ctf_str[1].isdigit() or ctf_str[1] in ('-', '+', '.')):
-				try:
+			if len(ctf_str) > 1 and (ctf_str[1].isdigit() or ctf_str[1] in ('-', '+', '.')):
+				ctf_obj = None
+				if ctf_str[0] == 'E':
 					from EMAN3.ctf import EMAN2Ctf
 					ctf_obj = EMAN2Ctf()
-					ctf_obj.from_string(ctf_str)
-					d["ctf"] = ctf_obj
-				except Exception:
-					pass  # leave as string if parse fails
+				elif ctf_str[0] == '3':
+					from EMAN3.ctf import EMAN3Ctf
+					ctf_obj = EMAN3Ctf()
+				if ctf_obj is not None:
+					try:
+						if ctf_obj.from_string(ctf_str) != 0:
+							raise ValueError(f"bad CTF string: {ctf_str}")
+						d["ctf"] = ctf_obj
+					except Exception:
+						pass  # leave as string if parse fails
 
 		# Auto-detect serialized Transform objects in any key
 		# Transform matrices are stored as strings of 12 floats in tuple/list format
@@ -639,7 +674,7 @@ class HdfIO2:
 		# Update imageid_max if appending
 		current_max = _read_scalar_attr(images_grp.attrs, "imageid_max")
 		if index > current_max:
-			images_grp.attrs["imageid_max"] = index
+			images_grp.attrs["imageid_max"] = np.int32(index)
 			self._nimg = index + 1
 
 		# Open or create the per-image group
@@ -798,8 +833,10 @@ def _write_attribute(loc, name, val):
 	  bool      -> single-byte 'T'/'F'
 	  int       -> int32
 	  float     -> float32
-	  str       -> variable-length string
+	  str       -> fixed-length C string (EMAN2 C_S1 convention; EMAN2's C++
+	                 reader cannot read variable-length string attributes)
 	  list      -> array of float32 or int32 (auto-detected)
+	  Transform -> 12 x float32 compound ("00".."23", row-major 3x4)
 	"""
 	if isinstance(val, bool):
 		loc.attrs[name] = np.int8(ord('T') if val else ord('F'))
@@ -808,27 +845,77 @@ def _write_attribute(loc, name, val):
 	elif isinstance(val, (float, np.floating)):
 		loc.attrs[name] = np.float32(val)
 	elif isinstance(val, str):
-		# HDF5 variable-length strings cannot hold embedded NULLs (e.g. from
-		# fixed-width char fields in binary headers); drop them rather than fail
-		loc.attrs[name] = val.replace("\x00", "")
+		_write_string_attribute(loc, name, val)
 	else:
-		# Try to serialize Transform objects (have get_matrix_string method)
-		if hasattr(val, 'get_matrix_string'):
-			loc.attrs[name] = val.get_matrix_string()
+		# Try to serialize Transform objects as a 12 x float32 compound, matching the
+		# EMAN2 C++ HdfIO2::write_attr() TRANSFORM layout (fields "00".."23")
+		if hasattr(val, 'get_matrix'):
+			m = np.asarray(val.get_matrix(), dtype=np.float32).reshape(-1)
+			if m.size == 12:
+				arr = np.empty(1, dtype=_TRANSFORM_DTYPE)
+				for i, fld in enumerate(_TRANSFORM_DTYPE.names):
+					arr[fld] = m[i]
+				loc.attrs[name] = arr
+				return
+		# Try to serialize Transform objects (older API, string matrix)
+		elif hasattr(val, 'get_matrix_string'):
+			_write_string_attribute(loc, name, val.get_matrix_string())
 		# Try to serialize CTF-like objects (have to_string/from_string methods)
 		elif hasattr(val, 'to_string') and hasattr(val, 'from_string'):
-			loc.attrs[name] = val.to_string()
+			s = val.to_string()
+			if len(s) > 1 and s[0] in ('E', 'O') and s[1].isdigit():
+				# already EMAN2-parseable (EMAN2Ctf / EMAN1Ctf format)
+				_write_string_attribute(loc, name, s)
+			else:
+				# EMAN2's reader only recognizes 'E'/'O'-prefixed CTF strings and
+				# crashes on a plain string in the 'ctf' key, so convert (e.g.
+				# EMAN3Ctf '3' format) rather than writing an unreadable value
+				f = getattr(val, 'to_eman2_string', None)
+				if f is not None:
+					_write_string_attribute(loc, name, f())
+				else:
+					raise ValueError(
+						f"CTF object for attribute {name} does not have an EMAN2-compatible string form")
 		elif isinstance(val, (list, tuple)):
 			arr = np.array(val)
 			if arr.dtype.kind == 'f':
 				loc.attrs[name] = arr.astype(np.float32)
+			elif arr.dtype.kind == 'b':
+				# EMAN2 has no boolean array attribute type; int32 0/1 is closest
+				loc.attrs[name] = arr.astype(np.int32)
 			else:
+				_int_range(arr, name)
 				loc.attrs[name] = arr.astype(np.int32)
 		elif isinstance(val, np.ndarray):
 			if val.dtype.kind == 'f':
 				loc.attrs[name] = val.astype(np.float32)
+			elif val.dtype.kind == 'b':
+				loc.attrs[name] = val.astype(np.int32)
 			else:
+				_int_range(val, name)
 				loc.attrs[name] = val.astype(np.int32)
 		else:
 			# Fallback - convert to string
-			loc.attrs[name] = str(val)
+			_write_string_attribute(loc, name, str(val))
+
+
+def _write_string_attribute(loc, name, s):
+	"""Write a string as a fixed-length C string (EMAN2 C_S1 convention).
+
+	EMAN2's C++ reader sizes its buffer with H5Tget_size(), which returns 0
+	for variable-length string types (what h5py writes by default), so such
+	attributes cannot be read by EMAN2. Fixed-length storage is what EMAN2's
+	C++ HdfIO2::write_attr() uses (C_S1 with size strlen+1).
+	"""
+	b = s.encode('utf-8')
+	dt = np.dtype('S%d' % (len(b) + 1))
+	buf = np.zeros(1, dtype=dt)
+	buf[0] = b + b'\x00'
+	loc.attrs[name] = buf[0]
+
+
+def _int_range(arr, name):
+	"""Ensure integer values fit int32 (EMAN2's int attribute width) rather than wrapping silently."""
+	i64 = np.asarray(arr).astype(np.int64)
+	if np.any(i64 < np.iinfo(np.int32).min) or np.any(i64 > np.iinfo(np.int32).max):
+		raise ValueError(f"integer value out of int32 range for HDF attribute {name}")
