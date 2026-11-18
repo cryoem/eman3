@@ -2550,7 +2550,8 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 	img - 2-D real image (numpy or jax), even square size S
 	apix - A/pix
 	nfinal - number of Points at the largest (final) working size
-	ninit - number of Points at the smallest (coarsest) working size (default max(16, round(nfinal/16)))
+	ninit - minimum number of Points at the coarsest working size (default max(16, round(nfinal/16))); the point count
+	    otherwise scales with the working image area (4x more points for each doubling of size), up to nfinal at the full size
 	sizes - optional list of even working sizes, strictly ascending and MUST end at the image size S (default auto)
 	iters - number of Adam gradient steps per working size (an int, or a list aligned with sizes)
 	lr - Adam learning rate
@@ -2614,7 +2615,7 @@ def fit_points_to_image_2d(img, apix, nfinal, ninit=None, sizes=None, iters=100,
 	lv=jax.jit(jax.value_and_grad(loss,argnums=0),static_argnames=["s"])
 
 	ns=len(sizes)
-	def target(stage): return int(round(ninit+(nfinal-ninit)*stage/(ns-1))) if ns>1 else nfinal
+	def target(stage): return max(ninit,int(round(nfinal*(sizes[stage]/float(S))**2)))
 
 	for stage,s in enumerate(sizes):
 		rad_img_int(s)
@@ -2658,7 +2659,8 @@ def fit_points_to_image_ctf_2d(img, apix, nfinal, ctf, ninit=None, sizes=None, i
 	    "ampcont" (%) defaults to 7; optional: "defocus" (um, default 1.0), "dfdiff" (um),
 	    "dfang" (deg), "bfactor" (A^2, Gaussian envelope damping of the object),
 	    "tilt_x"/"tilt_y" (A, in-plane beam tilt, Relion convention)
-	ninit - number of Points at the smallest (coarsest) working size (default max(16, round(nfinal/16)))
+	ninit - minimum number of Points at the coarsest working size (default max(16, round(nfinal/16))); the point count
+	    otherwise scales with the working image area (4x more points for each doubling of size), up to nfinal at the full size
 	sizes - optional list of even working sizes, strictly ascending and MUST end at the image size S (default auto)
 	iters - number of Adam gradient steps per working size (an int, or a list aligned with sizes)
 	lr - Adam learning rate
@@ -2738,7 +2740,7 @@ def fit_points_to_image_ctf_2d(img, apix, nfinal, ctf, ninit=None, sizes=None, i
 	lv=jax.jit(jax.value_and_grad(loss,argnums=0),static_argnames=["s"])
 
 	ns=len(sizes)
-	def target(stage): return int(round(ninit+(nfinal-ninit)*stage/(ns-1))) if ns>1 else nfinal
+	def target(stage): return max(ninit,int(round(nfinal*(sizes[stage]/float(S))**2)))
 
 	for stage,s in enumerate(sizes):
 		rad_img_int(s)
@@ -2788,7 +2790,8 @@ def fit_points_to_image_dot_2d(img, apix, nfinal, ctf, ninit=None, sizes=None, i
 	    "ampcont" (%) defaults to 7; optional: "defocus" (um, default 1.0), "dfdiff" (um),
 	    "dfang" (deg), "bfactor" (A^2, Gaussian envelope damping of the object),
 	    "tilt_x"/"tilt_y" (A, in-plane beam tilt, Relion convention)
-	ninit - number of Points at the smallest (coarsest) working size (default max(16, round(nfinal/16)))
+	ninit - minimum number of Points at the coarsest working size (default max(16, round(nfinal/16))); the point count
+	    otherwise scales with the working image area (4x more points for each doubling of size), up to nfinal at the full size
 	sizes - optional list of even working sizes, strictly ascending and MUST end at the image size S (default auto)
 	iters - number of Adam gradient steps per working size (an int, or a list aligned with sizes)
 	lr - Adam learning rate
@@ -2870,7 +2873,7 @@ def fit_points_to_image_dot_2d(img, apix, nfinal, ctf, ninit=None, sizes=None, i
 	lv=jax.jit(jax.value_and_grad(loss,argnums=0),static_argnames=["s"])
 
 	ns=len(sizes)
-	def target(stage): return int(round(ninit+(nfinal-ninit)*stage/(ns-1))) if ns>1 else nfinal
+	def target(stage): return max(ninit,int(round(nfinal*(sizes[stage]/float(S))**2)))
 
 	for stage,s in enumerate(sizes):
 		rad_img_int(s)
