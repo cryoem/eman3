@@ -344,7 +344,7 @@ set to indicate an error exit."""
 		hist.seek(n+20)
 	except:
 		return -1
-	hist.write(f"{int(progress*100.0):19.0f}")
+	hist.write(f"{-progress*100.0:11.2f}")	# negative number to indicate progress as %
 #	hist.flush()
 	hist.close()
 
@@ -361,7 +361,7 @@ This function is called to log the end of the current job. n is returned by E3in
 	except:
 		return -1
 	hist.seek(n+20)
-	try: hist.write(f"{end:19s}\t{timestamp_diff(start,end):11d}")
+	try: hist.write(f"{timestamp_diff(start,end):11d}")
 	except: print(f"E3end failed: {start} {end} {n}")
 	hist.close()
 
