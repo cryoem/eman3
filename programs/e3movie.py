@@ -202,6 +202,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	if options.est_gain is not None:
 		sumim = None
 		sumsq = None
+		sqbuf = None
 		n = 0
 		for i in range(nmov):
 			if (i % 10 == 0):
@@ -210,16 +211,22 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			with ImageIO(f, "r") as idio:
 				nimg = idio.nimg
 				print(f"{f}: {nimg}")
-				for j in range(0, nimg, 50):
-					data, _ = idio.read_images(list(range(j, min(j + 50, nimg))))
-					for img in data:
-						img = np.asarray(img, dtype=np.float32)
-						if sumim is None:
-							sumim = np.zeros_like(img)
-							sumsq = np.zeros_like(img)
-						sumim += img
-						sumsq += img * img
-						n += 1
+				# Read one frame at a time: this path only accumulates sum/sumsq,
+				# so materializing a 50-frame stack (read_images -> np.stack of
+				# 50x64MB) just to iterate over it wastes a lot of memory traffic.
+				for j in range(nimg):
+					img, _ = idio.read_image(j)
+					img = np.asarray(img, dtype=np.float32)
+					if sumim is None:
+						sumim = np.zeros_like(img)
+						sumsq = np.zeros_like(img)
+						sqbuf = np.empty_like(img)
+					sumim += img
+					# square into a preallocated buffer to avoid a fresh
+					# 64MB allocation on every frame
+					np.multiply(img, img, out=sqbuf)
+					sumsq += sqbuf
+					n += 1
 		avg = sumim / n
 		sig = np.sqrt(sumsq / n - avg ** 2)
 		# ensure that on average e- counts are still counts (shared scale factor)

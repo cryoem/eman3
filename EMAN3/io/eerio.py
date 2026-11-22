@@ -23,6 +23,12 @@ Supported extensions: .eer
 import os
 import numpy as np
 
+try:
+    from numba import njit
+    _HAVE_NUMBA = True
+except ImportError:
+    _HAVE_NUMBA = False
+
 
 class FileFormatError(Exception):
     pass
@@ -153,17 +159,122 @@ def _num_pix(oversample_i):
 
 
 # ---------------------------------------------------------------------------
+# Numba-JIT decoder (near-C throughput) — bit-exact mirror of the C++
+# BitStream<uint64_t> / EerRle / EerSubPix / Decoder logic. Used when numba
+# is available; the pure-Python decoder below remains as a fallback.
+# ---------------------------------------------------------------------------
+
+if _HAVE_NUMBA:
+    @njit(cache=True)
+    def _eer_get_bits(cur, bc, word_idx, words, n):
+        """Read *n* bits from the LSB of *cur* (LSB-first, matching C++ BitStream).
+
+        Returns (cur, bc, word_idx, bits, exhausted). Advances into *words*
+        as needed; exhausted=True (bits=0) if the word supply runs out.
+        """
+        mask = (np.uint64(1) << n) - np.uint64(1)
+        bits = cur & mask
+        if n < bc:
+            cur = cur >> n
+            bc = bc - n
+            return cur, bc, word_idx, bits, False
+        remaining = n - bc
+        word_idx = word_idx + 1
+        if word_idx >= words.shape[0]:
+            return cur, bc, word_idx, np.uint64(0), True
+        cur = words[word_idx]
+        bits = bits | ((cur & ((np.uint64(1) << remaining) - np.uint64(1))) << bc)
+        cur = cur >> remaining
+        bc = 64 - remaining
+        return cur, bc, word_idx, bits, False
+
+    @njit(cache=True)
+    def _decode_frame_numba(words, max_count, oversample_i):
+        """Decode compressed EER event words into a 2-D float32 image (numba JIT).
+
+        *words* is a uint64 array of the raw frame bitstream. Semantics match the
+        C++ decode_eer_data() exactly: 64-bit words read LSB-first, 7-bit RLE
+        chunks (127 = continue), 4-bit sub-pixel nibble, and the DecoderIx<I>
+        x/y mapping. If the bitstream is exhausted before max_count events the
+        remaining pixels stay at 0.
+        """
+        pix = _CAMERA_SIZE * (1 << oversample_i)
+        image = np.zeros((pix, pix), dtype=np.float32)
+        if words.shape[0] == 0:
+            return image
+
+        cam_mask = _CAMERA_SIZE - 1
+        cur = words[0]
+        bc = 64
+        word_idx = 0
+        exhausted = False
+
+        # initial RLE value (7-bit chunks, 127 = overflow)
+        rle_val = np.uint64(0)
+        while True:
+            cur, bc, word_idx, chunk, exhausted = _eer_get_bits(cur, bc, word_idx, words, 7)
+            if exhausted:
+                return image
+            rle_val = rle_val + chunk
+            if chunk != 127:
+                break
+        # initial sub-pixel nibble
+        cur, bc, word_idx, sub_pix, exhausted = _eer_get_bits(cur, bc, word_idx, words, 4)
+        if exhausted:
+            return image
+        count = np.int64(rle_val)
+
+        while count < max_count:
+            if oversample_i == 0:
+                x = count & cam_mask
+                y = count >> _CAM_BITS
+            else:
+                bx = count & cam_mask
+                by = count >> _CAM_BITS
+                x = (bx << oversample_i) | (((sub_pix & np.uint64(3)) ^ np.uint64(2)) >> (2 - oversample_i))
+                y = (by << oversample_i) | (((sub_pix >> np.uint64(2)) ^ np.uint64(2)) >> (2 - oversample_i))
+            image[y, x] += 1
+
+            # next RLE value
+            rle_val = np.uint64(0)
+            exhausted = False
+            while True:
+                cur, bc, word_idx, chunk, exhausted = _eer_get_bits(cur, bc, word_idx, words, 7)
+                if exhausted:
+                    break
+                rle_val = rle_val + chunk
+                if chunk != 127:
+                    break
+            if exhausted:
+                break
+            # next sub-pixel nibble
+            cur, bc, word_idx, sub_pix, exhausted = _eer_get_bits(cur, bc, word_idx, words, 4)
+            if exhausted:
+                break
+            count = count + np.int64(rle_val) + 1
+
+        return image
+
+
+# ---------------------------------------------------------------------------
 # Frame decoding — decompress one EER frame into an image array
 # ---------------------------------------------------------------------------
 
 def _decode_frame(raw_data, max_count, oversample_i):
-    """Decode compressed EER event data into a 2D float32 image.
+    """Decode compressed EER event data into a 2-D float32 image.
 
     Mirrors the C++ decode_eer_data() logic:
       1) Read first RLE + SubPix -> initial count = rle value
       2) While count < max_count: add coordinate, read next RLE+SubPix, count += rle+1
       3) If bitstream runs out before max_count, remaining pixels stay at 0.
+
+    Uses the numba-JIT implementation when available (near-C throughput);
+    otherwise falls back to the pure-Python decoder below.
     """
+    if _HAVE_NUMBA:
+        words = np.frombuffer(raw_data, dtype="<u8")
+        return _decode_frame_numba(words, max_count, oversample_i)
+
     pix = _num_pix(oversample_i)
     image = np.zeros((pix, pix), dtype=np.float32)
 
@@ -238,6 +349,17 @@ class EerIO:
         self.nimg = self._raw_num_frames // self._frame_averaging
         self._pix_dim = _num_pix(self._oversample_i)
 
+        # Precompute the (dataoffset, bytecount) strip table for every raw
+        # frame so per-frame reads never have to touch tifffile pages again.
+        self._frame_strips = [
+            (list(page.dataoffsets), list(page.databytecounts))
+            for page in self._tif.pages
+        ]
+
+        # One persistent binary handle for raw strip reads (open/close per
+        # frame is expensive); closed in __del__/__exit__.
+        self._file = open(self.filename, "rb")
+
         # Parse acquisition metadata from XML tag (65001) on first page
         self._acquisition_data = {}
         try:
@@ -250,12 +372,23 @@ class EerIO:
         except Exception:
             pass
 
-    def __del__(self):
+    def close(self):
+        """Close the persistent raw-read handle and the TIFF accessor."""
         try:
-            if hasattr(self, "_tif"):
-                self._tif.close()
+            if hasattr(self, "_file") and self._file is not None:
+                self._file.close()
+                self._file = None
         except Exception:
             pass
+        try:
+            if hasattr(self, "_tif") and self._tif is not None:
+                self._tif.close()
+                self._tif = None
+        except Exception:
+            pass
+
+    def __del__(self):
+        self.close()
 
     @staticmethod
     def is_valid(filepath, chunk=None):
@@ -284,16 +417,14 @@ class EerIO:
             raise FileIOError(
                 f"Frame index {frame_idx} out of range (0..{self._raw_num_frames - 1})")
 
-        page = self._tif.pages[frame_idx]
-
-        # Read raw compressed bytes from the TIFF file using data offsets.
-        # tifffile recognizes EER compression but cannot decode it without
-        # imagecodecs, so we read the raw strips ourselves.
-        with open(self.filename, "rb") as f:
-            all_data = bytearray()
-            for offset, count in zip(page.dataoffsets, page.databytecounts):
-                f.seek(offset)
-                all_data.extend(f.read(count))
+        # Read raw compressed bytes from the TIFF file using the precomputed
+        # strip offsets, over the single persistent binary handle.
+        offsets, counts = self._frame_strips[frame_idx]
+        all_data = bytearray()
+        f = self._file
+        for offset, count in zip(offsets, counts):
+            f.seek(offset)
+            all_data.extend(f.read(count))
 
         return bytes(all_data)
 
@@ -387,9 +518,5 @@ class EerIO:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if hasattr(self, "_tif"):
-                self._tif.close()
-        except Exception:
-            pass
+        self.close()
         return False
