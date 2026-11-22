@@ -52,22 +52,6 @@ EMANVERSION = "e3movie (EMAN3)"
 # Low level helpers (numpy real-space image: shape (ny,nx))
 # ---------------------------------------------------------------------------
 
-def _read_range(f, a, b):
-	"""Read frames a..b-1 from file f, return (numpy {N,Y,X}, headers list)."""
-	io = ImageIO(f, "r")
-	data, headers = io.read_images(list(range(a, b)))
-	io.close()
-	return np.asarray(data), headers
-
-
-def _read_frame(f, i):
-	"""Read a single frame i from file f, return (numpy (Y,X), header dict)."""
-	io = ImageIO(f, "r")
-	data, hdr = io.read_image(i)
-	io.close()
-	return np.asarray(data), hdr
-
-
 def _fixgain_counting(img, gain, gainmin=2.0, gainmax=2.0):
 	"""Port of EMAN2's "math.fixgain.counting" for a single (ny,nx) image.
 
@@ -77,8 +61,8 @@ def _fixgain_counting(img, gain, gainmin=2.0, gainmax=2.0):
 	bad sensor pixels: a good pixel is found by walking the diagonal toward the
 	image center, and the (image/gain) ratio from that good pixel is substituted.
 	"""
-	img = np.asarray(img, dtype=np.float64)
-	gain = np.asarray(gain, dtype=np.float64)
+	img = np.asarray(img, dtype=np.float32)
+	gain = np.asarray(gain, dtype=np.float32)
 	ny, nx = gain.shape
 	gmean = float(gain.mean())
 	gsig = float(gain.std())
@@ -121,7 +105,7 @@ def _translate2(im, dx, dy):
 def _edgemean(img):
 	"""Port of EMAN2's "normalize.edgemean": set the mean over a 3-pixel border
 	around each edge to zero and normalize to unit standard deviation."""
-	img = np.asarray(img, dtype=np.float64)
+	img = np.asarray(img, dtype=np.float32)
 	ny, nx = img.shape
 	edgemean = (img[0:ny - 3, 0:3].mean() +
 	            img[ny - 3:ny, 0:nx - 3].mean() +
@@ -154,27 +138,6 @@ def _resample(img, factor):
 	if newsize < 2:
 		newsize = 2
 	return np.asarray(jax_ift2d(jax_downsample_2d(jax_fft2d(img[np.newaxis, ...]), newsize))[0])
-
-
-def _write_image(fsp, img, apix=None):
-	"""Write a single (ny,nx) image to a new file at index 0."""
-	hdr = {"nx": img.shape[1], "ny": img.shape[0], "nz": 1}
-	if apix is not None:
-		hdr["apix_x"] = hdr["apix_y"] = hdr["apix_z"] = apix
-	io = ImageIO(fsp, "rw")
-	io.write_image(0, np.asarray(img, dtype=np.float32), hdr)
-	io.close()
-
-
-def _write_stack(fsp, stack, apix=None):
-	"""Write an {N,Y,X} stack to a new file."""
-	io = ImageIO(fsp, "rw")
-	for i in range(stack.shape[0]):
-		hdr = {"nx": stack.shape[2], "ny": stack.shape[1], "nz": 1}
-		if apix is not None:
-			hdr["apix_x"] = hdr["apix_y"] = hdr["apix_z"] = apix
-		io.write_image(i, np.asarray(stack[i], dtype=np.float32), hdr)
-	io.close()
 
 
 def _peak_shifts(ccfr, half):
@@ -244,18 +207,19 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if (i % 10 == 0):
 				E3progress(pid, i / nmov)
 			f = args[i]
-			nimg = ImageIO(f, "r").nimg
-			print(f"{f}: {nimg}")
-			for j in range(0, nimg, 50):
-				data, _ = _read_range(f, j, min(j + 50, nimg))
-				for img in data:
-					img = np.asarray(img, dtype=np.float64)
-					if sumim is None:
-						sumim = np.zeros_like(img)
-						sumsq = np.zeros_like(img)
-					sumim += img
-					sumsq += img * img
-					n += 1
+			with ImageIO(f, "r") as idio:
+				nimg = idio.nimg
+				print(f"{f}: {nimg}")
+				for j in range(0, nimg, 50):
+					data, _ = idio.read_images(list(range(j, min(j + 50, nimg))))
+					for img in data:
+						img = np.asarray(img, dtype=np.float32)
+						if sumim is None:
+							sumim = np.zeros_like(img)
+							sumsq = np.zeros_like(img)
+						sumim += img
+						sumsq += img * img
+						n += 1
 		avg = sumim / n
 		sig = np.sqrt(sumsq / n - avg ** 2)
 		# ensure that on average e- counts are still counts (shared scale factor)
@@ -265,7 +229,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		# pixels with very small or very large standard deviations are likely bad
 		slow = max(0.1, sig.mean() - 4.0 * sig.std())
 		shigh = sig.mean() + 4.0 * sig.std()
-		sigm = ((sig >= slow) & (sig <= shigh)).astype(np.float64)
+		sigm = ((sig >= slow) & (sig <= shigh)).astype(np.float32)
 		avg = avg * sigm
 
 		io = ImageIO(options.est_gain, "rw")
@@ -285,7 +249,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		for mi in range(nmov):
 			base = base_name(args[mi])[0]
 			f = args[mi]
-			nimg = ImageIO(f, "r").nimg
+			idio = ImageIO(f, "r")
+			nimg = idio.nimg
 			frames = (options.frames[0], min(options.frames[1], nimg))
 
 			if options.seqavg > 1:
@@ -294,11 +259,11 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				for i in range(nblk):
 					a = frames[0] + i * options.seqavg
 					b = frames[0] + (i + 1) * options.seqavg
-					d, _ = _read_range(f, a, b)
+					d, _ = idio.read_images(list(range(a, b)))
 					blk.append(d.sum(axis=0))
 				imgs = np.stack(blk)
 			else:
-				imgs, _ = _read_range(f, frames[0], frames[1])
+				imgs, _ = idio.read_images(list(range(frames[0], frames[1])))
 				imgs = np.asarray(imgs)
 
 			apix = None
@@ -306,7 +271,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				apix = options.apix
 			if apix is None:
 				try:
-					apix = _read_frame(f, frames[0])[1].get("apix_x", 1.0)
+					apix = idio.read_header(frames[0]).get("apix_x", 1.0)
 				except Exception:
 					apix = 1.0
 			if apix is None:
@@ -352,17 +317,19 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			step = max(options.seqavg, 1)
 			for i in range(frames[0], frames[1], step):
 				if options.seqavg > 1:
-					im = _read_range(f, i, i + options.seqavg)[0].sum(axis=0)
+					im = idio.read_images(list(range(i, i + options.seqavg)))[0].sum(axis=0)
 				else:
-					im = _read_frame(f, i)[0]
+					im = idio.read_image(i)[0]
 				if options.align_gain is not None:
 					im = _fixgain_counting(im, gain, 2, 2)
 				if clip is not None:
 					im = _center_crop(im, clip[0], clip[1])
 				orig.append(im)
-				# note the x/y order: translate(dx=x-shift, dy=y-shift)
-				ali.append(_translate2(im, int(seqoff[1, i - frames[0]]),
-				                       int(seqoff[0, i - frames[0]])))
+				# note the x/y order: translate(dx=x-shift, dy=y-shift);
+				# with seqavg>1 the shifts are per averaged block, so index by block number
+				bi = (i - frames[0]) // step
+				ali.append(_translate2(im, int(seqoff[1, bi]),
+				                       int(seqoff[0, bi])))
 			avgo = np.mean(orig, axis=0)
 			avga = np.mean(ali, axis=0)
 
@@ -373,10 +340,19 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				avgo = _resample(avgo, options.shrinkout)
 				avga = _resample(avga, options.shrinkout)
 
+			idio.close()
+
 			os.makedirs("micrographs", exist_ok=True)
+			hdr = {"nx": avga.shape[1], "ny": avga.shape[0], "nz": 1}
+			if apix is not None:
+				hdr["apix_x"] = hdr["apix_y"] = hdr["apix_z"] = apix
 			if options.keepunali:
-				_write_image(f"micrographs/{base}__{frames[0]}-{frames[1]}_unali.hdf", avgo, apix)
-			_write_image(f"micrographs/{base}__{frames[0]}-{frames[1]}.hdf", avga, apix)
+				io = ImageIO(f"micrographs/{base}__{frames[0]}-{frames[1]}_unali.hdf", "rw")
+				io.write_image(0, avgo, hdr)
+				io.close()
+			io = ImageIO(f"micrographs/{base}__{frames[0]}-{frames[1]}.hdf", "rw")
+			io.write_image(0, avga, hdr)
+			io.close()
 
 			js = js_open_dict(info_name(f))
 			js["movie_frames"] = frames
@@ -392,19 +368,20 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		for mi in range(nmov):
 			base = base_name(args[mi])[0]
 			f = args[mi]
-			nimg = ImageIO(f, "r").nimg
+			idio = ImageIO(f, "r")
+			nimg = idio.nimg
 			frames = (options.frames[0], min(options.frames[1], nimg))
 			apix = None
 			if options.apix is not None:
 				apix = options.apix
 			if apix is None:
 				try:
-					apix = _read_frame(f, frames[0])[1].get("apix_x", 1.0)
+					apix = idio.read_header(frames[0]).get("apix_x", 1.0)
 				except Exception:
 					apix = 1.0
 			if apix is None:
 				apix = 1.0
-			imgs, _ = _read_range(f, frames[0], frames[1])
+			imgs, _ = idio.read_images(list(range(frames[0], frames[1])))
 			imgs = np.asarray(imgs)
 			if options.align_gain is not None:
 				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
@@ -463,7 +440,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			orig = []
 			ali = []
 			for i in range(frames[0], frames[1]):
-				im = _read_frame(f, i)[0]
+				im = idio.read_image(i)[0]
 				if options.align_gain is not None:
 					im = _fixgain_counting(im, gain, 2, 2)
 				if clip is not None:
@@ -481,9 +458,18 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				avgo = _resample(avgo, options.shrinkout)
 				avga = _resample(avga, options.shrinkout)
 
+			idio.close()
+
 			os.makedirs("micrographs", exist_ok=True)
-			_write_image(f"micrographs/{base}_{frames[0]}-{frames[1]}_unali.hdf", avgo, apix)
-			_write_image(f"micrographs/{base}_{frames[0]}-{frames[1]}.hdf", avga, apix)
+			hdr = {"nx": avga.shape[1], "ny": avga.shape[0], "nz": 1}
+			if apix is not None:
+				hdr["apix_x"] = hdr["apix_y"] = hdr["apix_z"] = apix
+			io = ImageIO(f"micrographs/{base}_{frames[0]}-{frames[1]}_unali.hdf", "rw")
+			io.write_image(0, avgo, hdr)
+			io.close()
+			io = ImageIO(f"micrographs/{base}_{frames[0]}-{frames[1]}.hdf", "rw")
+			io.write_image(0, avga, hdr)
+			io.close()
 
 			js = js_open_dict(info_name(f))
 			js["movie_frames"] = frames
@@ -495,26 +481,34 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	# --ccftest : CCF between each image and the middle image
 	# ------------------------------------------------------------------
 	if options.ccftest:
-		avg = _read_frame("average.hdf", 0)[0]
+		with ImageIO("average.hdf", "r") as ain:
+			avg = ain.read_image(0)[0]
 		avg = avg / avg.mean()
-		nimg = ImageIO(args[0], "r").nimg
-		imgs = _read_range(args[0], 0, min(50, nimg))[0]
+		with ImageIO(args[0], "r") as idio:
+			imgs = idio.read_images(list(range(0, min(50, idio.nimg))))[0]
 		imgs = imgs / avg
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts * jnp.conj(ffts[len(imgs) // 2]))
 		ccfsr = np.asarray(jax_ift2d(ccfs))
 		ny, nx = ccfsr.shape[1:]
 		cens = ccfsr[:, ny // 2 - 64:ny // 2 + 64, nx // 2 - 64:nx // 2 + 64]
-		_write_stack("ccfs.hdf", cens)
+		hdr = {"nx": cens.shape[2], "ny": cens.shape[1], "nz": 1}
+		io = ImageIO("ccfs.hdf", "rw")
+		try:
+			for k in range(cens.shape[0]):
+				io.write_image(k, cens[k], hdr)
+		finally:
+			io.close()
 
 	# ------------------------------------------------------------------
 	# --acftest : ACF images for the input stack
 	# ------------------------------------------------------------------
 	if options.acftest:
-		avg = _read_frame("average.hdf", 0)[0]
+		with ImageIO("average.hdf", "r") as ain:
+			avg = ain.read_image(0)[0]
 		avg = avg / avg.mean()
-		nimg = ImageIO(args[0], "r").nimg
-		imgs = _read_range(args[0], 0, min(50, nimg))[0]
+		with ImageIO(args[0], "r") as idio:
+			imgs = idio.read_images(list(range(0, min(50, idio.nimg))))[0]
 		imgs = imgs / avg
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts * jnp.conj(ffts))
@@ -522,7 +516,13 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		ny, nx = ccfsr.shape[1:]
 		cens = ccfsr[:, ny // 2 - 64:ny // 2 + 64, nx // 2 - 64:nx // 2 + 64]
 		cens = np.stack([_edgemean(cens[k]) for k in range(cens.shape[0])])
-		_write_stack("ccfs.hdf", cens)
+		hdr = {"nx": cens.shape[2], "ny": cens.shape[1], "nz": 1}
+		io = ImageIO("ccfs.hdf", "rw")
+		try:
+			for k in range(cens.shape[0]):
+				io.write_image(k, cens[k], hdr)
+		finally:
+			io.close()
 
 	# ------------------------------------------------------------------
 	# --ccfdtest : CCF between each image and the next, with gain correction
@@ -534,13 +534,15 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			except OSError:
 				pass
 
-		avg = _read_frame(options.ccfdtest, 0)[0]
+		with ImageIO(options.ccfdtest, "r") as ain:
+			avg = ain.read_image(0)[0]
 		avg = avg / avg.mean()
-		nimg = ImageIO(args[0], "r").nimg
+		idio = ImageIO(args[0], "r")
+		nimg = idio.nimg
 
 		# first block: sum of 10-frame groups (step 2), 40 images
 		print(f"0:{min(50, nimg)}")
-		aimgs = _read_range(args[0], 0, min(50, nimg))[0]
+		aimgs = idio.read_images(list(range(0, min(50, nimg))))[0]
 		aimgs = np.stack([_fixgain_counting(aimgs[k], avg, 3, 3) for k in range(aimgs.shape[0])])
 		imgs = np.stack([aimgs[i:i + 10:2].sum(axis=0) for i in range(40)])
 		ffts = jax_fft2d(imgs)
@@ -548,12 +550,23 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		ccfsr = np.asarray(jax_ift2d(ccfs))
 		cens = _center_crop(ccfsr, 64, 64)
 		cens = np.stack([_edgemean(cens[k]) for k in range(cens.shape[0])])
-		_write_stack("ccfeo5.hdf", cens)
-		_write_stack("ccfeo5_imgs.hdf", imgs)
+		hdr = {"nx": cens.shape[2], "ny": cens.shape[1], "nz": 1}
+		io = ImageIO("ccfeo5.hdf", "rw")
+		try:
+			for k in range(cens.shape[0]):
+				io.write_image(k, cens[k], hdr)
+		finally:
+			io.close()
+		io = ImageIO("ccfeo5_imgs.hdf", "rw")
+		try:
+			for k in range(imgs.shape[0]):
+				io.write_image(k, imgs[k], hdr)
+		finally:
+			io.close()
 
 		for i in range(1, nimg, 25):
 			print(f"{i - 1}:{min(i + 25, nimg)}")
-			imgs = _read_range(args[0], i - 1, min(i + 25, nimg))[0]
+			imgs = idio.read_images(list(range(i - 1, min(i + 25, nimg))))[0]
 			imgs = np.stack([_fixgain_counting(imgs[k], avg, 3, 3) for k in range(imgs.shape[0])])
 
 			def _ccfblock(im):
@@ -564,22 +577,46 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				cn = np.stack([_edgemean(cn[k]) for k in range(cn.shape[0])])
 				return cn
 
-			_write_stack("ccfs.hdf", _ccfblock(imgs))
+			cn = _ccfblock(imgs)
+			hdr = {"nx": cn.shape[2], "ny": cn.shape[1], "nz": 1}
+			io = ImageIO("ccfs.hdf", "rw")
+			try:
+				for k in range(cn.shape[0]):
+					io.write_image(k, cn[k], hdr)
+			finally:
+				io.close()
 
 			imgs2k = _center_crop(imgs, 2048, 2048)
-			_write_stack("ccfs2k.hdf", _ccfblock(imgs2k))
+			cn = _ccfblock(imgs2k)
+			hdr = {"nx": cn.shape[2], "ny": cn.shape[1], "nz": 1}
+			io = ImageIO("ccfs2k.hdf", "rw")
+			try:
+				for k in range(cn.shape[0]):
+					io.write_image(k, cn[k], hdr)
+			finally:
+				io.close()
 
 			imgs1k = _center_crop(imgs, 1024, 1024)
-			_write_stack("ccfs1k.hdf", _ccfblock(imgs1k))
+			cn = _ccfblock(imgs1k)
+			hdr = {"nx": cn.shape[2], "ny": cn.shape[1], "nz": 1}
+			io = ImageIO("ccfs1k.hdf", "rw")
+			try:
+				for k in range(cn.shape[0]):
+					io.write_image(k, cn[k], hdr)
+			finally:
+				io.close()
+
+		idio.close()
 
 	# ------------------------------------------------------------------
 	# --ccftiletest : tiled average of the CCF
 	# ------------------------------------------------------------------
 	if options.ccftiletest:
-		avg = _read_frame("average.hdf", 0)[0]
+		with ImageIO("average.hdf", "r") as ain:
+			avg = ain.read_image(0)[0]
 		avg = avg / avg.mean()
-		nimg = ImageIO(args[0], "r").nimg
-		imgs = _read_range(args[0], 0, min(50, nimg))[0]
+		with ImageIO(args[0], "r") as idio:
+			imgs = idio.read_images(list(range(0, min(50, idio.nimg))))[0]
 		ny, nx = imgs.shape[1:]
 		imgs = imgs / avg
 
@@ -595,7 +632,13 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				else:
 					ccfsum = ccfsum + cr
 		ccfsum = np.stack([_edgemean(ccfsum[k]) for k in range(ccfsum.shape[0])])
-		_write_stack("ccfs.hdf", ccfsum)
+		hdr = {"nx": ccfsum.shape[2], "ny": ccfsum.shape[1], "nz": 1}
+		io = ImageIO("ccfs.hdf", "rw")
+		try:
+			for k in range(ccfsum.shape[0]):
+				io.write_image(k, ccfsum[k], hdr)
+		finally:
+			io.close()
 
 	E3end(pid)
 
