@@ -231,8 +231,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		rsz = 128  # half the size of the CCF regions to correlate
 		for mi in range(nmov):
 			if options.verbose >= 1:
-				print(args[mi])
+				print(args[mi],endl="\t")
 				tlast = print_progress(tlast, "alignbyccf", mi, nmov)
+				print("\n")
 
 			base = base_name(args[mi])[0]
 			f = args[mi]
@@ -255,6 +256,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 					d, _ = idio.read_images(list(range(a, b)))
 					blk.append(d.sum(axis=0))
 				imgs = np.stack(blk)
+				if options.verbose>1: tlast2=print_progress(tlast2,"reading",nblk,nblk)
 			else:
 				imgs, _ = idio.read_images(list(range(frames[0], frames[1])))
 				imgs = np.asarray(imgs)
