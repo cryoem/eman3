@@ -395,7 +395,7 @@ def linearfilter_lowpass_gaussian(stack: EMStack,
 	internally for convenience).
 
 	The half-width of the Gaussian (where the filter value is 1/e) may be specified in any ONE of three ways:
-		cutoff       - the half-width in terms of Nyquist = 0.5 (cycles/pixel, as used by jax_pointfilt_2d)
+		cutoff       - the half-width in terms of Nyquist = 0.5 (cycles/pixel, as used by jax_gaussfilt_2d)
 		cutoff_pix   - the same half-width expressed as a radius in Fourier pixels (relative to the image dimension)
 		cutoff_freq  - the same half-width expressed as a spatial frequency in reciprocal Angstroms
 					    (uses the stack's apix; requires stack.apix to be set, otherwise apix = 1.0 is assumed)

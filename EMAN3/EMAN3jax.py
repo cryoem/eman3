@@ -91,12 +91,12 @@ class StackCache():
 	def __init__(self,filename):
 		"""Specify the path to the .lst file to be cached"""
 		print("cache: ",filename)
+		if not filename.endswith(".lst"): raise Exception("StackCache: Can only cache .lst files")
 		io = ImageIO(filename)
 		hdr = io.read_header(0)  # header of the first image so we can compute downsampling
 		if hdr["nx"]<32 : raise Exception("StackCache: Cannot cache files smaller than 32x32 pixels")
 		if hdr["nx"]!=hdr["ny"] or (hdr["nx"]!=hdr["nz"] and hdr["nz"]!=1) : raise Exception("StackCache: Cannot cache non-square/cube images")
 		io.close()
-		if not filename.endswith(".lst"): raise Exception("StackCache: Can only cache .lst files")
 
 		# overall metadata, not stored per-particle
 		self.ctf_phase_flipped=False
@@ -1875,8 +1875,8 @@ def jax_phaseorigin3d(imgs):
 
 	return imgs*POF3D
 
-def jax_pointfilt_2d(boxsize,halfwidth):
-	"""create a (multiplicative) Point lowpass filter for boxsize with halfwidth (0.5=Nyquist)"""
+def jax_gaussfilt_2d(boxsize,halfwidth):
+	"""create a (multiplicative) Gaussian lowpass filter for boxsize with halfwidth (0.5=Nyquist)"""
 	coef=-1.0/(halfwidth*boxsize)**2
 	r2img=rad2_img(boxsize)
 	filt=jnp.exp(r2img*coef)

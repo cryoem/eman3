@@ -40,7 +40,7 @@ import jax.numpy as jnp
 
 from EMAN3.EMAN3 import (EMArgumentParser, E3init, E3end, E3progress, print_progress,
                          error_exit, warning, good_size, base_name, info_name)
-from EMAN3.EMAN3jax import (jax_fft2d, jax_ift2d, jax_pointfilt_2d,
+from EMAN3.EMAN3jax import (jax_fft2d, jax_ift2d, jax_gaussfilt_2d,
                            jax_downsample_2d, jax_phaseorigin2d, jax_set_device)
 from EMAN3.processor import normalize_edgemean_2d_real, xform_translate_int_2d_real
 from EMAN3.io.imageio import ImageIO
@@ -153,7 +153,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 
 	# tlast carries the print_progress state; each phase below ends with a cur==n
 	# call, which is required to reset print_progress's timing for the next phase.
-	tlast = 0
+	tlast,tlast2 = 0,0
 
 	# Load the gain image once if it is used for correction
 	gain = None
@@ -162,6 +162,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		gain, _ = io.read_image(0)
 		io.close()
 		gain = np.asarray(gain)
+
+	if options.verbose>1 : print("Initialized")
 
 	# ------------------------------------------------------------------
 	# --est_gain : estimate a gain image across all provided movies
@@ -228,17 +230,26 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	if options.alignbyccf:
 		rsz = 128  # half the size of the CCF regions to correlate
 		for mi in range(nmov):
+			if options.verbose >= 1:
+				print(args[mi])
+				tlast = print_progress(tlast, "alignbyccf", mi, nmov)
+
 			base = base_name(args[mi])[0]
 			f = args[mi]
 			idio = ImageIO(f, "r")
 			nimg = idio.nimg
 			frames = (options.frames[0], min(options.frames[1], nimg))
 			nfr = frames[1] - frames[0]
+			neff = nfr // options.seqavg if options.seqavg > 1 else nfr
+			if neff > 100:
+				print(f"warning: {neff} frames will be aligned, but individual frames of dose-fractionated movies may not have sufficient signal; consider --seqavg")
 
+			tlast2=0
 			if options.seqavg > 1:
 				nblk = (frames[1] - frames[0]) // options.seqavg
 				blk = []
 				for i in range(nblk):
+					if options.verbose>1: tlast2=print_progress(tlast2,"reading",i,nblk)
 					a = frames[0] + i * options.seqavg
 					b = frames[0] + (i + 1) * options.seqavg
 					d, _ = idio.read_images(list(range(a, b)))
@@ -261,6 +272,13 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 
 			if options.align_gain is not None:
 				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
+			# keep the unmodified (gain-corrected) images for the final aligned
+			# average, so the movie does not have to be read from disk a second time
+			raw = imgs
+			if clip is not None:
+				ny, nx = raw.shape[-2:]
+				raw = raw[..., (ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
+				           (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
 			# normalization only for alignment
 			imgs = normalize_edgemean_2d_real(imgs)
 			ny, nx = imgs.shape[-2:]
@@ -277,7 +295,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			ccfsr = (ccfsr - ccfsr.mean(axis=(1, 2), keepdims=True)) / ccfsr.std(axis=(1, 2), keepdims=True)
 
 			# gaussian low pass filter to smooth the ccfs after removing the 0 translation
-			filt = jax_pointfilt_2d(rsz * 2, 0.125)
+			filt = jax_gaussfilt_2d(rsz * 2, 0.125)
 			ccfsfilt = jax_fft2d(ccfsr) * filt
 			ccfsreal = jax_ift2d(ccfsfilt)
 
@@ -290,32 +308,11 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose:
 				print(seqoff)
 
-			if options.verbose >= 1:
-				tlast = print_progress(tlast, "alignbyccf", mi * 2 * nfr + nfr, nmov * 2 * nfr)
-
-			# average the (optionally gain-corrected, translated) frames
-			orig = []
-			step = max(options.seqavg, 1)
-			# the CCFs were computed on whole seqavg blocks only, so a trailing
-			# partial block (if any) must be excluded here as well
-			lend = frames[1] if step == 1 else frames[0] + ((frames[1] - frames[0]) // step) * step
-			for i in range(frames[0], lend, step):
-				if options.seqavg > 1:
-					im = idio.read_images(list(range(i, i + options.seqavg)))[0].sum(axis=0)
-				else:
-					im = idio.read_image(i)[0]
-				if options.align_gain is not None:
-					im = _fixgain_counting(im, gain, 2, 2)
-				if clip is not None:
-					ny, nx = im.shape
-					im = im[(ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
-					        (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
-				orig.append(im)
-				if options.verbose >= 1:
-					tlast = print_progress(tlast, "alignbyccf", mi * 2 * nfr + nfr + (i - frames[0]), nmov * 2 * nfr)
-			orig = np.stack(orig)
-			# note the x/y order: shifts are [dx, dy]; with seqavg>1 they are per
-			# averaged block, so index by block number
+			# average the frames, reusing the kept (gain-corrected, clip-cropped)
+			# copy so the movie does not need a second read from disk; with
+			# seqavg>1 the rows are per averaged block, so the shifts index by
+			# block number
+			orig = raw
 			idxs = jnp.arange(orig.shape[0])
 			shifts = jnp.stack([seqoff[1, idxs], seqoff[0, idxs]], axis=1)
 			ali = xform_translate_int_2d_real(orig, shifts)
@@ -350,7 +347,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			js = None
 
 		if options.verbose >= 1:
-			tlast = print_progress(tlast, "alignbyccf", nmov * 2 * nfr, nmov * 2 * nfr)
+			tlast = print_progress(tlast, "alignbyccf", nmov,nmov)
 
 	# ------------------------------------------------------------------
 	# --alignbyacfccf : progressive ACF-referenced CCF alignment
@@ -358,12 +355,18 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	if options.alignbyacfccf:
 		rsz = 128
 		for mi in range(nmov):
+			if options.verbose >= 1:
+				print(args[mi])
+				tlast = print_progress(tlast, "alignbyacfccf", mi, nmov)
+
 			base = base_name(args[mi])[0]
 			f = args[mi]
 			idio = ImageIO(f, "r")
 			nimg = idio.nimg
 			frames = (options.frames[0], min(options.frames[1], nimg))
 			nfr = frames[1] - frames[0]
+			if nfr > 100:
+				print(f"warning: {nfr} frames will be aligned, but individual frames of dose-fractionated movies may not have sufficient signal; consider using --alignbyccf with --seqavg")
 			apix = None
 			if options.apix is not None:
 				apix = options.apix
@@ -374,10 +377,22 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 					apix = 1.0
 			if apix is None:
 				apix = 1.0
-			imgs, _ = idio.read_images(list(range(frames[0], frames[1])))
-			imgs = np.asarray(imgs)
+			tlast2=0
+			blk = []
+			for i in range(nfr):
+				if options.verbose>1: tlast2=print_progress(tlast2,"reading",i,nfr)
+				im, _ = idio.read_image(frames[0] + i)
+				blk.append(im)
+			imgs = np.stack(blk)
 			if options.align_gain is not None:
 				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
+			# keep the unmodified (gain-corrected) images for the final aligned
+			# average, so the movie does not have to be read from disk a second time
+			raw = imgs
+			if clip is not None:
+				ny, nx = raw.shape[-2:]
+				raw = raw[..., (ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
+				           (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
 			imgs = normalize_edgemean_2d_real(imgs)
 			ny, nx = imgs.shape[-2:]
 			imgs = imgs[..., (ny - 3072) // 2:(ny - 3072) // 2 + 3072, (nx - 3072) // 2:(nx - 3072) // 2 + 3072]
@@ -425,22 +440,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose:
 				print(seqoff)
 
-			if options.verbose >= 1:
-				tlast = print_progress(tlast, "alignbyacfccf", mi * 2 * nfr + nfr, nmov * 2 * nfr)
-
-			orig = []
-			for i in range(frames[0], frames[1]):
-				im = idio.read_image(i)[0]
-				if options.align_gain is not None:
-					im = _fixgain_counting(im, gain, 2, 2)
-				if clip is not None:
-					ny, nx = im.shape
-					im = im[(ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
-					        (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
-				orig.append(im)
-				if options.verbose >= 1:
-					tlast = print_progress(tlast, "alignbyacfccf", mi * 2 * nfr + nfr + (i - frames[0]), nmov * 2 * nfr)
-			orig = np.stack(orig)
+			# average the frames, reusing the kept (gain-corrected, clip-cropped)
+			# copy so the movie does not need a second read from disk
+			orig = raw
 			idxs = jnp.arange(orig.shape[0])
 			shifts = jnp.stack([seqoff[1, idxs], seqoff[0, idxs]], axis=1)
 			ali = xform_translate_int_2d_real(orig, shifts)
@@ -474,7 +476,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			js = None
 
 		if options.verbose >= 1:
-			tlast = print_progress(tlast, "alignbyacfccf", nmov * 2 * nfr, nmov * 2 * nfr)
+			tlast = print_progress(tlast, "alignbyacfccf", nmov,nmov)
 
 	# ------------------------------------------------------------------
 	# --ccftest : CCF between each image and the middle image
