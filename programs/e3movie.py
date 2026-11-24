@@ -270,6 +270,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if apix is None:
 				apix = 1.0
 
+			if options.verbose>1 : print(" aligning        ",end="\r")
 			if options.align_gain is not None:
 				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
 			# keep the unmodified (gain-corrected) images for the final aligned
@@ -305,7 +306,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			seqoff = jnp.cumsum(seqoff, axis=1)
 			seqoff = seqoff - jnp.array([int(seqoff[0].mean()), int(seqoff[1].mean())]).reshape(2, 1)  # recenter to minimize edge effects
 
-			if options.verbose:
+			if options.verbose>2:
 				print(seqoff)
 
 			# average the frames, reusing the kept (gain-corrected, clip-cropped)
@@ -328,6 +329,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 
 			idio.close()
 
+			if options.verbose>1: print(" saving            ",end="\r")
 			os.makedirs("micrographs", exist_ok=True)
 			hdr = {"nx": avga.shape[1], "ny": avga.shape[0], "nz": 1}
 			if apix is not None:
