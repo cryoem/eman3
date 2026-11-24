@@ -270,7 +270,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if apix is None:
 				apix = 1.0
 
-			if options.verbose>1 : print(" aligning        ",end="\r")
+			if options.verbose>1 : print(" preproc and fft        ",end="\r")
 			if options.align_gain is not None:
 				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
 			# keep the unmodified (gain-corrected) images for the final aligned
@@ -286,6 +286,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			imgs = imgs[..., (ny - 3072) // 2:(ny - 3072) // 2 + 3072, (nx - 3072) // 2:(nx - 3072) // 2 + 3072]
 			ffts = jax_fft2d(imgs)
 
+			if options.verbose>1 : print(" ccfs             ",end="\r")
 			# CCF between each image and the subsequent image
 			ccfs = jax_phaseorigin2d(ffts[:-1] * jnp.conj(ffts[1:]))
 			ccfsr = jax_ift2d(ccfs)
@@ -300,6 +301,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			ccfsfilt = jax_fft2d(ccfsr) * filt
 			ccfsreal = jax_ift2d(ccfsfilt)
 
+			if options.verbose>1 : print(" peaks             ",end="\r")
 			# extract the peak locations and convert to absolute shifts
 			seqoff = _peak_shifts(ccfsreal, rsz)
 			seqoff = jnp.concatenate([jnp.zeros((2, 1), dtype=seqoff.dtype), seqoff], axis=1)  # first image is 0 shift
