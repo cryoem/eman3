@@ -141,6 +141,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	jax_set_device(dev=options.gpudev, maxmem=options.gpuram)
 
 	pid = E3init(sys.argv)
+
 	nmov = len(args)
 	if options.clip is not None:
 		clip = (int(options.clip.split(",")[0]), int(options.clip.split(",")[1]))
@@ -151,9 +152,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	else:
 		options.frames = (0, 100000)
 
-	# tlast carries the print_progress state; each phase below ends with a cur==n
-	# call, which is required to reset print_progress's timing for the next phase.
-	tlast,tlast2 = 0,0
+	tlast = 0
+	if options.verbose >= 1: tlast = print_progress(tlast, "e3movie", 0, nmov)
 
 	# Load the gain image once if it is used for correction
 	gain = None
@@ -233,7 +233,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose >= 1:
 				print(args[mi],end="\t")
 				tlast = print_progress(tlast, "alignbyccf", mi, nmov)
-				print("\n")
+				print("")
 
 			base = base_name(args[mi])[0]
 			f = args[mi]
@@ -245,18 +245,16 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if neff > 100:
 				print(f"warning: {neff} frames will be aligned, but individual frames of dose-fractionated movies may not have sufficient signal; consider --seqavg")
 
-			tlast2=0
 			if options.seqavg > 1:
 				nblk = (frames[1] - frames[0]) // options.seqavg
 				blk = []
 				for i in range(nblk):
-					if options.verbose>1: tlast2=print_progress(tlast2,"reading",i,nblk)
+					if options.verbose>1: print(f" reading {i}/{nblk}",end="\r")
 					a = frames[0] + i * options.seqavg
 					b = frames[0] + (i + 1) * options.seqavg
 					d, _ = idio.read_images(list(range(a, b)))
 					blk.append(d.sum(axis=0))
 				imgs = np.stack(blk)
-				if options.verbose>1: tlast2=print_progress(tlast2,"reading",nblk,nblk)
 			else:
 				imgs, _ = idio.read_images(list(range(frames[0], frames[1])))
 				imgs = np.asarray(imgs)
