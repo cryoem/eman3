@@ -231,7 +231,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		rsz = 128  # half the size of the CCF regions to correlate
 		for mi in range(nmov):
 			if options.verbose >= 1:
-				print(args[mi],endl="\t")
+				print(args[mi],end="\t")
 				tlast = print_progress(tlast, "alignbyccf", mi, nmov)
 				print("\n")
 
