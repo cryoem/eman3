@@ -41,7 +41,8 @@ import jax.numpy as jnp
 from EMAN3.EMAN3 import (EMArgumentParser, E3init, E3end, E3progress,
                          error_exit, warning, good_size, base_name, info_name)
 from EMAN3.EMAN3jax import (jax_fft2d, jax_ift2d, jax_pointfilt_2d,
-                            jax_downsample_2d, jax_phaseorigin2d, jax_set_device)
+                           jax_downsample_2d, jax_phaseorigin2d, jax_set_device)
+from EMAN3.processor import normalize_edgemean_2d_real, xform_translate_int_2d_real
 from EMAN3.io.imageio import ImageIO
 from EMAN3.EMAN3jsondb import js_open_dict
 
@@ -90,44 +91,6 @@ def _fixgain_counting(img, gain, gainmin=2.0, gainmax=2.0):
 	return out
 
 
-def _translate2(im, dx, dy):
-	"""Zero-fill integer translate: content moves by +dx in x and +dy in y
-	(out[p] = in[p - shift]), matching EMAN2's integer translate."""
-	im = np.asarray(im)
-	out = np.zeros_like(im)
-	ny, nx = im.shape
-	sx0, sx1 = max(0, -dx), min(nx, nx - dx)
-	sy0, sy1 = max(0, -dy), min(ny, ny - dy)
-	out[sy0 + dy:sy1 + dy, sx0 + dx:sx1 + dx] = im[sy0:sy1, sx0:sx1]
-	return out
-
-
-def _edgemean(img):
-	"""Port of EMAN2's "normalize.edgemean": set the mean over a 3-pixel border
-	around each edge to zero and normalize to unit standard deviation."""
-	img = np.asarray(img, dtype=np.float32)
-	ny, nx = img.shape
-	edgemean = (img[0:ny - 3, 0:3].mean() +
-	            img[ny - 3:ny, 0:nx - 3].mean() +
-	            img[3:ny, nx - 3:nx].mean() +
-	            img[0:3, 3:nx].mean()) / 4.0
-	return (img - edgemean) / img.std()
-
-
-def _center_crop(img, cx, cy):
-	"""Centrally crop a single image or stack to (cy, cx), trimming both edges.
-	If the requested size exceeds the image in an axis, that axis is left as-is."""
-	img = np.asarray(img)
-	ny, nx = img.shape[-2:]
-	cy = min(cy, ny)
-	cx = min(cx, nx)
-	sy = (ny - cy) // 2
-	sx = (nx - cx) // 2
-	if img.ndim == 2:
-		return img[sy:sy + cy, sx:sx + cx].copy()
-	return img[:, sy:sy + cy, sx:sx + cx].copy()
-
-
 def _resample(img, factor):
 	"""Fourier-downsample a real-space image by a (possibly fractional) factor,
 	producing an even-sized image. Analogous to EMAN2's "math.fft.resample n=factor"."""
@@ -142,10 +105,10 @@ def _resample(img, factor):
 
 def _peak_shifts(ccfr, half):
 	"""Given a real-space CCF/ACF stack {N, 2*half, 2*half}, extract the peak
-	shift of each (relative to center) as a (2, N) int array (rows: y then x)."""
-	flat = np.argmax(ccfr.reshape(ccfr.shape[0], -1), axis=1)
-	py, px = np.unravel_index(flat, (half * 2, half * 2))
-	return np.array([py, px]) - half  # shape (2, N): row 0 = y, row 1 = x
+	shift of each (relative to center) as a (2, N) int32 array (rows: y then x)."""
+	flat = jnp.argmax(ccfr.reshape(ccfr.shape[0], -1), axis=1)
+	py, px = jnp.unravel_index(flat, (half * 2, half * 2))
+	return jnp.array([py, px]) - half  # shape (2, N): row 0 = y, row 1 = x
 
 
 def main():
@@ -287,40 +250,36 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.align_gain is not None:
 				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
 			# normalization only for alignment
-			imgs = np.stack([_edgemean(imgs[k]) for k in range(imgs.shape[0])])
-			imgs = _center_crop(imgs, 3072, 3072)
+			imgs = normalize_edgemean_2d_real(imgs)
+			ny, nx = imgs.shape[-2:]
+			imgs = imgs[..., (ny - 3072) // 2:(ny - 3072) // 2 + 3072, (nx - 3072) // 2:(nx - 3072) // 2 + 3072]
 			ffts = jax_fft2d(imgs)
 
 			# CCF between each image and the subsequent image
 			ccfs = jax_phaseorigin2d(ffts[:-1] * jnp.conj(ffts[1:]))
-			ccfsr = np.asarray(jax_ift2d(ccfs))
-			ccfsr = _center_crop(ccfsr, rsz * 2, rsz * 2)
-			ccfsr[:, rsz, rsz] = (ccfsr[:, rsz - 1, rsz] + ccfsr[:, rsz + 1, rsz] +
-	                             ccfsr[:, rsz, rsz - 1] + ccfsr[:, rsz, rsz + 1]) / 4.0
-			for i in range(ccfsr.shape[0]):
-				ccfsr[i] -= np.mean(ccfsr[i])
-				ccfsr[i] /= np.std(ccfsr[i])
+			ccfsr = jax_ift2d(ccfs)
+			ny, nx = ccfsr.shape[-2:]
+			ccfsr = ccfsr[..., ny // 2 - rsz:ny // 2 + rsz, nx // 2 - rsz:nx // 2 + rsz]
+			ccfsr = ccfsr.at[:, rsz, rsz].set((ccfsr[:, rsz - 1, rsz] + ccfsr[:, rsz + 1, rsz] +
+			                                    ccfsr[:, rsz, rsz - 1] + ccfsr[:, rsz, rsz + 1]) / 4.0)
+			ccfsr = (ccfsr - ccfsr.mean(axis=(1, 2), keepdims=True)) / ccfsr.std(axis=(1, 2), keepdims=True)
 
 			# gaussian low pass filter to smooth the ccfs after removing the 0 translation
 			filt = jax_pointfilt_2d(rsz * 2, 0.125)
 			ccfsfilt = jax_fft2d(ccfsr) * filt
-			ccfsreal = np.asarray(jax_ift2d(ccfsfilt))
+			ccfsreal = jax_ift2d(ccfsfilt)
 
 			# extract the peak locations and convert to absolute shifts
 			seqoff = _peak_shifts(ccfsreal, rsz)
-			seqoff = np.insert(seqoff, 0, np.array([0, 0]), axis=1)  # first image is 0 shift
-			for i in range(1, seqoff.shape[1]):
-				seqoff[0, i] += seqoff[0, i - 1]
-				seqoff[1, i] += seqoff[1, i - 1]
-			seqoff[0] -= int(seqoff[0].mean())  # recenter to minimize edge effects
-			seqoff[1] -= int(seqoff[1].mean())
+			seqoff = jnp.concatenate([jnp.zeros((2, 1), dtype=seqoff.dtype), seqoff], axis=1)  # first image is 0 shift
+			seqoff = jnp.cumsum(seqoff, axis=1)
+			seqoff = seqoff - jnp.array([int(seqoff[0].mean()), int(seqoff[1].mean())]).reshape(2, 1)  # recenter to minimize edge effects
 
 			if options.verbose:
 				print(seqoff)
 
 			# average the (optionally gain-corrected, translated) frames
 			orig = []
-			ali = []
 			step = max(options.seqavg, 1)
 			for i in range(frames[0], frames[1], step):
 				if options.seqavg > 1:
@@ -330,15 +289,18 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				if options.align_gain is not None:
 					im = _fixgain_counting(im, gain, 2, 2)
 				if clip is not None:
-					im = _center_crop(im, clip[0], clip[1])
+					ny, nx = im.shape
+					im = im[(ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
+					        (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
 				orig.append(im)
-				# note the x/y order: translate(dx=x-shift, dy=y-shift);
-				# with seqavg>1 the shifts are per averaged block, so index by block number
-				bi = (i - frames[0]) // step
-				ali.append(_translate2(im, int(seqoff[1, bi]),
-				                       int(seqoff[0, bi])))
+			orig = np.stack(orig)
+			# note the x/y order: shifts are [dx, dy]; with seqavg>1 they are per
+			# averaged block, so index by block number
+			idxs = jnp.arange(orig.shape[0])
+			shifts = jnp.stack([seqoff[1, idxs], seqoff[0, idxs]], axis=1)
+			ali = xform_translate_int_2d_real(orig, shifts)
 			avgo = np.mean(orig, axis=0)
-			avga = np.mean(ali, axis=0)
+			avga = jnp.mean(ali, axis=0)
 
 			if not options.noinvert:
 				avgo = -1.0 * avgo
@@ -358,7 +320,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				io.write_image(0, avgo, hdr)
 				io.close()
 			io = ImageIO(f"micrographs/{base}__{frames[0]}-{frames[1]}.hdf", "rw")
-			io.write_image(0, avga, hdr)
+			io.write_image(0, np.asarray(avga), hdr)
 			io.close()
 
 			js = js_open_dict(info_name(f))
@@ -392,71 +354,69 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			imgs = np.asarray(imgs)
 			if options.align_gain is not None:
 				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
-			imgs = np.stack([_edgemean(imgs[k]) for k in range(imgs.shape[0])])
-			imgs = _center_crop(imgs, 3072, 3072)
+			imgs = normalize_edgemean_2d_real(imgs)
+			ny, nx = imgs.shape[-2:]
+			imgs = imgs[..., (ny - 3072) // 2:(ny - 3072) // 2 + 3072, (nx - 3072) // 2:(nx - 3072) // 2 + 3072]
 			ffts = jax_fft2d(imgs)
 
 			# ACF of each image, then average them
 			acfs = jax_phaseorigin2d(ffts * jnp.conj(ffts))
-			acfsr = np.asarray(jax_ift2d(acfs))
+			acfsr = jax_ift2d(acfs)
 			ny, nx = acfsr.shape[1:]
 			acfsr = acfsr[:, ny // 2 - rsz:ny // 2 + rsz, nx // 2 - rsz:nx // 2 + rsz]
 			acfav = acfsr.mean(axis=0)
 
 			# zero out / smooth the region near the origin
-			acfav[rsz - 1, rsz - 1] = (acfav[rsz - 2, rsz - 1] + acfav[rsz - 1, rsz - 2]) / 2.0
-			acfav[rsz, rsz - 1] = acfav[rsz, rsz - 2]
-			acfav[rsz + 1, rsz - 1] = (acfav[rsz + 1, rsz - 2] + acfav[rsz + 2, rsz - 1]) / 2.0
-			acfav[rsz - 1, rsz] = acfav[rsz - 2, rsz]
-			acfav[rsz + 1, rsz] = acfav[rsz + 2, rsz]
-			acfav[rsz - 1, rsz + 1] = (acfav[rsz - 2, rsz + 1] + acfav[rsz - 1, rsz + 2]) / 2.0
-			acfav[rsz, rsz + 1] = acfav[rsz, rsz + 2]
-			acfav[rsz + 1, rsz + 1] = (acfav[rsz + 2, rsz + 1] + acfav[rsz + 1, rsz + 2]) / 2.0
-			acfav[rsz, rsz] = (acfav[rsz, rsz - 1] + acfav[rsz - 1, rsz] + acfav[rsz + 1, rsz] + acfav[rsz, rsz + 1]) / 4.0
-			acfav -= acfav.mean()
-			acfav /= acfav.std()
+			acfav = acfav.at[rsz - 1, rsz - 1].set((acfav[rsz - 2, rsz - 1] + acfav[rsz - 1, rsz - 2]) / 2.0)
+			acfav = acfav.at[rsz, rsz - 1].set(acfav[rsz, rsz - 2])
+			acfav = acfav.at[rsz + 1, rsz - 1].set((acfav[rsz + 1, rsz - 2] + acfav[rsz + 2, rsz - 1]) / 2.0)
+			acfav = acfav.at[rsz - 1, rsz].set(acfav[rsz - 2, rsz])
+			acfav = acfav.at[rsz + 1, rsz].set(acfav[rsz + 2, rsz])
+			acfav = acfav.at[rsz - 1, rsz + 1].set((acfav[rsz - 2, rsz + 1] + acfav[rsz - 1, rsz + 2]) / 2.0)
+			acfav = acfav.at[rsz, rsz + 1].set(acfav[rsz, rsz + 2])
+			acfav = acfav.at[rsz + 1, rsz + 1].set((acfav[rsz + 2, rsz + 1] + acfav[rsz + 1, rsz + 2]) / 2.0)
+			acfav = acfav.at[rsz, rsz].set((acfav[rsz, rsz - 1] + acfav[rsz - 1, rsz] + acfav[rsz + 1, rsz] + acfav[rsz, rsz + 1]) / 4.0)
+			acfav = (acfav - acfav.mean()) / acfav.std()
 
 			acfavf = jax_fft2d(acfav)
 
 			# CCF between each image and the subsequent image, central region
 			ccfs = jax_phaseorigin2d(ffts[:-1] * jnp.conj(ffts[1:]))
-			ccfsr = np.asarray(jax_ift2d(ccfs))
-			ccfsr = ccfsr[:, ny // 2 - rsz:ny // 2 + rsz, nx // 2 - rsz:nx // 2 + rsz].copy()
-			ccfsr[:, rsz, rsz] = (ccfsr[:, rsz - 1, rsz] + ccfsr[:, rsz + 1, rsz] +
-	                             ccfsr[:, rsz, rsz - 1] + ccfsr[:, rsz, rsz + 1]) / 4.0
-			for i in range(ccfsr.shape[0]):
-				ccfsr[i] -= np.mean(ccfsr[i])
-				ccfsr[i] /= np.std(ccfsr[i])
+			ccfsr = jax_ift2d(ccfs)
+			ccfsr = ccfsr[..., ny // 2 - rsz:ny // 2 + rsz, nx // 2 - rsz:nx // 2 + rsz]
+			ccfsr = ccfsr.at[:, rsz, rsz].set((ccfsr[:, rsz - 1, rsz] + ccfsr[:, rsz + 1, rsz] +
+			                                    ccfsr[:, rsz, rsz - 1] + ccfsr[:, rsz, rsz + 1]) / 4.0)
+			ccfsr = (ccfsr - ccfsr.mean(axis=(1, 2), keepdims=True)) / ccfsr.std(axis=(1, 2), keepdims=True)
 			ccfsf = jax_fft2d(ccfsr)
 
 			# CCF between the CCFS and the ACF reference
 			ccfacf = jax_phaseorigin2d(ccfsf * jnp.conj(acfavf))
-			ccfacfr = np.asarray(jax_ift2d(ccfacf))
+			ccfacfr = jax_ift2d(ccfacf)
 
 			seqoff = _peak_shifts(ccfacfr, rsz)
-			seqoff = np.insert(seqoff, 0, np.array([0, 0]), axis=1)
-			for i in range(1, seqoff.shape[1]):
-				seqoff[0, i] += seqoff[0, i - 1]
-				seqoff[1, i] += seqoff[1, i - 1]
-			seqoff[0] -= int(seqoff[0].mean())
-			seqoff[1] -= int(seqoff[1].mean())
+			seqoff = jnp.concatenate([jnp.zeros((2, 1), dtype=seqoff.dtype), seqoff], axis=1)
+			seqoff = jnp.cumsum(seqoff, axis=1)
+			seqoff = seqoff - jnp.array([int(seqoff[0].mean()), int(seqoff[1].mean())]).reshape(2, 1)
 
 			if options.verbose:
 				print(seqoff)
 
 			orig = []
-			ali = []
 			for i in range(frames[0], frames[1]):
 				im = idio.read_image(i)[0]
 				if options.align_gain is not None:
 					im = _fixgain_counting(im, gain, 2, 2)
 				if clip is not None:
-					im = _center_crop(im, clip[0], clip[1])
+					ny, nx = im.shape
+					im = im[(ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
+					        (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
 				orig.append(im)
-				ali.append(_translate2(im, int(seqoff[1, i - frames[0]]),
-				                       int(seqoff[0, i - frames[0]])))
+			orig = np.stack(orig)
+			idxs = jnp.arange(orig.shape[0])
+			shifts = jnp.stack([seqoff[1, idxs], seqoff[0, idxs]], axis=1)
+			ali = xform_translate_int_2d_real(orig, shifts)
 			avgo = np.mean(orig, axis=0)
-			avga = np.mean(ali, axis=0)
+			avga = jnp.mean(ali, axis=0)
 
 			if not options.noinvert:
 				avgo = -1.0 * avgo
@@ -475,7 +435,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			io.write_image(0, avgo, hdr)
 			io.close()
 			io = ImageIO(f"micrographs/{base}_{frames[0]}-{frames[1]}.hdf", "rw")
-			io.write_image(0, avga, hdr)
+			io.write_image(0, np.asarray(avga), hdr)
 			io.close()
 
 			js = js_open_dict(info_name(f))
@@ -496,9 +456,10 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		imgs = imgs / avg
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts * jnp.conj(ffts[len(imgs) // 2]))
-		ccfsr = np.asarray(jax_ift2d(ccfs))
+		ccfsr = jax_ift2d(ccfs)
 		ny, nx = ccfsr.shape[1:]
-		cens = ccfsr[:, ny // 2 - 64:ny // 2 + 64, nx // 2 - 64:nx // 2 + 64]
+		cens = ccfsr[..., ny // 2 - 64:ny // 2 + 64, nx // 2 - 64:nx // 2 + 64]
+		cens = np.asarray(cens)
 		hdr = {"nx": cens.shape[2], "ny": cens.shape[1], "nz": 1}
 		io = ImageIO("ccfs.hdf", "rw")
 		try:
@@ -519,10 +480,10 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		imgs = imgs / avg
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts * jnp.conj(ffts))
-		ccfsr = np.asarray(jax_ift2d(ccfs))
+		ccfsr = jax_ift2d(ccfs)
 		ny, nx = ccfsr.shape[1:]
-		cens = ccfsr[:, ny // 2 - 64:ny // 2 + 64, nx // 2 - 64:nx // 2 + 64]
-		cens = np.stack([_edgemean(cens[k]) for k in range(cens.shape[0])])
+		cens = ccfsr[..., ny // 2 - 64:ny // 2 + 64, nx // 2 - 64:nx // 2 + 64]
+		cens = np.asarray(normalize_edgemean_2d_real(cens))
 		hdr = {"nx": cens.shape[2], "ny": cens.shape[1], "nz": 1}
 		io = ImageIO("ccfs.hdf", "rw")
 		try:
@@ -554,9 +515,10 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		imgs = np.stack([aimgs[i:i + 10:2].sum(axis=0) for i in range(40)])
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts[:-1] * jnp.conj(ffts[1:]))
-		ccfsr = np.asarray(jax_ift2d(ccfs))
-		cens = _center_crop(ccfsr, 64, 64)
-		cens = np.stack([_edgemean(cens[k]) for k in range(cens.shape[0])])
+		ccfsr = jax_ift2d(ccfs)
+		ny, nx = ccfsr.shape[-2:]
+		cens = ccfsr[..., (ny - 64) // 2:(ny - 64) // 2 + 64, (nx - 64) // 2:(nx - 64) // 2 + 64]
+		cens = np.asarray(normalize_edgemean_2d_real(cens))
 		hdr = {"nx": cens.shape[2], "ny": cens.shape[1], "nz": 1}
 		io = ImageIO("ccfeo5.hdf", "rw")
 		try:
@@ -579,10 +541,10 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			def _ccfblock(im):
 				ff = jax_fft2d(im)
 				c = jax_phaseorigin2d(ff[:-1] * jnp.conj(ff[1:]))
-				cr = np.asarray(jax_ift2d(c))
-				cn = _center_crop(cr, 64, 64)
-				cn = np.stack([_edgemean(cn[k]) for k in range(cn.shape[0])])
-				return cn
+				cr = jax_ift2d(c)
+				ny, nx = cr.shape[-2:]
+				cn = cr[..., (ny - 64) // 2:(ny - 64) // 2 + 64, (nx - 64) // 2:(nx - 64) // 2 + 64]
+				return np.asarray(normalize_edgemean_2d_real(cn))
 
 			cn = _ccfblock(imgs)
 			hdr = {"nx": cn.shape[2], "ny": cn.shape[1], "nz": 1}
@@ -593,7 +555,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			finally:
 				io.close()
 
-			imgs2k = _center_crop(imgs, 2048, 2048)
+			ny, nx = imgs.shape[-2:]
+			imgs2k = imgs[..., (ny - 2048) // 2:(ny - 2048) // 2 + 2048, (nx - 2048) // 2:(nx - 2048) // 2 + 2048]
 			cn = _ccfblock(imgs2k)
 			hdr = {"nx": cn.shape[2], "ny": cn.shape[1], "nz": 1}
 			io = ImageIO("ccfs2k.hdf", "rw")
@@ -603,7 +566,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			finally:
 				io.close()
 
-			imgs1k = _center_crop(imgs, 1024, 1024)
+			imgs1k = imgs[..., (ny - 1024) // 2:(ny - 1024) // 2 + 1024, (nx - 1024) // 2:(nx - 1024) // 2 + 1024]
 			cn = _ccfblock(imgs1k)
 			hdr = {"nx": cn.shape[2], "ny": cn.shape[1], "nz": 1}
 			io = ImageIO("ccfs1k.hdf", "rw")
@@ -633,12 +596,12 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				imgt = imgs[:, y:y + 1024, x:x + 1024]
 				ff = jax_fft2d(imgt)
 				c = jax_phaseorigin2d(ff[:-1] * jnp.conj(ff[1:]))
-				cr = np.asarray(jax_ift2d(c))
+				cr = jax_ift2d(c)
 				if ccfsum is None:
 					ccfsum = cr
 				else:
 					ccfsum = ccfsum + cr
-		ccfsum = np.stack([_edgemean(ccfsum[k]) for k in range(ccfsum.shape[0])])
+		ccfsum = np.asarray(normalize_edgemean_2d_real(ccfsum))
 		hdr = {"nx": ccfsum.shape[2], "ny": ccfsum.shape[1], "nz": 1}
 		io = ImageIO("ccfs.hdf", "rw")
 		try:

@@ -88,6 +88,9 @@ __all__ = [
 	"xform",
 	"xform_2d_real",
 	"xform_3d_real",
+	"xform_translate_int",
+	"xform_translate_int_2d_real",
+	"xform_translate_int_3d_real",
 	"xform_applysym",
 	"xform_center",
 	"xform_center_2d_real",
@@ -1378,6 +1381,59 @@ def xform_3d_real(data: jnp.ndarray, mat34: jnp.ndarray) -> jnp.ndarray:
 
 
 @jax.jit
+def xform_translate_int_2d_real(data: jnp.ndarray, shift: jnp.ndarray) -> jnp.ndarray:
+	"""Integer-pixel translation of each image of a 2-D stack (data: float {N,Y,X}), with zero-fill at
+	the edges: out[n,i,j] = in[n, i-dy[n], j-dx[n]] (content moved by +dx in x, +dy in y), and 0 where the
+	source pixel falls outside the input. No interpolation (an exact integer shift), so this is cheaper
+	than xform_2d_real when the translation is integral.
+	shift - a 2-vector [dx, dy] applied to the whole stack, or a {N,2} array of per-image [dx, dy] shifts;
+	        non-integer values are truncated toward zero.
+	Branch-free."""
+	n = data.shape[0]
+	ny, nx = data.shape[-2], data.shape[-1]
+	shift = jnp.broadcast_to(jnp.asarray(shift, dtype=jnp.float32), (n, 2))
+	dx = shift[:, 0]
+	dy = shift[:, 1]
+	sx = jnp.arange(nx, dtype=jnp.float32)[None, :] - dx[:, None]    # {N,X}
+	sy = jnp.arange(ny, dtype=jnp.float32)[None, :] - dy[:, None]    # {N,Y}
+	valid = ((sy >= 0) & (sy < ny))[:, :, None] & ((sx >= 0) & (sx < nx))[:, None, :]   # {N,Y,X}
+	xi = jnp.floor(sx).astype(jnp.int32).clip(0, nx - 1)
+	yi = jnp.floor(sy).astype(jnp.int32).clip(0, ny - 1)
+	b = jnp.arange(n)[:, None, None]      # explicit batch index so all index arrays broadcast together
+	out = data[b, yi[:, :, None], xi[:, None, :]]
+	return jnp.where(valid, out, 0.0)
+
+
+@jax.jit
+def xform_translate_int_3d_real(data: jnp.ndarray, shift: jnp.ndarray) -> jnp.ndarray:
+	"""Integer-pixel translation of each volume of a 3-D stack (data: float {N,Z,Y,X}), with zero-fill at
+	the edges: out[n,k,i,j] = in[n, k-dz[n], i-dy[n], j-dx[n]] (content moved by +dx/+dy/+dz), and 0 where the
+	source voxel falls outside the input. No interpolation (an exact integer shift), so this is cheaper
+	than xform_3d_real when the translation is integral.
+	shift - a 3-vector [dx, dy, dz] applied to the whole stack, or a {N,3} array of per-image [dx, dy, dz]
+	        shifts; non-integer values are truncated toward zero.
+	Branch-free."""
+	n = data.shape[0]
+	nz, ny, nx = data.shape[-3], data.shape[-2], data.shape[-1]
+	shift = jnp.broadcast_to(jnp.asarray(shift, dtype=jnp.float32), (n, 3))
+	dx = shift[:, 0]
+	dy = shift[:, 1]
+	dz = shift[:, 2]
+	sx = jnp.arange(nx, dtype=jnp.float32)[None, :] - dx[:, None]    # {N,X}
+	sy = jnp.arange(ny, dtype=jnp.float32)[None, :] - dy[:, None]    # {N,Y}
+	sz = jnp.arange(nz, dtype=jnp.float32)[None, :] - dz[:, None]    # {N,Z}
+	valid = (((sz >= 0) & (sz < nz))[:, :, None, None]
+			 & ((sy >= 0) & (sy < ny))[:, None, :, None]
+			 & ((sx >= 0) & (sx < nx))[:, None, None, :])            # {N,Z,Y,X}
+	xi = jnp.floor(sx).astype(jnp.int32).clip(0, nx - 1)
+	yi = jnp.floor(sy).astype(jnp.int32).clip(0, ny - 1)
+	zi = jnp.floor(sz).astype(jnp.int32).clip(0, nz - 1)
+	b = jnp.arange(n)[:, None, None, None]   # explicit batch index so all index arrays broadcast together
+	out = data[b, zi[:, :, None, None], yi[:, None, :, None], xi[:, None, None, :]]
+	return jnp.where(valid, out, 0.0)
+
+
+@jax.jit
 def xform_flip_x_2d_real(data: jnp.ndarray) -> jnp.ndarray:
 	"""Reverse the order of the pixels along the x axis of each 2-D image (data: float {N,Y,X}):
 	out[... , i, ...] = in[..., nx-1-i, ...]."""
@@ -1668,6 +1724,28 @@ def xform_flip(stack: EMStack,
 	else:
 		v2d, v3d = xform_flip_z_3d_real, xform_flip_z_3d_real
 	return _process_stack_real(stack, v2d, v3d)
+
+
+def xform_translate_int(stack: EMStack,
+				    shift) -> EMStack:
+	"""Translate every image/volume in the stack by an integer number of pixels, zero-filling at the
+	edges (no interpolation), applied to the entire stack at once: the content moves by +dx in x, +dy in y
+	(and +dz in z for a 3-D stack), and pixels whose source falls outside the input are 0.
+	Returns a new EMStack of the same kind; the input is not modified.
+	xform_translate_int is a real-space operation: Fourier-space (complex) input is rejected.
+	shift - a 2-vector [dx, dy] for a 2-D stack or a 3-vector [dx, dy, dz] for a 3-D stack, applied to the
+	        whole stack; a per-image {N,2} (or {N,3}) array of shifts is also accepted.
+
+	Example: xform_translate_int(my_stack, (3, -2))
+	"""
+	data = stack.jax
+	if jnp.issubdtype(data.dtype, jnp.complexfloating):
+		raise ValueError("this processor operates on real-space data only; a Fourier-space (complex) stack was provided")
+	if isinstance(stack, EMStack2D):
+		newdata = xform_translate_int_2d_real(data, shift)
+	else:
+		newdata = xform_translate_int_3d_real(data, shift)
+	return type(stack)(newdata, parent=stack)
 
 
 def xform_mirror(stack: EMStack,
