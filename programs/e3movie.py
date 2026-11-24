@@ -38,7 +38,7 @@ import traceback
 import numpy as np
 import jax.numpy as jnp
 
-from EMAN3.EMAN3 import (EMArgumentParser, E3init, E3end, E3progress,
+from EMAN3.EMAN3 import (EMArgumentParser, E3init, E3end, E3progress, print_progress,
                          error_exit, warning, good_size, base_name, info_name)
 from EMAN3.EMAN3jax import (jax_fft2d, jax_ift2d, jax_pointfilt_2d,
                            jax_downsample_2d, jax_phaseorigin2d, jax_set_device)
@@ -151,6 +151,10 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	else:
 		options.frames = (0, 100000)
 
+	# tlast carries the print_progress state; each phase below ends with a cur==n
+	# call, which is required to reset print_progress's timing for the next phase.
+	tlast = 0
+
 	# Load the gain image once if it is used for correction
 	gain = None
 	if options.align_gain is not None:
@@ -167,12 +171,15 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		sumsq = None
 		sqbuf = None
 		n = 0
+		nimg_first = 0
 		for i in range(nmov):
 			if (i % 10 == 0):
 				E3progress(pid, i / nmov)
 			f = args[i]
 			with ImageIO(f, "r") as idio:
 				nimg = idio.nimg
+				if nimg_first == 0:
+					nimg_first = nimg
 				print(f"{f}: {nimg}")
 				# Read one frame at a time: this path only accumulates sum/sumsq,
 				# so materializing a 50-frame stack (read_images -> np.stack of
@@ -190,6 +197,10 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 					np.multiply(img, img, out=sqbuf)
 					sumsq += sqbuf
 					n += 1
+					if options.verbose >= 1:
+						tlast = print_progress(tlast, "est_gain", i * nimg_first + j, nmov * nimg_first)
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "est_gain", nmov * nimg_first, nmov * nimg_first)
 		avg = sumim / n
 		sig = np.sqrt(sumsq / n - avg ** 2)
 		# ensure that on average e- counts are still counts (shared scale factor)
@@ -222,6 +233,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			idio = ImageIO(f, "r")
 			nimg = idio.nimg
 			frames = (options.frames[0], min(options.frames[1], nimg))
+			nfr = frames[1] - frames[0]
 
 			if options.seqavg > 1:
 				nblk = (frames[1] - frames[0]) // options.seqavg
@@ -278,10 +290,16 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose:
 				print(seqoff)
 
+			if options.verbose >= 1:
+				tlast = print_progress(tlast, "alignbyccf", mi * 2 * nfr + nfr, nmov * 2 * nfr)
+
 			# average the (optionally gain-corrected, translated) frames
 			orig = []
 			step = max(options.seqavg, 1)
-			for i in range(frames[0], frames[1], step):
+			# the CCFs were computed on whole seqavg blocks only, so a trailing
+			# partial block (if any) must be excluded here as well
+			lend = frames[1] if step == 1 else frames[0] + ((frames[1] - frames[0]) // step) * step
+			for i in range(frames[0], lend, step):
 				if options.seqavg > 1:
 					im = idio.read_images(list(range(i, i + options.seqavg)))[0].sum(axis=0)
 				else:
@@ -293,6 +311,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 					im = im[(ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
 					        (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
 				orig.append(im)
+				if options.verbose >= 1:
+					tlast = print_progress(tlast, "alignbyccf", mi * 2 * nfr + nfr + (i - frames[0]), nmov * 2 * nfr)
 			orig = np.stack(orig)
 			# note the x/y order: shifts are [dx, dy]; with seqavg>1 they are per
 			# averaged block, so index by block number
@@ -329,6 +349,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			js["movie_align_y"] = seqoff[0].tolist()
 			js = None
 
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "alignbyccf", nmov * 2 * nfr, nmov * 2 * nfr)
+
 	# ------------------------------------------------------------------
 	# --alignbyacfccf : progressive ACF-referenced CCF alignment
 	# ------------------------------------------------------------------
@@ -340,6 +363,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			idio = ImageIO(f, "r")
 			nimg = idio.nimg
 			frames = (options.frames[0], min(options.frames[1], nimg))
+			nfr = frames[1] - frames[0]
 			apix = None
 			if options.apix is not None:
 				apix = options.apix
@@ -401,6 +425,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose:
 				print(seqoff)
 
+			if options.verbose >= 1:
+				tlast = print_progress(tlast, "alignbyacfccf", mi * 2 * nfr + nfr, nmov * 2 * nfr)
+
 			orig = []
 			for i in range(frames[0], frames[1]):
 				im = idio.read_image(i)[0]
@@ -411,6 +438,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 					im = im[(ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
 					        (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
 				orig.append(im)
+				if options.verbose >= 1:
+					tlast = print_progress(tlast, "alignbyacfccf", mi * 2 * nfr + nfr + (i - frames[0]), nmov * 2 * nfr)
 			orig = np.stack(orig)
 			idxs = jnp.arange(orig.shape[0])
 			shifts = jnp.stack([seqoff[1, idxs], seqoff[0, idxs]], axis=1)
@@ -444,6 +473,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			js["movie_align_y"] = seqoff[0].tolist()
 			js = None
 
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "alignbyacfccf", nmov * 2 * nfr, nmov * 2 * nfr)
+
 	# ------------------------------------------------------------------
 	# --ccftest : CCF between each image and the middle image
 	# ------------------------------------------------------------------
@@ -454,6 +486,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		with ImageIO(args[0], "r") as idio:
 			imgs = idio.read_images(list(range(0, min(50, idio.nimg))))[0]
 		imgs = imgs / avg
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "ccftest", 1, 2)
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts * jnp.conj(ffts[len(imgs) // 2]))
 		ccfsr = jax_ift2d(ccfs)
@@ -467,6 +501,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				io.write_image(k, cens[k], hdr)
 		finally:
 			io.close()
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "ccftest", 2, 2)
 
 	# ------------------------------------------------------------------
 	# --acftest : ACF images for the input stack
@@ -478,6 +514,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		with ImageIO(args[0], "r") as idio:
 			imgs = idio.read_images(list(range(0, min(50, idio.nimg))))[0]
 		imgs = imgs / avg
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "acftest", 1, 2)
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts * jnp.conj(ffts))
 		ccfsr = jax_ift2d(ccfs)
@@ -491,6 +529,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				io.write_image(k, cens[k], hdr)
 		finally:
 			io.close()
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "acftest", 2, 2)
 
 	# ------------------------------------------------------------------
 	# --ccfdtest : CCF between each image and the next, with gain correction
@@ -507,6 +547,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		avg = avg / avg.mean()
 		idio = ImageIO(args[0], "r")
 		nimg = idio.nimg
+		ntest = 1 + len(range(1, nimg, 25))
 
 		# first block: sum of 10-frame groups (step 2), 40 images
 		print(f"0:{min(50, nimg)}")
@@ -532,9 +573,13 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				io.write_image(k, imgs[k], hdr)
 		finally:
 			io.close()
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "ccfdtest", 1, ntest)
 
 		for i in range(1, nimg, 25):
 			print(f"{i - 1}:{min(i + 25, nimg)}")
+			if options.verbose >= 1:
+				tlast = print_progress(tlast, "ccfdtest", 1 + (i - 1) // 25, ntest)
 			imgs = idio.read_images(list(range(i - 1, min(i + 25, nimg))))[0]
 			imgs = np.stack([_fixgain_counting(imgs[k], avg, 3, 3) for k in range(imgs.shape[0])])
 
@@ -577,6 +622,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				io.close()
 
 		idio.close()
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "ccfdtest", ntest, ntest)
 
 	# ------------------------------------------------------------------
 	# --ccftiletest : tiled average of the CCF
@@ -591,8 +638,12 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		imgs = imgs / avg
 
 		ccfsum = None
+		ntile = len(range(0, nx - 1024, 1024)) * len(range(0, ny - 1024, 1024))
+		nt = 0
 		for x in range(0, nx - 1024, 1024):
 			for y in range(0, ny - 1024, 1024):
+				if options.verbose >= 1:
+					tlast = print_progress(tlast, "ccftiletest", nt, ntile)
 				imgt = imgs[:, y:y + 1024, x:x + 1024]
 				ff = jax_fft2d(imgt)
 				c = jax_phaseorigin2d(ff[:-1] * jnp.conj(ff[1:]))
@@ -601,6 +652,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 					ccfsum = cr
 				else:
 					ccfsum = ccfsum + cr
+				nt += 1
+		if options.verbose >= 1:
+			tlast = print_progress(tlast, "ccftiletest", ntile, ntile)
 		ccfsum = np.asarray(normalize_edgemean_2d_real(ccfsum))
 		hdr = {"nx": ccfsum.shape[2], "ny": ccfsum.shape[1], "nz": 1}
 		io = ImageIO("ccfs.hdf", "rw")
