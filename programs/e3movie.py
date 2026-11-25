@@ -53,16 +53,15 @@ EMANVERSION = "e3movie (EMAN3)"
 # Low level helpers (numpy real-space image: shape (ny,nx))
 # ---------------------------------------------------------------------------
 
-def _fixgain_counting(img, gain, gainmin=2.0, gainmax=2.0):
-	"""Port of EMAN2's "math.fixgain.counting" for a single (ny,nx) image.
+def build_fixgain_map(gain, gainmin=2.0, gainmax=2.0):
+	"""One-time pass over a gain image (EMAN2's "math.fixgain.counting" semantics).
 
-	Divides the image by the gain image. Pixels whose gain falls outside the
-	[gainmin, gainmax] window (expressed in units of the gain sigma about the
-	gain mean, gainmax/gainmin = n*sigma, gainmin floored at 0.1) are considered
-	bad sensor pixels: a good pixel is found by walking the diagonal toward the
-	image center, and the (image/gain) ratio from that good pixel is substituted.
+	Identifies the bad sensor pixels (gain outside the [gainmin, gainmax] sigma
+	window about the gain mean, gainmin floored at 0.1) and, for each, the good
+	pixel found by walking the diagonal toward the image center. Returns a
+	mapping consumed by apply_fixgain, so the per-pixel bad-pixel search is done
+	once per gain image rather than once per image being corrected.
 	"""
-	img = np.asarray(img, dtype=np.float32)
 	gain = np.asarray(gain, dtype=np.float32)
 	ny, nx = gain.shape
 	gmean = float(gain.mean())
@@ -71,23 +70,47 @@ def _fixgain_counting(img, gain, gainmin=2.0, gainmax=2.0):
 	lo = max(0.1, gmean - gainmin * gsig)
 
 	good = (gain >= lo) & (gain <= hi)
-	out = np.zeros_like(img)
-	with np.errstate(divide="ignore", invalid="ignore"):
-		out[good] = img[good] / gain[good]
-
-	# bad pixels: walk the diagonal toward the center to find a good gain value
-	for (y, x) in np.argwhere(~good):
+	bad = np.argwhere(~good)   # (M,2), rows [y, x]
+	m = bad.shape[0]
+	good_y = np.empty(m, dtype=np.intp)
+	good_x = np.empty(m, dtype=np.intp)
+	fallback = np.zeros(m, dtype=bool)   # no good pixel found on the diagonal
+	for k in range(m):
+		y, x = bad[k]
 		dyy = -1 if y < ny / 2 else 1
 		dxx = -1 if x < nx / 2 else 1
 		found = False
 		for i in range(1, max(nx, ny) // 2 + 1):
 			yy, xx = y + dyy * i, x + dxx * i
 			if 0 <= yy < ny and 0 <= xx < nx and lo <= gain[yy, xx] <= hi:
-				out[y, x] = img[yy, xx] / gain[yy, xx]
+				good_y[k], good_x[k] = yy, xx
 				found = True
 				break
-		if not found:
-			out[y, x] = gmean  # fallback to the gain mean
+		fallback[k] = not found
+
+	return {"gain": gain, "gmean": gmean,
+	        "bad_y": bad[:, 0], "bad_x": bad[:, 1],
+	        "good_y": good_y, "good_x": good_x, "fallback": fallback}
+
+
+def apply_fixgain(img, fmap):
+	"""Divide an image or a stack of images by the gain image from a mapping
+	built by build_fixgain_map, substituting each bad gain pixel's value with
+	the (image/gain) value of its mapped good pixel, or the gain mean if no
+	good pixel was found. Fully vectorized.
+	"""
+	img = np.asarray(img, dtype=np.float32)
+	with np.errstate(divide="ignore", invalid="ignore"):
+		out = img / fmap["gain"]
+	m = fmap["bad_y"].size
+	if m:
+		remap = ~fmap["fallback"]
+		if remap.any():
+			out[..., fmap["bad_y"][remap], fmap["bad_x"][remap]] = \
+				out[..., fmap["good_y"][remap], fmap["good_x"][remap]]
+		fb = fmap["fallback"]
+		if fb.any():
+			out[..., fmap["bad_y"][fb], fmap["bad_x"][fb]] = fmap["gmean"]
 	return out
 
 
@@ -270,9 +293,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if apix is None:
 				apix = 1.0
 
-			if options.verbose>1 : print(" preproc and fft        ",end="\r")
 			if options.align_gain is not None:
-				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
+				fmap = build_fixgain_map(gain, 2, 2)
+				imgs = apply_fixgain(imgs, fmap)
 			# keep the unmodified (gain-corrected) images for the final aligned
 			# average, so the movie does not have to be read from disk a second time
 			raw = imgs
@@ -389,7 +412,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 				blk.append(im)
 			imgs = np.stack(blk)
 			if options.align_gain is not None:
-				imgs = np.stack([_fixgain_counting(imgs[k], gain, 2, 2) for k in range(imgs.shape[0])])
+				fmap = build_fixgain_map(gain, 2, 2)
+				imgs = apply_fixgain(imgs, fmap)
 			# keep the unmodified (gain-corrected) images for the final aligned
 			# average, so the movie does not have to be read from disk a second time
 			raw = imgs
@@ -558,7 +582,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		# first block: sum of 10-frame groups (step 2), 40 images
 		print(f"0:{min(50, nimg)}")
 		aimgs = idio.read_images(list(range(0, min(50, nimg))))[0]
-		aimgs = np.stack([_fixgain_counting(aimgs[k], avg, 3, 3) for k in range(aimgs.shape[0])])
+		fmap = build_fixgain_map(avg, 3, 3)
+		aimgs = apply_fixgain(aimgs, fmap)
 		imgs = np.stack([aimgs[i:i + 10:2].sum(axis=0) for i in range(40)])
 		ffts = jax_fft2d(imgs)
 		ccfs = jax_phaseorigin2d(ffts[:-1] * jnp.conj(ffts[1:]))
@@ -587,7 +612,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose >= 1:
 				tlast = print_progress(tlast, "ccfdtest", 1 + (i - 1) // 25, ntest)
 			imgs = idio.read_images(list(range(i - 1, min(i + 25, nimg))))[0]
-			imgs = np.stack([_fixgain_counting(imgs[k], avg, 3, 3) for k in range(imgs.shape[0])])
+			imgs = apply_fixgain(imgs, fmap)
 
 			def _ccfblock(im):
 				ff = jax_fft2d(im)
