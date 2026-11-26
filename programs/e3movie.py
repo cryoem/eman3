@@ -233,8 +233,8 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 		avg = avg / A
 		sig = sig / A  # scale the sigma the same way as the average
 		# pixels with very small or very large standard deviations are likely bad
-		slow = max(0.1, sig.mean() - 4.0 * sig.std())
-		shigh = sig.mean() + 4.0 * sig.std()
+		slow = max(0.1, sig.mean() - 6.0 * sig.std())
+		shigh = sig.mean() + 6.0 * sig.std()
 		sigm = ((sig >= slow) & (sig <= shigh)).astype(np.float32)
 		avg = avg * sigm
 
