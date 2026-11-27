@@ -150,7 +150,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	parser.add_argument("--align_gain", type=str, help="Gain image for correcting movie images before alignment. Applied correction is to divide by the gain image.", default=None)
 	parser.add_argument("--keepunali", action="store_true", default=False, help="If set, stores unaligned as well as aligned micrograph average")
 	parser.add_argument("--noinvert", action="store_true", default=False, help="Default behavior is to invert averaged image contrast. This disables that behavior.")
-	parser.add_argument("--clip", type=str, default=None, help="nx,ny output image size. Trims both edges equally as necessary")
+	parser.add_argument("--crop", type=int, default=0, help="trim <n> pixels from all 4 edges of the image after gain correction, before further processing")
 	parser.add_argument("--frames", type=str, default=None, help="<first>,<last+1> movie frames to use, first frame is 0, '0,3' will use frames 0,1,2")
 	parser.add_argument("--acftest", action="store_true", default=False, help="compute ACF images for input stack")
 	parser.add_argument("--ccftest", action="store_true", default=False, help="compute CCF between each image and the middle image in the movie")
@@ -166,10 +166,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 	pid = E3init(sys.argv)
 
 	nmov = len(args)
-	if options.clip is not None:
-		clip = (int(options.clip.split(",")[0]), int(options.clip.split(",")[1]))
-	else:
-		clip = None
+	crop = options.crop
 	if options.frames is not None:
 		options.frames = (int(options.frames.split(",")[0]), int(options.frames.split(",")[1]))
 	else:
@@ -299,10 +296,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			# keep the unmodified (gain-corrected) images for the final aligned
 			# average, so the movie does not have to be read from disk a second time
 			raw = imgs
-			if clip is not None:
+			if crop:
 				ny, nx = raw.shape[-2:]
-				raw = raw[..., (ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
-				           (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
+				raw = raw[..., crop:ny - crop, crop:nx - crop]
 			# normalization only for alignment
 			imgs = normalize_edgemean_2d_real(imgs)
 			ny, nx = imgs.shape[-2:]
@@ -334,7 +330,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose>2:
 				print(seqoff)
 
-			# average the frames, reusing the kept (gain-corrected, clip-cropped)
+			# average the frames, reusing the kept (gain-corrected, crop-cropped)
 			# copy so the movie does not need a second read from disk; with
 			# seqavg>1 the rows are per averaged block, so the shifts index by
 			# block number
@@ -417,10 +413,9 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			# keep the unmodified (gain-corrected) images for the final aligned
 			# average, so the movie does not have to be read from disk a second time
 			raw = imgs
-			if clip is not None:
+			if crop:
 				ny, nx = raw.shape[-2:]
-				raw = raw[..., (ny - clip[1]) // 2:(ny - clip[1]) // 2 + clip[1],
-				           (nx - clip[0]) // 2:(nx - clip[0]) // 2 + clip[0]]
+				raw = raw[..., crop:ny - crop, crop:nx - crop]
 			imgs = normalize_edgemean_2d_real(imgs)
 			ny, nx = imgs.shape[-2:]
 			imgs = imgs[..., (ny - 3072) // 2:(ny - 3072) // 2 + 3072, (nx - 3072) // 2:(nx - 3072) // 2 + 3072]
@@ -468,7 +463,7 @@ This will estimate gain for counting mode cameras, and has a "first draft" of fr
 			if options.verbose:
 				print(seqoff)
 
-			# average the frames, reusing the kept (gain-corrected, clip-cropped)
+			# average the frames, reusing the kept (gain-corrected, crop-cropped)
 			# copy so the movie does not need a second read from disk
 			orig = raw
 			idxs = jnp.arange(orig.shape[0])
